@@ -371,9 +371,17 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
     values = {k: str(cfg.get(k) or "").strip() or None for k in ("model", "provider", "base_url", "api_key")}
     values["api_mode"] = str(cfg.get("api_mode") or "").strip().lower() or None
     explicit_request_overrides = cfg.get("request_overrides") if isinstance(cfg.get("request_overrides"), dict) else None
-    is_native_sdk_provider = (values["provider"] or "").strip().lower() in _NATIVE_SDK_PROVIDERS
+    provider_key = (values["provider"] or "").strip().lower()
+    is_native_sdk_provider = provider_key in _NATIVE_SDK_PROVIDERS
+    # An OAuth/runtime-backed delegation provider with no explicit
+    # delegation.api_key must resolve fresh runtime credentials rather than
+    # treat a persisted base URL as a static direct endpoint — otherwise an
+    # expired OAuth base URL silently becomes the child's endpoint.
+    use_runtime_provider = bool(
+        values["provider"] and provider_key in _RUNTIME_OAUTH_PROVIDERS and not values["api_key"]
+    )
 
-    if values["base_url"] and not is_native_sdk_provider:
+    if values["base_url"] and not use_runtime_provider and not is_native_sdk_provider:
         return _direct_endpoint_credentials(values, explicit_request_overrides)
     if not values["provider"]:
         # Pure inherit; explicit request_overrides still merge OVER the parent's.
@@ -412,6 +420,12 @@ _ROUTING_FILTER_DEFAULTS = (
 )
 
 _NOUS_PROVIDERS = frozenset({"nous", "nous-portal", "nousresearch"})
+
+# Providers whose credentials come from a live OAuth/runtime exchange, not a
+# static key: a configured delegation.base_url must not shadow them.
+_RUNTIME_OAUTH_PROVIDERS = frozenset({
+    "anthropic", "copilot-acp", "google-gemini-cli", "nous", "openai-codex", "qwen-oauth",
+})
 
 
 def _resolve_child_fallback_chain(parent_agent, routing_cfg: Any, pinned: bool) -> Optional[List[Dict[str, Any]]]:
