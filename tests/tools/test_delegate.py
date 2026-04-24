@@ -692,6 +692,51 @@ class TestDelegationCredentialResolution(unittest.TestCase):
         self.assertEqual(creds["api_key"], "foundry-key")
         self.assertEqual(creds["api_mode"], "anthropic_messages")
 
+    @patch("hermes_cli.runtime_provider.resolve_runtime_provider")
+    def test_runtime_provider_wins_over_stored_codex_url_without_api_key(
+        self, mock_resolve
+    ):
+        mock_resolve.return_value = {
+            "provider": "openai-codex",
+            "base_url": "https://chatgpt.com/backend-api/codex",
+            "api_key": "codex-token",
+            "api_mode": "codex_responses",
+        }
+        parent = _make_mock_parent(depth=0)
+        cfg = {
+            "model": "gpt-5.6-sol",
+            "provider": "openai-codex",
+            "base_url": "https://chatgpt.com/backend-api/codex",
+        }
+
+        creds = _resolve_delegation_credentials(cfg, parent)
+
+        self.assertEqual(creds["model"], "gpt-5.6-sol")
+        self.assertEqual(creds["provider"], "openai-codex")
+        self.assertEqual(creds["base_url"], "https://chatgpt.com/backend-api/codex")
+        self.assertEqual(creds["api_key"], "codex-token")
+        self.assertEqual(creds["api_mode"], "codex_responses")
+        mock_resolve.assert_called_once_with(
+            requested="openai-codex", target_model="gpt-5.6-sol"
+        )
+
+    @patch("hermes_cli.runtime_provider.resolve_runtime_provider")
+    def test_explicit_codex_api_key_keeps_direct_endpoint(self, mock_resolve):
+        parent = _make_mock_parent(depth=0)
+        cfg = {
+            "model": "gpt-5.6-sol",
+            "provider": "openai-codex",
+            "base_url": "https://chatgpt.com/backend-api/codex",
+            "api_key": "explicit-token",
+        }
+
+        creds = _resolve_delegation_credentials(cfg, parent)
+
+        self.assertEqual(creds["provider"], "openai-codex")
+        self.assertEqual(creds["api_key"], "explicit-token")
+        self.assertEqual(creds["api_mode"], "codex_responses")
+        mock_resolve.assert_not_called()
+
 
     @patch("hermes_cli.runtime_provider.resolve_runtime_provider")
     def test_provider_resolution_failure_raises_valueerror(self, mock_resolve):
