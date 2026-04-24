@@ -440,6 +440,29 @@ def _save_cfg(cfg: dict):
             _cfg_mtime = None
 
 
+def _agent_max_turns(cfg: dict, default: int = 90) -> int:
+    """Resolve max tool-calling iterations from gateway config.
+
+    CLI/config loading normalizes this setting to ``agent.max_turns`` but the
+    gateway reads raw config.yaml directly for speed. Honor the nested key first
+    and keep the legacy root-level fallback for old configs.
+    """
+    candidates = []
+    if isinstance(cfg, dict):
+        agent_cfg = cfg.get("agent")
+        if isinstance(agent_cfg, dict):
+            candidates.append(agent_cfg.get("max_turns"))
+        candidates.append(cfg.get("max_turns"))
+    for value in candidates:
+        try:
+            turns = int(value)
+        except (TypeError, ValueError):
+            continue
+        if turns > 0:
+            return turns
+    return default
+
+
 def _set_session_context(session_key: str) -> list:
     try:
         from gateway.session_context import set_session_vars
@@ -1158,7 +1181,7 @@ def _background_agent_kwargs(agent, task_id: str) -> dict:
         "acp_command": getattr(agent, "acp_command", None) or None,
         "acp_args": getattr(agent, "acp_args", None) or None,
         "model": getattr(agent, "model", None) or _resolve_model(),
-        "max_iterations": int(cfg.get("max_turns", 25) or 25),
+        "max_iterations": _agent_max_turns(cfg),
         "enabled_toolsets": getattr(agent, "enabled_toolsets", None)
         or _load_enabled_toolsets(),
         "quiet_mode": True,
@@ -1227,6 +1250,7 @@ def _make_agent(sid: str, key: str, session_id: str | None = None):
         acp_command=runtime.get("command"),
         acp_args=runtime.get("args"),
         credential_pool=runtime.get("credential_pool"),
+        max_iterations=_agent_max_turns(cfg),
         quiet_mode=True,
         verbose_logging=_load_tool_progress_mode() == "verbose",
         reasoning_config=_load_reasoning_config(),
@@ -4152,7 +4176,7 @@ def _(rid, params: dict) -> dict:
             {
                 "title": "Agent",
                 "rows": [
-                    ["Max Turns", str(cfg.get("max_turns", 25))],
+                    ["Max Turns", str(_agent_max_turns(cfg))],
                     ["Toolsets", ", ".join(cfg.get("enabled_toolsets", [])) or "all"],
                     ["Verbose", str(cfg.get("verbose", False))],
                 ],
