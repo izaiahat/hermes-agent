@@ -6,13 +6,19 @@ import json
 from dataclasses import asdict, dataclass
 
 CONCURRENCY = {
-    "max_concurrent_children": 10,
+    "gpt55_max_concurrent_children": 5,
+    "native_codex_max_concurrent_children": 2,
+    "gpt54_orchestrator_max_concurrent_children": 1,
     "max_spawn_depth": 3,
 }
 
 FAILURE_RECOVERY = {
     "gpt55_timeout": "retry once with the same prompt, then mark partial and continue",
-    "codex_cli_failure": "check sandbox flags and retry with an alternate sandbox mode if appropriate",
+    "native_codex_failure": (
+        "stop new Codex spawns, capture the Cloudflare / rate-limit error, and "
+        "fall back to safe gpt-5.5 leaves unless the operator explicitly requests "
+        "a Codex retry"
+    ),
     "delegate_task_failure": "fall back to terminal+hermes chat shell-out",
     "bad_child_output": "do not trust silently; add a follow-up lane and annotate the gap",
 }
@@ -47,15 +53,22 @@ GPT55_SPECIALIST = {
     "spawn_pattern": "delegate_task(goal=..., context=..., toolsets=...)",
 }
 
-CODEX_CLI = {
-    "lane": "codex_cli_long_context",
-    "role": "standalone_process",
+CODEX_NATIVE = {
+    "lane": "codex_native_subagent",
+    "model": "gpt-5.5",
+    "provider": "openai-codex",
+    "role": "leaf",
     "max_context_tokens": 1_000_000,
     "timeout_seconds": 600,
-    "command_read_only": "codex exec --skip-git-repo-check --sandbox read-only --ephemeral '<prompt>'",
-    "command_workspace_write": "codex exec --skip-git-repo-check --sandbox workspace-write --ephemeral '<prompt>'",
-    "command_json": "codex exec --skip-git-repo-check --sandbox read-only --ephemeral --json '<prompt>'",
-    "spawn_pattern": "terminal(command='codex exec ...', pty=true)",
+    "default_toolsets": {
+        "read": ["file"],
+        "write": ["file", "terminal"],
+    },
+    "spawn_pattern": (
+        "delegate_task(goal=..., context=..., toolsets=['file']) using Hermes native "
+        "openai-codex/codex_responses path"
+    ),
+    "anti_pattern": "never use raw codex exec / raw Node subprocesses",
 }
 
 GPT54_ORCHESTRATOR = {
@@ -65,7 +78,10 @@ GPT54_ORCHESTRATOR = {
     "role": "orchestrator",
     "max_context_tokens": 1_000_000,
     "timeout_seconds": 600,
-    "command": "hermes chat --provider openai-codex --model gpt-5.4 -s delegation-routing-v2 -Q -q '<self-contained orchestrator prompt>'",
+    "command": (
+        "hermes chat --provider openai-codex --model gpt-5.4 "
+        "-s delegation-routing-v2 -Q -q '<self-contained orchestrator prompt>'"
+    ),
     "spawn_pattern": "terminal(command='hermes chat ...')",
 }
 
@@ -116,16 +132,16 @@ def specialist_toolsets(task_type: str) -> list[str]:
     return GPT55_SPECIALIST["default_toolsets"].get(task_type, ["file"])
 
 
-def codex_command(profile: TaskProfile) -> str:
-    if profile.json_mode:
-        return CODEX_CLI["command_json"]
+def codex_toolsets(profile: TaskProfile) -> list[str]:
     if profile.write_allowed:
-        return CODEX_CLI["command_workspace_write"]
-    return CODEX_CLI["command_read_only"]
+        return CODEX_NATIVE["default_toolsets"]["write"]
+    return CODEX_NATIVE["default_toolsets"]["read"]
 
 
-def apply_global_limits(decision: RoutingDecision) -> RoutingDecision:
-    decision.max_concurrent_children = CONCURRENCY["max_concurrent_children"]
+def apply_global_limits(
+    decision: RoutingDecision, *, max_concurrent_children: int
+) -> RoutingDecision:
+    decision.max_concurrent_children = max_concurrent_children
     decision.max_spawn_depth = CONCURRENCY["max_spawn_depth"]
     return decision
 
@@ -139,7 +155,8 @@ def make_parent(reasons: list[str]) -> RoutingDecision:
             provider=PARENT["provider"],
             role=PARENT["role"],
             spawn_pattern=PARENT["spawn_pattern"],
-        )
+        ),
+        max_concurrent_children=1,
     )
 
 
@@ -158,24 +175,28 @@ def make_gpt55(task_type: str, reasons: list[str]) -> RoutingDecision:
                 "timeout": FAILURE_RECOVERY["gpt55_timeout"],
                 "bad_output": FAILURE_RECOVERY["bad_child_output"],
             },
-        )
+        ),
+        max_concurrent_children=CONCURRENCY["gpt55_max_concurrent_children"],
     )
 
 
 def make_codex(profile: TaskProfile, reasons: list[str]) -> RoutingDecision:
     return apply_global_limits(
         RoutingDecision(
-            lane=CODEX_CLI["lane"],
+            lane=CODEX_NATIVE["lane"],
             reasons=reasons,
-            role=CODEX_CLI["role"],
-            command=codex_command(profile),
-            spawn_pattern=CODEX_CLI["spawn_pattern"],
-            timeout_seconds=CODEX_CLI["timeout_seconds"],
+            model=CODEX_NATIVE["model"],
+            provider=CODEX_NATIVE["provider"],
+            role=CODEX_NATIVE["role"],
+            toolsets=codex_toolsets(profile),
+            spawn_pattern=CODEX_NATIVE["spawn_pattern"],
+            timeout_seconds=CODEX_NATIVE["timeout_seconds"],
             failure_recovery={
-                "failure": FAILURE_RECOVERY["codex_cli_failure"],
+                "failure": FAILURE_RECOVERY["native_codex_failure"],
                 "bad_output": FAILURE_RECOVERY["bad_child_output"],
             },
-        )
+        ),
+        max_concurrent_children=CONCURRENCY["native_codex_max_concurrent_children"],
     )
 
 
@@ -194,15 +215,23 @@ def make_gpt54_orchestrator(reasons: list[str]) -> RoutingDecision:
                 "delegate_task_failure": FAILURE_RECOVERY["delegate_task_failure"],
                 "bad_output": FAILURE_RECOVERY["bad_child_output"],
             },
-        )
+        ),
+        max_concurrent_children=CONCURRENCY["gpt54_orchestrator_max_concurrent_children"],
     )
 
 
-def choose_parallel_child(profile: TaskProfile) -> tuple[str, str | None, list[str] | None, str | None]:
+def choose_parallel_child(
+    profile: TaskProfile,
+) -> tuple[str, str | None, list[str] | None, str | None]:
     subtask_tokens = profile.subtask_estimated_tokens or profile.estimated_tokens
     subtask_files = profile.subtask_file_count or profile.file_count
     if subtask_files >= 5 or subtask_tokens > 300_000 or profile.clean_room:
-        return CODEX_CLI["lane"], None, None, codex_command(profile)
+        return (
+            CODEX_NATIVE["lane"],
+            CODEX_NATIVE["model"],
+            codex_toolsets(profile),
+            None,
+        )
     return (
         GPT55_SPECIALIST["lane"],
         GPT55_SPECIALIST["model"],
@@ -234,6 +263,11 @@ def route_task(profile: TaskProfile) -> RoutingDecision:
 
     if profile.parallel_subtasks >= 2:
         child_lane, child_model, child_toolsets, child_command = choose_parallel_child(profile)
+        max_children = (
+            CONCURRENCY["native_codex_max_concurrent_children"]
+            if child_lane == CODEX_NATIVE["lane"]
+            else CONCURRENCY["gpt55_max_concurrent_children"]
+        )
         return apply_global_limits(
             RoutingDecision(
                 lane="parallel_fanout",
@@ -242,10 +276,14 @@ def route_task(profile: TaskProfile) -> RoutingDecision:
                     f"child lane selected from subtask size: {child_lane}",
                 ],
                 spawn_pattern="spawn N children immediately and supervise in parallel",
-                timeout_seconds=GPT55_SPECIALIST["timeout_seconds"] if child_lane == GPT55_SPECIALIST["lane"] else CODEX_CLI["timeout_seconds"],
+                timeout_seconds=(
+                    GPT55_SPECIALIST["timeout_seconds"]
+                    if child_lane == GPT55_SPECIALIST["lane"]
+                    else CODEX_NATIVE["timeout_seconds"]
+                ),
                 failure_recovery={
                     "gpt55_timeout": FAILURE_RECOVERY["gpt55_timeout"],
-                    "codex_cli_failure": FAILURE_RECOVERY["codex_cli_failure"],
+                    "native_codex_failure": FAILURE_RECOVERY["native_codex_failure"],
                     "bad_output": FAILURE_RECOVERY["bad_child_output"],
                 },
                 child_lane=child_lane,
@@ -253,23 +291,30 @@ def route_task(profile: TaskProfile) -> RoutingDecision:
                 child_toolsets=child_toolsets,
                 child_command=child_command,
                 parallel_subtasks=profile.parallel_subtasks,
-            )
+            ),
+            max_concurrent_children=max_children,
         )
 
     if profile.file_count >= 5 or profile.estimated_tokens > 300_000 or profile.clean_room:
         return make_codex(
             profile,
-            ["D: 5+ files, >300k tokens, or clean-room perspective routes to Codex CLI"],
+            [
+                "D: 5+ files, >300k tokens, or clean-room perspective routes to Hermes native Codex subagent"
+            ],
         )
 
-    bounded_structured = (
-        profile.estimated_tokens <= 200_000
-        and (profile.structured_output or profile.code_review or profile.task_type in {"code", "research", "inspection"})
+    bounded_structured = profile.estimated_tokens <= 200_000 and (
+        profile.structured_output
+        or profile.code_review
+        or profile.task_type in {"code", "research", "inspection"}
     )
     if bounded_structured:
-        return make_gpt55(profile.task_type, [
-            "C: bounded reasoning / structured output under 200k routes to gpt-5.5 specialist",
-        ])
+        return make_gpt55(
+            profile.task_type,
+            [
+                "C: bounded reasoning / structured output under 200k routes to gpt-5.5 specialist"
+            ],
+        )
 
     return make_parent([
         "Fallback: task did not justify delegation overhead",
@@ -325,7 +370,9 @@ def print_examples() -> None:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Hardcoded Kael delegation router")
     parser.add_argument("description", nargs="?", default="", help="Task description")
-    parser.add_argument("--task-type", choices=["code", "research", "inspection"], default="inspection")
+    parser.add_argument(
+        "--task-type", choices=["code", "research", "inspection"], default="inspection"
+    )
     parser.add_argument("--estimated-tokens", type=int, default=0)
     parser.add_argument("--subtask-estimated-tokens", type=int, default=0)
     parser.add_argument("--file-count", type=int, default=0)
@@ -370,10 +417,15 @@ def main() -> None:
         write_allowed=args.write_allowed,
         json_mode=args.json_mode,
     )
-    print(json.dumps({
-        "profile": asdict(profile),
-        "decision": asdict(route_task(profile)),
-    }, indent=2))
+    print(
+        json.dumps(
+            {
+                "profile": asdict(profile),
+                "decision": asdict(route_task(profile)),
+            },
+            indent=2,
+        )
+    )
 
 
 if __name__ == "__main__":
