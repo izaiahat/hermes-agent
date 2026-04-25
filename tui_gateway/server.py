@@ -571,6 +571,19 @@ def _resolve_model() -> str:
     return "anthropic/claude-sonnet-4"
 
 
+def _agent_max_turns(cfg: dict) -> int:
+    """Return the effective TUI agent iteration budget.
+
+    TUI sessions should honor nested ``agent.max_turns`` the same way the CLI
+    and gateway do. Falling back to the legacy root-level ``max_turns`` keeps
+    old configs working, but nested config wins when present.
+    """
+    agent_cfg = cfg.get("agent") if isinstance(cfg, dict) else None
+    if isinstance(agent_cfg, dict) and agent_cfg.get("max_turns") is not None:
+        return int(agent_cfg.get("max_turns") or 25)
+    return int(cfg.get("max_turns", 25) or 25) if isinstance(cfg, dict) else 25
+
+
 def _write_config_key(key_path: str, value):
     cfg = _load_cfg()
     current = cfg
@@ -1220,7 +1233,9 @@ def _background_agent_kwargs(agent, task_id: str) -> dict:
         "acp_command": getattr(agent, "acp_command", None) or None,
         "acp_args": getattr(agent, "acp_args", None) or None,
         "model": getattr(agent, "model", None) or _resolve_model(),
-        "max_iterations": int(cfg.get("max_turns", 25) or 25),
+        "max_iterations": int(
+            getattr(agent, "max_iterations", None) or _agent_max_turns(cfg)
+        ),
         "enabled_toolsets": getattr(agent, "enabled_toolsets", None)
         or _load_enabled_toolsets(),
         "quiet_mode": True,
@@ -1287,6 +1302,7 @@ def _make_agent(sid: str, key: str, session_id: str | None = None):
         acp_command=runtime.get("command"),
         acp_args=runtime.get("args"),
         credential_pool=runtime.get("credential_pool"),
+        max_iterations=_agent_max_turns(cfg),
         quiet_mode=True,
         verbose_logging=_load_tool_progress_mode() == "verbose",
         reasoning_config=_load_reasoning_config(),
@@ -4241,7 +4257,7 @@ def _(rid, params: dict) -> dict:
             {
                 "title": "Agent",
                 "rows": [
-                    ["Max Turns", str(cfg.get("max_turns", 25))],
+                    ["Max Turns", str(_agent_max_turns(cfg))],
                     ["Toolsets", ", ".join(cfg.get("enabled_toolsets", [])) or "all"],
                     ["Verbose", str(cfg.get("verbose", False))],
                 ],
