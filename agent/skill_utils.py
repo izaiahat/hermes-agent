@@ -22,6 +22,9 @@ PLATFORM_MAP = {"macos": "darwin", "linux": "linux", "windows": "win32"}
 
 EXCLUDED_SKILL_DIRS = frozenset((
     ".git", ".github", ".hub", ".archive", ".curator_backups",
+    # A Curator or archive workflow can preserve a complete old skill package
+    # under these; they must never be scanned as live skills.
+    "_archived", ".archived",
     ".venv", "venv", "node_modules", "site-packages", "__pycache__",
     ".tox", ".nox", ".pytest_cache", ".mypy_cache", ".ruff_cache",
 ))
@@ -635,10 +638,48 @@ def _hermes_metadata(frontmatter: Dict[str, Any]) -> Dict[str, Any]:
 _CONDITION_KEYS = ("fallback_for_toolsets", "requires_toolsets", "fallback_for_tools", "requires_tools", "session_platforms")
 
 
+# Toolset names authors actually write versus the canonical toolset ids, so a
+# skill declaring `requires_toolsets: [files]` still gates on the `file` toolset
+# instead of silently never matching.
+_TOOLSET_ALIASES = {"files": "file", "skills_tools": "skills", "terminal_tools": "terminal"}
+_ALIASED_CONDITION_KEYS = ("fallback_for_toolsets", "requires_toolsets")
+
+
+def _normalize_condition_list(value: Any, *, aliases: Dict[str, str] | None = None) -> List[str]:
+    """A scalar, list, tuple or set of condition names as a clean list of strings.
+
+    Blank entries are dropped and simple aliases (``files`` -> ``file``) applied.
+    """
+    if value is None:
+        return []
+    if isinstance(value, str):
+        raw_items: List[Any] = [value]
+    elif isinstance(value, (list, tuple, set)):
+        raw_items = list(value)
+    else:
+        return []
+    alias_map = aliases or {}
+    normalized: List[str] = []
+    for item in raw_items:
+        text = str(item).strip()
+        if text:
+            normalized.append(alias_map.get(text, text))
+    return normalized
+
+
 def extract_skill_conditions(frontmatter: Dict[str, Any]) -> Dict[str, List]:
     """Extract conditional activation fields from parsed frontmatter (absent = ``[]``)."""
     hermes = _hermes_metadata(frontmatter)
-    return {key: hermes.get(key, []) for key in _CONDITION_KEYS}
+    conditions: Dict[str, List] = {}
+    for key in _CONDITION_KEYS:
+        raw = hermes.get(key, [])
+        if key in _ALIASED_CONDITION_KEYS:
+            conditions[key] = _normalize_condition_list(raw, aliases=_TOOLSET_ALIASES)
+        elif key.endswith("_tools"):
+            conditions[key] = _normalize_condition_list(raw)
+        else:
+            conditions[key] = raw
+    return conditions
 
 
 def extract_skill_config_vars(frontmatter: Dict[str, Any]) -> List[Dict[str, Any]]:
