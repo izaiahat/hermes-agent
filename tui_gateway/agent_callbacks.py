@@ -291,7 +291,10 @@ def _background_agent_kwargs(agent, task_id: str) -> dict:
                                      "acp_args", "ephemeral_system_prompt")},
         **{k: g(k) for k in ("providers_allowed", "providers_ignored", "providers_order", "provider_sort",
                              "provider_data_collection", "openrouter_min_coding_score")},
-        "model": g("model") or _resolve_model(), "max_iterations": _cfg_max_turns(cfg, 25),
+        "model": g("model") or _resolve_model(),
+        # A nested/side agent launched by a parent that pinned --max-turns keeps that
+        # pin; only an unpinned agent falls back to the configured default.
+        "max_iterations": int(g("max_iterations", None) or _cfg_max_turns(cfg, 25)),
         "enabled_toolsets": g("enabled_toolsets") or _load_enabled_toolsets("tui"),
         "quiet_mode": True, "verbose_logging": False,
         "provider_require_parameters": g("provider_require_parameters", False), "session_id": task_id,
