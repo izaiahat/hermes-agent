@@ -50,6 +50,7 @@ AUTHOR_MAP = {
     "maks.mir@yahoo.com": "say8hi",
     "web3blind@users.noreply.github.com": "web3blind",
     "julia@alexland.us": "alexg0bot",
+    "1060770+benjaminsehl@users.noreply.github.com": "benjaminsehl",
     # contributors (from noreply pattern)
     "david.vv@icloud.com": "davidvv",
     "wangqiang@wangqiangdeMac-mini.local": "xiaoqiang243",
@@ -66,6 +67,7 @@ AUTHOR_MAP = {
     "kshitijk4poor@gmail.com": "kshitijk4poor",
     "keira.voss94@gmail.com": "keiravoss94",
     "16443023+stablegenius49@users.noreply.github.com": "stablegenius49",
+    "simbamax99@gmail.com": "simbam99",
     "185121704+stablegenius49@users.noreply.github.com": "stablegenius49",
     "101283333+batuhankocyigit@users.noreply.github.com": "batuhankocyigit",
     "255305877+ismell0992-afk@users.noreply.github.com": "ismell0992-afk",
@@ -112,6 +114,7 @@ AUTHOR_MAP = {
     "30841158+n-WN@users.noreply.github.com": "n-WN",
     "tsuijinglei@gmail.com": "hiddenpuppy",
     "jerome@clawwork.ai": "HiddenPuppy",
+    "jerome.benoit@sap.com": "jerome-benoit",
     "wysie@users.noreply.github.com": "Wysie",
     "leoyuan0099@gmail.com": "keyuyuan",
     "bxzt2006@163.com": "Only-Code-A",
@@ -499,6 +502,7 @@ AUTHOR_MAP = {
     "zhangxicen@example.com": "zhangxicen",
     "codex@openai.invalid": "teknium1",
     "screenmachine@gmail.com": "teknium1",
+    "chenzeshi@live.com": "chen1749144759",
 }
 
 

@@ -5659,9 +5659,17 @@ class GatewayRunner:
                         lines = [f"Model switched to `{result.new_model}`"]
                         lines.append(f"Provider: {plabel}")
                         mi = result.model_info
+                        from hermes_cli.model_switch import resolve_display_context_length
+                        ctx = resolve_display_context_length(
+                            result.new_model,
+                            result.target_provider,
+                            base_url=result.base_url or current_base_url or "",
+                            api_key=result.api_key or current_api_key or "",
+                            model_info=mi,
+                        )
+                        if ctx:
+                            lines.append(f"Context: {ctx:,} tokens")
                         if mi:
-                            if mi.context_window:
-                                lines.append(f"Context: {mi.context_window:,} tokens")
                             if mi.max_output:
                                 lines.append(f"Max output: {mi.max_output:,} tokens")
                             if mi.has_cost_data():
@@ -5795,28 +5803,25 @@ class GatewayRunner:
         lines = [f"Model switched to `{result.new_model}`"]
         lines.append(f"Provider: {provider_label}")
 
-        # Rich metadata from models.dev
+        # Context: always resolve via the provider-aware chain so Codex OAuth,
+        # Copilot, and Nous-enforced caps win over the raw models.dev entry.
         mi = result.model_info
+        from hermes_cli.model_switch import resolve_display_context_length
+        ctx = resolve_display_context_length(
+            result.new_model,
+            result.target_provider,
+            base_url=result.base_url or current_base_url or "",
+            api_key=result.api_key or current_api_key or "",
+            model_info=mi,
+        )
+        if ctx:
+            lines.append(f"Context: {ctx:,} tokens")
         if mi:
-            if mi.context_window:
-                lines.append(f"Context: {mi.context_window:,} tokens")
             if mi.max_output:
                 lines.append(f"Max output: {mi.max_output:,} tokens")
             if mi.has_cost_data():
                 lines.append(f"Cost: {mi.format_cost()}")
             lines.append(f"Capabilities: {mi.format_capabilities()}")
-        else:
-            try:
-                from agent.model_metadata import get_model_context_length
-                ctx = get_model_context_length(
-                    result.new_model,
-                    base_url=result.base_url or current_base_url,
-                    api_key=result.api_key or current_api_key,
-                    provider=result.target_provider,
-                )
-                lines.append(f"Context: {ctx:,} tokens")
-            except Exception:
-                pass
 
         # Cache notice
         cache_enabled = (
@@ -7228,13 +7233,19 @@ class GatewayRunner:
                 logger.debug("Failed to list titled sessions: %s", e)
                 return f"Could not list sessions: {e}"
 
-        # Resolve the name to a session ID
+        # Resolve the name to a session ID.
         target_id = self._session_db.resolve_session_by_title(name)
         if not target_id:
             return (
                 f"No session found matching '**{name}**'.\n"
                 "Use `/resume` with no arguments to see available sessions."
             )
+        # Compression creates child continuations that hold the live transcript.
+        # Follow that chain so gateway /resume matches CLI behavior (#15000).
+        try:
+            target_id = self._session_db.resolve_resume_session_id(target_id)
+        except Exception as e:
+            logger.debug("Failed to resolve resume continuation for %s: %s", target_id, e)
 
         # Check if already on that session
         current_entry = self.session_store.get_or_create_session(source)

@@ -4162,6 +4162,49 @@ class AIAgent:
         except Exception:
             pass
 
+    def _sync_external_memory_for_turn(
+        self,
+        *,
+        original_user_message: Any,
+        final_response: Any,
+        interrupted: bool,
+    ) -> None:
+        """Mirror a completed turn into external memory providers.
+
+        Called at the end of ``run_conversation`` with the cleaned user
+        message (``original_user_message``) and the finalised assistant
+        response.  The external memory backend gets both ``sync_all`` (to
+        persist the exchange) and ``queue_prefetch_all`` (to start
+        warming context for the next turn) in one shot.
+
+        Uses ``original_user_message`` rather than ``user_message``
+        because the latter may carry injected skill content that bloats
+        or breaks provider queries.
+
+        Interrupted turns are skipped entirely (#15218).  A partial
+        assistant output, an aborted tool chain, or a mid-stream reset
+        is not durable conversational truth — mirroring it into an
+        external memory backend pollutes future recall with state the
+        user never saw completed.  The prefetch is gated on the same
+        flag: the user's next message is almost certainly a retry of
+        the same intent, and a prefetch keyed on the interrupted turn
+        would fire against stale context.
+
+        Normal completed turns still sync as before.  The whole body is
+        wrapped in ``try/except Exception`` because external memory
+        providers are strictly best-effort — a misconfigured or offline
+        backend must not block the user from seeing their response.
+        """
+        if interrupted:
+            return
+        if not (self._memory_manager and final_response and original_user_message):
+            return
+        try:
+            self._memory_manager.sync_all(original_user_message, final_response)
+            self._memory_manager.queue_prefetch_all(original_user_message)
+        except Exception:
+            pass
+
     def release_clients(self) -> None:
         """Release LLM client resources WITHOUT tearing down session tool state.
 
@@ -7582,6 +7625,12 @@ class AIAgent:
             raw_reasoning_content = getattr(assistant_message, "reasoning_content", None)
             if raw_reasoning_content is not None:
                 msg["reasoning_content"] = _sanitize_surrogates(raw_reasoning_content)
+            elif msg.get("tool_calls") and self._needs_deepseek_tool_reasoning():
+                # DeepSeek thinking mode requires reasoning_content on every
+                # assistant tool-call message. Without it, replaying the
+                # persisted message causes HTTP 400. Include empty string
+                # as a defensive compatibility fallback (refs #15250).
+                msg["reasoning_content"] = ""
 
         if hasattr(assistant_message, 'reasoning_details') and assistant_message.reasoning_details:
             # Pass reasoning_details back unmodified so providers (OpenRouter,
@@ -7657,6 +7706,35 @@ class AIAgent:
 
         return msg
 
+    def _needs_kimi_tool_reasoning(self) -> bool:
+        """Return True when the current provider is Kimi / Moonshot thinking mode.
+
+        Kimi ``/coding`` and Moonshot thinking mode both require
+        ``reasoning_content`` on every assistant tool-call message; omitting
+        it causes the next replay to fail with HTTP 400.
+        """
+        return (
+            self.provider in {"kimi-coding", "kimi-coding-cn"}
+            or base_url_host_matches(self.base_url, "api.kimi.com")
+            or base_url_host_matches(self.base_url, "moonshot.ai")
+            or base_url_host_matches(self.base_url, "moonshot.cn")
+        )
+
+    def _needs_deepseek_tool_reasoning(self) -> bool:
+        """Return True when the current provider is DeepSeek thinking mode.
+
+        DeepSeek V4 thinking mode requires ``reasoning_content`` on every
+        assistant tool-call turn; omitting it causes HTTP 400 when the
+        message is replayed in a subsequent API request (#15250).
+        """
+        provider = (self.provider or "").lower()
+        model = (self.model or "").lower()
+        return (
+            provider == "deepseek"
+            or "deepseek" in model
+            or base_url_host_matches(self.base_url, "api.deepseek.com")
+        )
+
     def _copy_reasoning_content_for_api(self, source_msg: dict, api_msg: dict) -> None:
         """Copy provider-facing reasoning fields onto an API replay message."""
         if source_msg.get("role") != "assistant":
@@ -7672,13 +7750,14 @@ class AIAgent:
             api_msg["reasoning_content"] = normalized_reasoning
             return
 
-        kimi_requires_reasoning = (
-            self.provider in {"kimi-coding", "kimi-coding-cn"}
-            or base_url_host_matches(self.base_url, "api.kimi.com")
-            or base_url_host_matches(self.base_url, "moonshot.ai")
-            or base_url_host_matches(self.base_url, "moonshot.cn")
-        )
-        if kimi_requires_reasoning and source_msg.get("tool_calls"):
+        # Providers that require an echoed reasoning_content on every
+        # assistant tool-call turn. Detection logic lives in the per-provider
+        # helpers so both the creation path (_build_assistant_message) and
+        # this replay path stay in sync.
+        if source_msg.get("tool_calls") and (
+            self._needs_kimi_tool_reasoning()
+            or self._needs_deepseek_tool_reasoning()
+        ):
             api_msg["reasoning_content"] = ""
 
     @staticmethod
@@ -9052,6 +9131,7 @@ class AIAgent:
             api_messages = []
             for msg in messages:
                 api_msg = msg.copy()
+                self._copy_reasoning_content_for_api(msg, api_msg)
                 for internal_field in ("reasoning", "finish_reason", "_thinking_prefill"):
                     api_msg.pop(internal_field, None)
                 if _needs_sanitize:
@@ -12524,14 +12604,11 @@ class AIAgent:
             self._iters_since_skill = 0
 
         # External memory provider: sync the completed turn + queue next prefetch.
-        # Use original_user_message (clean input) — user_message may contain
-        # injected skill content that bloats / breaks provider queries.
-        if self._memory_manager and final_response and original_user_message:
-            try:
-                self._memory_manager.sync_all(original_user_message, final_response)
-                self._memory_manager.queue_prefetch_all(original_user_message)
-            except Exception:
-                pass
+        self._sync_external_memory_for_turn(
+            original_user_message=original_user_message,
+            final_response=final_response,
+            interrupted=interrupted,
+        )
 
         # Background memory/skill review — runs AFTER the response is delivered
         # so it never competes with the user's task for model attention.
