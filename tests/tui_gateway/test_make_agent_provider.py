@@ -60,6 +60,74 @@ def test_make_agent_passes_resolved_provider():
         assert call_kwargs.kwargs["api_mode"] == "anthropic_messages"
 
 
+def test_make_agent_uses_nested_agent_max_turns_for_max_iterations():
+    fake_runtime = {
+        "provider": "openrouter",
+        "base_url": "https://openrouter.ai/api/v1",
+        "api_key": "***",
+        "api_mode": "chat_completions",
+        "command": None,
+        "args": None,
+        "credential_pool": None,
+    }
+
+    fake_cfg = {
+        "model": {"default": "gpt-5.4", "provider": "openai-codex"},
+        "agent": {"system_prompt": "test", "max_turns": 2200},
+    }
+
+    with (
+        patch("tui_gateway.server._load_cfg", return_value=fake_cfg),
+        patch("tui_gateway.server._get_db", return_value=MagicMock()),
+        patch("tui_gateway.server._load_tool_progress_mode", return_value="compact"),
+        patch("tui_gateway.server._load_reasoning_config", return_value=None),
+        patch("tui_gateway.server._load_service_tier", return_value=None),
+        patch("tui_gateway.server._load_enabled_toolsets", return_value=None),
+        patch(
+            "hermes_cli.runtime_provider.resolve_runtime_provider",
+            return_value=fake_runtime,
+        ),
+        patch("run_agent.AIAgent") as mock_agent,
+    ):
+        from tui_gateway.server import _make_agent
+
+        _make_agent("sid-max-turns", "key-max-turns")
+
+        assert mock_agent.call_args.kwargs["max_iterations"] == 2200
+
+
+def test_background_agent_kwargs_prefers_agent_max_iterations_then_nested_config():
+    fake_cfg = {"agent": {"max_turns": 2200}}
+    agent = MagicMock()
+    agent.base_url = "https://chatgpt.com/backend-api/codex"
+    agent.api_key = "***"
+    agent.provider = "openai-codex"
+    agent.api_mode = "codex_responses"
+    agent.acp_command = None
+    agent.acp_args = None
+    agent.model = "gpt-5.4"
+    agent.enabled_toolsets = ["terminal", "file"]
+    agent.ephemeral_system_prompt = None
+    agent.providers_allowed = None
+    agent.providers_ignored = None
+    agent.providers_order = None
+    agent.provider_sort = None
+    agent.provider_require_parameters = False
+    agent.provider_data_collection = None
+    agent.reasoning_config = None
+    agent.service_tier = None
+    agent.request_overrides = {}
+    agent._fallback_model = None
+    agent.max_iterations = 2200
+
+    with patch("tui_gateway.server._load_cfg", return_value=fake_cfg):
+        from tui_gateway.server import _background_agent_kwargs
+
+        kwargs = _background_agent_kwargs(agent, "task-1")
+
+    assert kwargs["max_iterations"] == 2200
+
+
 def test_make_agent_ignores_display_personality_without_system_prompt():
     """The TUI matches the classic CLI: personality only becomes active once
     it has been saved to agent.system_prompt."""
