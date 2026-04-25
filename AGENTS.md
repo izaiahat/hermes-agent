@@ -181,6 +181,18 @@ source .venv/bin/activate   # or: source venv/bin/activate
 `scripts/run_tests.sh` probes `.venv`, then `venv`, then `$HOME/.hermes/hermes-agent/venv`
 (worktrees sharing the main checkout's venv).
 
+## Local fork doctrine note
+
+This checkout also carries Kael's hardcoded delegation router.
+
+Primary references:
+- `scripts/kael_delegation_router.py`
+- `KAEL-DELEGATION-ROUTING-V2.md`
+- `~/.hermes/skills/delegation-routing-v2/SKILL.md`
+- `/home/ubuntu/business/reports/delegation-system-hardcoded-2026-04-25.md`
+
+When work in this repo involves deciding whether to keep execution in the parent, spawn a `gpt-5.5` specialist, use Codex CLI for long-context work, or launch a `gpt-5.4` orchestrator child, follow that router rather than ad-hoc judgment.
+
 ## Project Structure
 
 Counts shift constantly; the filesystem is canonical. Load-bearing entry points:
