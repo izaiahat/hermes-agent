@@ -101,7 +101,7 @@ _PLATFORM_MAP = {
     "windows": "win32",
 }
 _ENV_VAR_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
-_EXCLUDED_SKILL_DIRS = frozenset((".git", ".github", ".hub", ".archive"))
+_EXCLUDED_SKILL_DIRS = frozenset((".git", ".github", ".hub", ".archive", "_archived", ".archived"))
 _REMOTE_ENV_BACKENDS = frozenset(
     {"docker", "singularity", "modal", "ssh", "daytona", "vercel_sandbox"}
 )
@@ -1007,6 +1007,22 @@ def skill_view(
             for found_md in search_dir.rglob(f"{name}.md"):
                 if found_md.name != "SKILL.md":
                     _record(None, found_md)
+
+        # Strategy 4: frontmatter name lookup. This preserves the fork's
+        # selector-improvement behavior while still feeding every match into the
+        # upstream candidate/collision detector instead of silently choosing the
+        # first frontmatter match.
+        for search_dir in all_dirs:
+            for found_skill_md in iter_skill_index_files(search_dir, "SKILL.md"):
+                try:
+                    found_frontmatter, _ = _parse_frontmatter(
+                        found_skill_md.read_text(encoding="utf-8")[:4000]
+                    )
+                except Exception:
+                    continue
+                found_name = str(found_frontmatter.get("name") or "").strip()
+                if found_name == name:
+                    _record(found_skill_md.parent, found_skill_md)
 
         if len(candidates) > 1:
             paths = [str(smd) for _, smd in candidates]
