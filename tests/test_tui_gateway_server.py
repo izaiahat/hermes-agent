@@ -13954,6 +13954,7 @@ class _FakeAgentForBackground:
     service_tier = None
     request_overrides = {}
     _fallback_model = None
+    max_iterations: int | None = None
 
 
 def test_background_agent_kwargs_reads_nested_max_turns(monkeypatch):
@@ -13962,6 +13963,16 @@ def test_background_agent_kwargs_reads_nested_max_turns(monkeypatch):
     kwargs = server._background_agent_kwargs(_FakeAgentForBackground(), "task_1")
 
     assert kwargs["max_iterations"] == 300
+
+
+def test_background_agent_kwargs_prefers_agent_max_iterations(monkeypatch):
+    monkeypatch.setattr(server, "_load_cfg", lambda: {"agent": {"max_turns": 300}})
+    agent = _FakeAgentForBackground()
+    agent.max_iterations = 2200
+
+    kwargs = server._background_agent_kwargs(agent, "task_1")
+
+    assert kwargs["max_iterations"] == 2200
 
 
 def test_background_agent_kwargs_falls_back_to_root_max_turns(monkeypatch):
