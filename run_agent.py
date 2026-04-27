@@ -897,7 +897,8 @@ class AIAgent:
         fallback_model: Dict[str, Any] = None,
         credential_pool=None,
         checkpoints_enabled: bool = False,
-        checkpoint_max_snapshots: int = 50,
+        checkpoint_max_snapshots: int = 10,
+        checkpoint_max_total_bytes: int = 1_000_000_000,
         pass_session_id: bool = False,
     ):
         """
@@ -1556,6 +1557,7 @@ class AIAgent:
         self._checkpoint_mgr = CheckpointManager(
             enabled=checkpoints_enabled,
             max_snapshots=checkpoint_max_snapshots,
+            max_total_bytes=checkpoint_max_total_bytes,
         )
         
         # SQLite session store (optional -- provided by CLI or gateway)

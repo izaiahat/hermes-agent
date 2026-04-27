@@ -19,11 +19,15 @@ into the user's project directory.
 """
 
 import hashlib
+import io
 import logging
 import os
 import re
 import shutil
 import subprocess
+import tarfile
+import tempfile
+import time
 from pathlib import Path
 from hermes_constants import get_hermes_home
 from typing import Dict, List, Optional, Set
@@ -268,6 +272,153 @@ def _dir_file_count(path: str) -> int:
     return count
 
 
+def _shadow_repo_size_bytes(shadow_repo: Path) -> int:
+    """Best-effort recursive size calculation for a shadow repo."""
+    total = 0
+    try:
+        for child in shadow_repo.rglob("*"):
+            try:
+                if child.is_file():
+                    total += child.stat().st_size
+            except OSError:
+                continue
+    except OSError:
+        return total
+    return total
+
+
+def _clear_worktree_except_git(worktree: Path) -> None:
+    """Remove all files from a temp worktree except its ``.git`` directory."""
+    for child in worktree.iterdir():
+        if child.name == ".git":
+            continue
+        try:
+            if child.is_dir() and not child.is_symlink():
+                shutil.rmtree(child, ignore_errors=True)
+            else:
+                child.unlink(missing_ok=True)
+        except OSError:
+            shutil.rmtree(child, ignore_errors=True)
+
+
+def _touch_tree_contents(worktree: Path) -> None:
+    """Bump mtimes after archive extraction to avoid racy-git false clean reads."""
+    now = time.time()
+    for child in worktree.rglob("*"):
+        try:
+            os.utime(child, (now, now), follow_symlinks=False)
+        except OSError:
+            continue
+
+
+def _rebuild_shadow_repo(
+    source_shadow_repo: Path,
+    working_dir: str,
+    commit_hashes: List[str],
+) -> Optional[Path]:
+    """Rebuild a shadow repo containing only ``commit_hashes`` in order.
+
+    Returns a path to the rebuilt shadow repo on success, or ``None`` on any
+    failure. The rebuilt repo is created in a temporary directory and must be
+    moved into place by the caller.
+    """
+    if not commit_hashes:
+        return None
+
+    tmp_root = Path(tempfile.mkdtemp(prefix=f"{source_shadow_repo.name}-prune-", dir=str(source_shadow_repo.parent)))
+    temp_worktree = tmp_root / "worktree"
+    temp_worktree.mkdir(parents=True, exist_ok=True)
+    temp_shadow = tmp_root / "shadow"
+
+    init_err = _init_shadow_repo(temp_shadow, str(temp_worktree))
+    if init_err:
+        shutil.rmtree(tmp_root, ignore_errors=True)
+        return None
+
+    for commit_hash in commit_hashes:
+        _clear_worktree_except_git(temp_worktree)
+
+        archive = subprocess.run(
+            ["git", "archive", commit_hash],
+            cwd=str(_normalize_path(working_dir)),
+            env=_git_env(source_shadow_repo, working_dir),
+            capture_output=True,
+            timeout=_GIT_TIMEOUT * 4,
+        )
+        if archive.returncode != 0:
+            shutil.rmtree(tmp_root, ignore_errors=True)
+            return None
+
+        try:
+            with tarfile.open(fileobj=io.BytesIO(archive.stdout), mode="r:") as tar:
+                tar.extractall(temp_worktree)
+            _touch_tree_contents(temp_worktree)
+        except (tarfile.TarError, OSError):
+            shutil.rmtree(tmp_root, ignore_errors=True)
+            return None
+
+        ok, meta, _ = _run_git(
+            ["show", "-s", "--format=%aI%x00%B", commit_hash],
+            source_shadow_repo,
+            working_dir,
+        )
+        if not ok:
+            shutil.rmtree(tmp_root, ignore_errors=True)
+            return None
+        author_date, _, message = meta.partition("\x00")
+
+        ok, _, _ = _run_git(["add", "-A"], temp_shadow, str(temp_worktree))
+        if not ok:
+            shutil.rmtree(tmp_root, ignore_errors=True)
+            return None
+
+        env = _git_env(temp_shadow, str(temp_worktree))
+        env["GIT_AUTHOR_DATE"] = author_date.strip() or time.strftime("%Y-%m-%dT%H:%M:%S%z")
+        env["GIT_COMMITTER_DATE"] = author_date.strip() or env["GIT_AUTHOR_DATE"]
+        commit = subprocess.run(
+            ["git", "commit", "--allow-empty-message", "-F", "-", "--no-gpg-sign"],
+            cwd=str(_normalize_path(str(temp_worktree))),
+            env=env,
+            input=message,
+            text=True,
+            capture_output=True,
+            timeout=_GIT_TIMEOUT * 4,
+        )
+        if commit.returncode != 0:
+            shutil.rmtree(tmp_root, ignore_errors=True)
+            return None
+
+    _run_git(["gc", "--prune=now", "--aggressive"], temp_shadow, str(temp_worktree))
+    return temp_shadow
+
+
+def _replace_shadow_repo(shadow_repo: Path, replacement_repo: Path, working_dir: str) -> bool:
+    """Atomically-ish replace ``shadow_repo`` with ``replacement_repo`` contents."""
+    replacement = shadow_repo.parent / f".{shadow_repo.name}.replacement"
+    backup = shadow_repo.parent / f".{shadow_repo.name}.backup"
+
+    shutil.rmtree(replacement, ignore_errors=True)
+    shutil.rmtree(backup, ignore_errors=True)
+    shutil.copytree(replacement_repo, replacement)
+    (replacement / "HERMES_WORKDIR").write_text(
+        str(_normalize_path(working_dir)) + "\n", encoding="utf-8"
+    )
+
+    try:
+        if shadow_repo.exists():
+            shadow_repo.rename(backup)
+        replacement.rename(shadow_repo)
+        shutil.rmtree(backup, ignore_errors=True)
+        return True
+    except OSError:
+        if shadow_repo.exists():
+            shutil.rmtree(shadow_repo, ignore_errors=True)
+        if backup.exists() and not shadow_repo.exists():
+            backup.rename(shadow_repo)
+        shutil.rmtree(replacement, ignore_errors=True)
+        return False
+
+
 # ---------------------------------------------------------------------------
 # CheckpointManager
 # ---------------------------------------------------------------------------
@@ -286,11 +437,16 @@ class CheckpointManager:
         Master switch (from config / CLI flag).
     max_snapshots : int
         Keep at most this many checkpoints per directory.
+    max_total_bytes : int
+        If the shadow repo still exceeds this size after commit-count pruning,
+        drop oldest checkpoints until the repo is at or under the cap, always
+        preserving the most recent checkpoint.
     """
 
-    def __init__(self, enabled: bool = False, max_snapshots: int = 50):
+    def __init__(self, enabled: bool = False, max_snapshots: int = 10, max_total_bytes: int = 1_000_000_000):
         self.enabled = enabled
-        self.max_snapshots = max_snapshots
+        self.max_snapshots = max(1, int(max_snapshots or 10))
+        self.max_total_bytes = max(0, int(max_total_bytes or 0))
         self._checkpointed_dirs: Set[str] = set()
         self._git_available: Optional[bool] = None  # lazy probe
 
@@ -599,27 +755,58 @@ class CheckpointManager:
         return True
 
     def _prune(self, shadow_repo: Path, working_dir: str) -> None:
-        """Keep only the last max_snapshots commits via orphan reset."""
+        """Enforce checkpoint count and size limits on a shadow repo."""
         ok, stdout, _ = _run_git(
-            ["rev-list", "--count", "HEAD"], shadow_repo, working_dir,
+            ["rev-list", "--reverse", "HEAD"], shadow_repo, working_dir,
         )
         if not ok:
             return
 
-        try:
-            count = int(stdout)
-        except ValueError:
+        commits = [line.strip() for line in stdout.splitlines() if line.strip()]
+        if not commits:
             return
 
-        if count <= self.max_snapshots:
+        repo_bytes = _shadow_repo_size_bytes(shadow_repo)
+        within_count = len(commits) <= self.max_snapshots
+        within_size = self.max_total_bytes <= 0 or repo_bytes <= self.max_total_bytes
+        if within_count and within_size:
             return
 
-        # For simplicity, we don't actually prune — git's pack mechanism
-        # handles this efficiently, and the objects are small.  The log
-        # listing is already limited by max_snapshots.
-        # Full pruning would require rebase --onto or filter-branch which
-        # is fragile for a background feature.  We just limit the log view.
-        logger.debug("Checkpoint repo has %d commits (limit %d)", count, self.max_snapshots)
+        keep_hashes = commits[-min(len(commits), self.max_snapshots):]
+        while keep_hashes:
+            rebuilt = _rebuild_shadow_repo(shadow_repo, working_dir, keep_hashes)
+            if rebuilt is None:
+                logger.warning(
+                    "Checkpoint prune skipped: failed to rebuild shadow repo for %s",
+                    working_dir,
+                )
+                return
+
+            rebuilt_bytes = _shadow_repo_size_bytes(rebuilt)
+            size_ok = self.max_total_bytes <= 0 or rebuilt_bytes <= self.max_total_bytes
+            replace_ok = size_ok or len(keep_hashes) == 1
+            temp_root = rebuilt.parent
+
+            if replace_ok:
+                if _replace_shadow_repo(shadow_repo, rebuilt, working_dir):
+                    logger.info(
+                        "Checkpoint prune enforced for %s: commits %d→%d, bytes %d→%d",
+                        working_dir,
+                        len(commits),
+                        len(keep_hashes),
+                        repo_bytes,
+                        rebuilt_bytes,
+                    )
+                else:
+                    logger.warning(
+                        "Checkpoint prune skipped: failed to replace shadow repo for %s",
+                        working_dir,
+                    )
+                shutil.rmtree(temp_root, ignore_errors=True)
+                return
+
+            shutil.rmtree(temp_root, ignore_errors=True)
+            keep_hashes = keep_hashes[1:]
 
 
 def format_checkpoint_list(checkpoints: List[Dict], directory: str) -> str:
@@ -658,11 +845,11 @@ def format_checkpoint_list(checkpoints: List[Dict], directory: str) -> str:
 # ---------------------------------------------------------------------------
 #
 # Every working directory the agent has ever touched gets its own shadow
-# repo under CHECKPOINT_BASE.  Per-repo ``_prune`` is a no-op (see comment
-# in CheckpointManager._prune), so abandoned repos (deleted projects,
-# one-off tmp dirs, long-stale work trees) accumulate forever.  Field
-# reports put the typical offender at 1000+ repos / ~12 GB on active
-# contributor machines.
+# repo under CHECKPOINT_BASE. Per-repo ``_prune`` now enforces commit-count
+# and size caps for active repos, but abandoned repos (deleted projects,
+# one-off tmp dirs, long-stale work trees) can still accumulate forever
+# without a base-directory sweep. Field reports put the typical offender at
+# 1000+ repos / ~12 GB on active contributor machines.
 #
 # ``prune_checkpoints`` sweeps CHECKPOINT_BASE at startup, deleting shadow
 # repos that match either criterion:

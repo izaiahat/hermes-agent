@@ -256,6 +256,38 @@ class TestListCheckpoints:
         assert listed[0]["reason"] == "initial"
 
 
+class TestCheckpointRetention:
+    def test_prune_keeps_only_last_max_snapshots(self, checkpoint_base, work_dir, monkeypatch):
+        monkeypatch.setattr("tools.checkpoint_manager.CHECKPOINT_BASE", checkpoint_base)
+        mgr = CheckpointManager(enabled=True, max_snapshots=3, max_total_bytes=0)
+
+        for i in range(1, 6):
+            (work_dir / "main.py").write_text(f"v{i}\\n")
+            assert mgr.ensure_checkpoint(str(work_dir), f"checkpoint {i}") is True
+            mgr.new_turn()
+
+        checkpoints = mgr.list_checkpoints(str(work_dir))
+        assert len(checkpoints) == 3
+        assert [cp["reason"] for cp in checkpoints] == [
+            "checkpoint 5",
+            "checkpoint 4",
+            "checkpoint 3",
+        ]
+
+    def test_size_cap_preserves_only_most_recent_when_needed(self, checkpoint_base, work_dir, monkeypatch):
+        monkeypatch.setattr("tools.checkpoint_manager.CHECKPOINT_BASE", checkpoint_base)
+        mgr = CheckpointManager(enabled=True, max_snapshots=10, max_total_bytes=1)
+
+        for i in range(1, 4):
+            (work_dir / "main.py").write_text((f"v{i}\\n") * 200)
+            assert mgr.ensure_checkpoint(str(work_dir), f"checkpoint {i}") is True
+            mgr.new_turn()
+
+        checkpoints = mgr.list_checkpoints(str(work_dir))
+        assert len(checkpoints) == 1
+        assert checkpoints[0]["reason"] == "checkpoint 3"
+
+
 # =========================================================================
 # CheckpointManager — restoring
 # =========================================================================
