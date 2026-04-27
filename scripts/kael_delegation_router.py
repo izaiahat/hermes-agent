@@ -1,9 +1,21 @@
 #!/usr/bin/env python3
+"""Production-grade hardcoded Kael delegation router.
+
+This script encodes Kael's routing doctrine in a deterministic form so it can be:
+- unit tested
+- inspected from the CLI
+- used as a doctrine/regression artifact beside the live skill/config/docs
+
+Important: this script is currently a doctrine-encoding artifact, not a runtime
+hook automatically invoked by Kael inside Hermes core. See `integration_status()`.
+"""
+
 from __future__ import annotations
 
 import argparse
 import json
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
+from typing import Any, Iterable, Sequence
 
 CONCURRENCY = {
     "gpt55_max_concurrent_children": 10,
@@ -58,6 +70,7 @@ CODEX_NATIVE = {
     "model": "gpt-5.5",
     "provider": "openai-codex",
     "role": "leaf",
+    "api_mode": "codex_responses",
     "max_context_tokens": 1_000_000,
     "timeout_seconds": 600,
     "default_toolsets": {
@@ -85,9 +98,17 @@ GPT54_ORCHESTRATOR = {
     "spawn_pattern": "terminal(command='hermes chat ...')",
 }
 
+_ALLOWED_TASK_TYPES = frozenset({"code", "research", "inspection"})
 
-@dataclass
+
+@dataclass(slots=True)
 class TaskProfile:
+    """Normalized task facts used by the hardcoded router.
+
+    The profile is intentionally compact and declarative. It captures the
+    features of a task that matter to routing, not every execution detail.
+    """
+
     description: str
     task_type: str = "inspection"
     estimated_tokens: int = 0
@@ -105,10 +126,39 @@ class TaskProfile:
     broad_domains: int = 0
     write_allowed: bool = False
     json_mode: bool = False
+    subtask_token_samples: tuple[int, ...] = field(default_factory=tuple)
+    subtask_file_samples: tuple[int, ...] = field(default_factory=tuple)
+
+    def __post_init__(self) -> None:
+        if self.task_type not in _ALLOWED_TASK_TYPES:
+            raise ValueError(
+                f"Invalid task_type '{self.task_type}'. Allowed: {sorted(_ALLOWED_TASK_TYPES)}"
+            )
+        if not isinstance(self.description, str):
+            raise ValueError("description must be a string")
+
+        for name in (
+            "estimated_tokens",
+            "subtask_estimated_tokens",
+            "file_count",
+            "subtask_file_count",
+            "parallel_subtasks",
+            "broad_domains",
+        ):
+            _validate_non_negative_int(name, getattr(self, name))
+
+        self.subtask_token_samples = _normalize_int_samples(
+            "subtask_token_samples", self.subtask_token_samples
+        )
+        self.subtask_file_samples = _normalize_int_samples(
+            "subtask_file_samples", self.subtask_file_samples
+        )
 
 
-@dataclass
+@dataclass(slots=True)
 class RoutingDecision:
+    """Structured router output suitable for tests and CLI JSON rendering."""
+
     lane: str
     reasons: list[str]
     model: str | None = None
@@ -128,11 +178,46 @@ class RoutingDecision:
     max_spawn_depth: int | None = None
 
 
+@dataclass(slots=True)
+class ValidationCase:
+    """Expected outcome for a representative routing regression case."""
+
+    name: str
+    profile: TaskProfile
+    expected_lane: str
+    expected_max_concurrent_children: int
+    expected_child_lane: str | None = None
+    expected_model: str | None = None
+
+
+def _validate_non_negative_int(name: str, value: Any) -> None:
+    """Reject non-integers and negative counts/tokens."""
+    if not isinstance(value, int):
+        raise ValueError(f"{name} must be an int, got {type(value).__name__}")
+    if value < 0:
+        raise ValueError(f"{name} must be non-negative, got {value}")
+
+
+def _normalize_int_samples(name: str, values: Sequence[int]) -> tuple[int, ...]:
+    """Validate and normalize a sequence of non-negative integer samples."""
+    if values is None:
+        return ()
+    if not isinstance(values, Sequence) or isinstance(values, (str, bytes)):
+        raise ValueError(f"{name} must be a sequence of ints")
+    normalized: list[int] = []
+    for idx, value in enumerate(values):
+        _validate_non_negative_int(f"{name}[{idx}]", value)
+        normalized.append(value)
+    return tuple(normalized)
+
+
 def specialist_toolsets(task_type: str) -> list[str]:
+    """Return default leaf toolsets for the given bounded-task type."""
     return GPT55_SPECIALIST["default_toolsets"].get(task_type, ["file"])
 
 
 def codex_toolsets(profile: TaskProfile) -> list[str]:
+    """Return the native-Codex toolset mix for the task profile."""
     if profile.write_allowed:
         return CODEX_NATIVE["default_toolsets"]["write"]
     return CODEX_NATIVE["default_toolsets"]["read"]
@@ -141,12 +226,14 @@ def codex_toolsets(profile: TaskProfile) -> list[str]:
 def apply_global_limits(
     decision: RoutingDecision, *, max_concurrent_children: int
 ) -> RoutingDecision:
+    """Attach the current hard caps to a routing decision."""
     decision.max_concurrent_children = max_concurrent_children
     decision.max_spawn_depth = CONCURRENCY["max_spawn_depth"]
     return decision
 
 
 def make_parent(reasons: list[str]) -> RoutingDecision:
+    """Build a decision that keeps work in the Kael parent."""
     return apply_global_limits(
         RoutingDecision(
             lane=PARENT["lane"],
@@ -161,6 +248,7 @@ def make_parent(reasons: list[str]) -> RoutingDecision:
 
 
 def make_gpt55(task_type: str, reasons: list[str]) -> RoutingDecision:
+    """Build a bounded specialist-leaf decision."""
     return apply_global_limits(
         RoutingDecision(
             lane=GPT55_SPECIALIST["lane"],
@@ -181,6 +269,7 @@ def make_gpt55(task_type: str, reasons: list[str]) -> RoutingDecision:
 
 
 def make_codex(profile: TaskProfile, reasons: list[str]) -> RoutingDecision:
+    """Build a native-Codex child decision for large-context work."""
     return apply_global_limits(
         RoutingDecision(
             lane=CODEX_NATIVE["lane"],
@@ -201,6 +290,7 @@ def make_codex(profile: TaskProfile, reasons: list[str]) -> RoutingDecision:
 
 
 def make_gpt54_orchestrator(reasons: list[str]) -> RoutingDecision:
+    """Build a native Hermes CLI orchestrator-child decision."""
     return apply_global_limits(
         RoutingDecision(
             lane=GPT54_ORCHESTRATOR["lane"],
@@ -220,11 +310,38 @@ def make_gpt54_orchestrator(reasons: list[str]) -> RoutingDecision:
     )
 
 
+def _largest_subtask_tokens(profile: TaskProfile) -> int:
+    """Return the largest known subtask token estimate.
+
+    If explicit sample data exists, it wins. Otherwise fall back to the legacy
+    single subtask estimate or the overall estimate.
+    """
+    if profile.subtask_token_samples:
+        return max(profile.subtask_token_samples)
+    if profile.subtask_estimated_tokens:
+        return profile.subtask_estimated_tokens
+    return profile.estimated_tokens
+
+
+def _largest_subtask_file_count(profile: TaskProfile) -> int:
+    """Return the largest known subtask file-count estimate."""
+    if profile.subtask_file_samples:
+        return max(profile.subtask_file_samples)
+    if profile.subtask_file_count:
+        return profile.subtask_file_count
+    return profile.file_count
+
+
 def choose_parallel_child(
     profile: TaskProfile,
 ) -> tuple[str, str | None, list[str] | None, str | None]:
-    subtask_tokens = profile.subtask_estimated_tokens or profile.estimated_tokens
-    subtask_files = profile.subtask_file_count or profile.file_count
+    """Choose the child lane for a parallel-fanout task.
+
+    This uses the *largest* known subtask size, so mixed-size bursts route to a
+    safe lane if any one subtask needs the heavier native-Codex treatment.
+    """
+    subtask_tokens = _largest_subtask_tokens(profile)
+    subtask_files = _largest_subtask_file_count(profile)
     if subtask_files >= 5 or subtask_tokens > 300_000 or profile.clean_room:
         return (
             CODEX_NATIVE["lane"],
@@ -241,6 +358,17 @@ def choose_parallel_child(
 
 
 def route_task(profile: TaskProfile) -> RoutingDecision:
+    """Route a normalized task profile to the hardcoded Kael lane.
+
+    Precedence is intentional:
+    1. Parent-only safety / irreversibility
+    2. Tiny local work
+    3. Broad-domain orchestrator topology
+    4. Parallel topology
+    5. Large-corpus native Codex lane
+    6. Bounded gpt-5.5 specialist
+    7. Parent fallback
+    """
     if profile.shared_state_write or profile.irreversible_action:
         return make_parent([
             "A: shared-state or irreversible action stays in parent",
@@ -262,7 +390,9 @@ def route_task(profile: TaskProfile) -> RoutingDecision:
         ])
 
     if profile.parallel_subtasks >= 2:
-        child_lane, child_model, child_toolsets, child_command = choose_parallel_child(profile)
+        child_lane, child_model, child_toolsets, child_command = choose_parallel_child(
+            profile
+        )
         max_children = (
             CONCURRENCY["native_codex_max_concurrent_children"]
             if child_lane == CODEX_NATIVE["lane"]
@@ -273,7 +403,7 @@ def route_task(profile: TaskProfile) -> RoutingDecision:
                 lane="parallel_fanout",
                 reasons=[
                     "E: task splits into independent parallel subtasks",
-                    f"child lane selected from subtask size: {child_lane}",
+                    f"child lane selected from largest subtask: {child_lane}",
                 ],
                 spawn_pattern="spawn N children immediately and supervise in parallel",
                 timeout_seconds=(
@@ -295,7 +425,11 @@ def route_task(profile: TaskProfile) -> RoutingDecision:
             max_concurrent_children=max_children,
         )
 
-    if profile.file_count >= 5 or profile.estimated_tokens > 300_000 or profile.clean_room:
+    if (
+        profile.file_count >= 5
+        or profile.estimated_tokens > 300_000
+        or profile.clean_room
+    ):
         return make_codex(
             profile,
             [
@@ -321,8 +455,9 @@ def route_task(profile: TaskProfile) -> RoutingDecision:
     ])
 
 
-def print_examples() -> None:
-    examples = [
+def example_profiles() -> list[TaskProfile]:
+    """Return the five canonical example profiles shown in docs/reports."""
+    return [
         TaskProfile(
             description="Review one module diff and return JSON findings",
             task_type="code",
@@ -358,20 +493,126 @@ def print_examples() -> None:
             broad_domains=3,
         ),
     ]
-    rendered = []
-    for profile in examples:
-        rendered.append({
-            "task": profile.description,
-            "decision": asdict(route_task(profile)),
-        })
-    print(json.dumps(rendered, indent=2))
+
+
+def validation_cases() -> list[ValidationCase]:
+    """Return regression cases used by `--validate` and unit tests."""
+    return [
+        ValidationCase(
+            name="bounded_json_code_review",
+            profile=example_profiles()[0],
+            expected_lane="gpt55_specialist",
+            expected_max_concurrent_children=10,
+            expected_model="gpt-5.5",
+        ),
+        ValidationCase(
+            name="large_corpus_native_codex",
+            profile=example_profiles()[1],
+            expected_lane="codex_native_subagent",
+            expected_max_concurrent_children=5,
+            expected_model="gpt-5.5",
+        ),
+        ValidationCase(
+            name="parallel_small_file_audits",
+            profile=example_profiles()[2],
+            expected_lane="parallel_fanout",
+            expected_child_lane="gpt55_specialist",
+            expected_max_concurrent_children=10,
+        ),
+        ValidationCase(
+            name="shared_truth_parent",
+            profile=example_profiles()[3],
+            expected_lane="parent",
+            expected_max_concurrent_children=1,
+            expected_model="gpt-5.4",
+        ),
+        ValidationCase(
+            name="multi_domain_orchestrator",
+            profile=example_profiles()[4],
+            expected_lane="gpt54_orchestrator_cli",
+            expected_max_concurrent_children=2,
+            expected_model="gpt-5.4",
+        ),
+    ]
+
+
+def run_validation() -> dict[str, Any]:
+    """Run regression validation over the canonical example cases."""
+    cases = validation_cases()
+    results: list[dict[str, Any]] = []
+    ok = True
+    for case in cases:
+        decision = route_task(case.profile)
+        mismatches: list[str] = []
+        if decision.lane != case.expected_lane:
+            mismatches.append(f"lane={decision.lane} expected={case.expected_lane}")
+        if decision.max_concurrent_children != case.expected_max_concurrent_children:
+            mismatches.append(
+                "max_concurrent_children="
+                f"{decision.max_concurrent_children} expected={case.expected_max_concurrent_children}"
+            )
+        if case.expected_child_lane is not None and decision.child_lane != case.expected_child_lane:
+            mismatches.append(
+                f"child_lane={decision.child_lane} expected={case.expected_child_lane}"
+            )
+        if case.expected_model is not None and decision.model != case.expected_model:
+            mismatches.append(f"model={decision.model} expected={case.expected_model}")
+        passed = not mismatches
+        ok = ok and passed
+        results.append(
+            {
+                "name": case.name,
+                "passed": passed,
+                "mismatches": mismatches,
+                "decision": asdict(decision),
+            }
+        )
+    return {
+        "ok": ok,
+        "case_count": len(cases),
+        "results": results,
+    }
+
+
+def integration_status() -> dict[str, Any]:
+    """Describe how this router currently relates to live Kael execution.
+
+    Current assessment: doctrine-encoding test artifact with config/doc coupling,
+    but not auto-invoked by Hermes core at runtime.
+    """
+    return {
+        "status": "doctrine_encoding_test_artifact",
+        "runtime_invoked_by_core": False,
+        "references": [
+            "~/.hermes/skills/delegation-routing-v2/SKILL.md",
+            "~/.hermes/config.yaml::kael_delegation",
+            "/home/ubuntu/business/reports/delegation-system-hardcoded-2026-04-25.md",
+            "tests/test_kael_delegation_router.py",
+        ],
+        "implication": (
+            "The script is authoritative as doctrine/regression logic, but Hermes core does "
+            "not currently import and execute it automatically inside the parent agent loop. "
+            "Further runtime integration would require explicit product/code changes."
+        ),
+    }
+
+
+def render_examples() -> list[dict[str, Any]]:
+    """Return the example profiles annotated with routing decisions."""
+    return [
+        {"task": profile.description, "decision": asdict(route_task(profile))}
+        for profile in example_profiles()
+    ]
 
 
 def parse_args() -> argparse.Namespace:
+    """Parse CLI arguments for direct router inspection/validation."""
     parser = argparse.ArgumentParser(description="Hardcoded Kael delegation router")
     parser.add_argument("description", nargs="?", default="", help="Task description")
     parser.add_argument(
-        "--task-type", choices=["code", "research", "inspection"], default="inspection"
+        "--task-type",
+        choices=sorted(_ALLOWED_TASK_TYPES),
+        default="inspection",
     )
     parser.add_argument("--estimated-tokens", type=int, default=0)
     parser.add_argument("--subtask-estimated-tokens", type=int, default=0)
@@ -388,17 +629,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--broad-domains", type=int, default=0)
     parser.add_argument("--write-allowed", action="store_true")
     parser.add_argument("--json-mode", action="store_true")
+    parser.add_argument("--subtask-token-samples", nargs="*", type=int, default=())
+    parser.add_argument("--subtask-file-samples", nargs="*", type=int, default=())
     parser.add_argument("--examples", action="store_true")
+    parser.add_argument("--validate", action="store_true")
+    parser.add_argument("--integration-status", action="store_true")
     return parser.parse_args()
 
 
-def main() -> None:
-    args = parse_args()
-    if args.examples:
-        print_examples()
-        return
-
-    profile = TaskProfile(
+def build_profile_from_args(args: argparse.Namespace) -> TaskProfile:
+    """Build a validated `TaskProfile` from CLI args."""
+    return TaskProfile(
         description=args.description,
         task_type=args.task_type,
         estimated_tokens=args.estimated_tokens,
@@ -416,7 +657,37 @@ def main() -> None:
         broad_domains=args.broad_domains,
         write_allowed=args.write_allowed,
         json_mode=args.json_mode,
+        subtask_token_samples=tuple(args.subtask_token_samples),
+        subtask_file_samples=tuple(args.subtask_file_samples),
     )
+
+
+def main() -> None:
+    """CLI entrypoint.
+
+    - `--examples` prints clean example JSON.
+    - `--validate` prints regression JSON and exits non-zero on failure.
+    - `--integration-status` prints current integration assessment.
+    - default mode prints one routed task as JSON.
+    """
+    args = parse_args()
+
+    if args.examples:
+        print(json.dumps(render_examples(), indent=2))
+        return
+
+    if args.validate:
+        result = run_validation()
+        print(json.dumps(result, indent=2))
+        if not result["ok"]:
+            raise SystemExit(1)
+        return
+
+    if args.integration_status:
+        print(json.dumps(integration_status(), indent=2))
+        return
+
+    profile = build_profile_from_args(args)
     print(
         json.dumps(
             {
