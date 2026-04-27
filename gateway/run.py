@@ -8845,7 +8845,8 @@ class GatewayRunner:
 
         mgr = CheckpointManager(
             enabled=True,
-            max_snapshots=cp_cfg.get("max_snapshots", 50),
+            max_snapshots=cp_cfg.get("max_snapshots", 10),
+            max_total_bytes=cp_cfg.get("max_total_bytes", 1_000_000_000),
         )
 
         cwd = os.getenv("TERMINAL_CWD", str(Path.home()))

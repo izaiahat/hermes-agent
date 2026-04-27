@@ -571,7 +571,8 @@ DEFAULT_CONFIG = {
     # conversation turn (on first write_file/patch call).  Use /rollback to restore.
     "checkpoints": {
         "enabled": True,
-        "max_snapshots": 50,  # Max checkpoints to keep per directory
+        "max_snapshots": 10,  # Max checkpoints to keep per directory
+        "max_total_bytes": 1_000_000_000,  # Cap each shadow repo at ~1 GB, preserving the newest checkpoint
         # Auto-maintenance: shadow repos accumulate forever under
         # ~/.hermes/checkpoints/ (one per cd'd working directory). Field
         # reports put the typical offender at 1000+ repos / ~12 GB. When
