@@ -42,7 +42,7 @@ def test_bounded_code_review_routes_to_gpt55() -> None:
     assert decision.lane == "gpt55_specialist"
     assert decision.model == "gpt-5.5"
     assert decision.toolsets == ["file", "terminal"]
-    assert decision.max_concurrent_children == 5
+    assert decision.max_concurrent_children == 10
 
 
 def test_large_corpus_routes_to_native_codex_subagent() -> None:
@@ -60,7 +60,7 @@ def test_large_corpus_routes_to_native_codex_subagent() -> None:
     assert decision.toolsets == ["file"]
     assert decision.command is None
     assert "delegate_task" in (decision.spawn_pattern or "")
-    assert decision.max_concurrent_children == 2
+    assert decision.max_concurrent_children == 5
 
 
 def test_parallel_small_subtasks_route_to_gpt55_children() -> None:
@@ -77,7 +77,7 @@ def test_parallel_small_subtasks_route_to_gpt55_children() -> None:
     assert decision.lane == "parallel_fanout"
     assert decision.child_lane == "gpt55_specialist"
     assert decision.child_toolsets == ["file"]
-    assert decision.max_concurrent_children == 5
+    assert decision.max_concurrent_children == 10
 
 
 def test_multi_domain_routes_to_gpt54_orchestrator() -> None:
@@ -92,7 +92,7 @@ def test_multi_domain_routes_to_gpt54_orchestrator() -> None:
     assert decision.lane == "gpt54_orchestrator_cli"
     assert decision.model == "gpt-5.4"
     assert decision.role == "orchestrator"
-    assert decision.max_concurrent_children == 1
+    assert decision.max_concurrent_children == 2
 
 
 def test_parallel_large_subtasks_route_to_native_codex_children() -> None:
@@ -112,4 +112,4 @@ def test_parallel_large_subtasks_route_to_native_codex_children() -> None:
     assert decision.child_model == "gpt-5.5"
     assert decision.child_toolsets == ["file"]
     assert decision.child_command is None
-    assert decision.max_concurrent_children == 2
+    assert decision.max_concurrent_children == 5
