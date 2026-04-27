@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import importlib.util
+import json
+import subprocess
 import sys
 from pathlib import Path
 
@@ -14,6 +16,9 @@ SPEC.loader.exec_module(MODULE)
 
 TaskProfile = MODULE.TaskProfile
 route_task = MODULE.route_task
+run_validation = MODULE.run_validation
+render_examples = MODULE.render_examples
+integration_status = MODULE.integration_status
 
 
 def test_shared_state_routes_to_parent() -> None:
@@ -26,6 +31,30 @@ def test_shared_state_routes_to_parent() -> None:
     )
     assert decision.lane == "parent"
     assert decision.model == "gpt-5.4"
+    assert decision.max_concurrent_children == 1
+
+
+def test_single_tool_call_routes_to_parent() -> None:
+    decision = route_task(
+        TaskProfile(
+            description="Check one file and answer yes/no",
+            single_tool_call=True,
+            estimated_tokens=10_000,
+        )
+    )
+    assert decision.lane == "parent"
+    assert decision.max_concurrent_children == 1
+
+
+def test_pure_reasoning_under_50k_routes_to_parent() -> None:
+    decision = route_task(
+        TaskProfile(
+            description="Reason about a short policy question",
+            pure_reasoning=True,
+            estimated_tokens=50_000,
+        )
+    )
+    assert decision.lane == "parent"
     assert decision.max_concurrent_children == 1
 
 
@@ -45,21 +74,44 @@ def test_bounded_code_review_routes_to_gpt55() -> None:
     assert decision.max_concurrent_children == 10
 
 
-def test_large_corpus_routes_to_native_codex_subagent() -> None:
+def test_exactly_200k_structured_still_routes_to_gpt55() -> None:
     decision = route_task(
         TaskProfile(
-            description="Analyze a 50-file codebase and summarize drift",
+            description="Return structured markdown from a bounded research task",
             task_type="research",
-            estimated_tokens=450_000,
-            file_count=50,
+            estimated_tokens=200_000,
+            structured_output=True,
+        )
+    )
+    assert decision.lane == "gpt55_specialist"
+    assert decision.max_concurrent_children == 10
+
+
+def test_exactly_300k_without_other_triggers_falls_back_to_parent() -> None:
+    decision = route_task(
+        TaskProfile(
+            description="A medium-large but non-decomposed inspection task",
+            task_type="inspection",
+            estimated_tokens=300_000,
+            file_count=4,
+        )
+    )
+    assert decision.lane == "parent"
+
+
+def test_exactly_five_files_routes_to_native_codex_subagent() -> None:
+    decision = route_task(
+        TaskProfile(
+            description="Analyze five files as one corpus",
+            task_type="research",
+            estimated_tokens=220_000,
+            file_count=5,
         )
     )
     assert decision.lane == "codex_native_subagent"
     assert decision.model == "gpt-5.5"
     assert decision.provider == "openai-codex"
     assert decision.toolsets == ["file"]
-    assert decision.command is None
-    assert "delegate_task" in (decision.spawn_pattern or "")
     assert decision.max_concurrent_children == 5
 
 
@@ -80,6 +132,37 @@ def test_parallel_small_subtasks_route_to_gpt55_children() -> None:
     assert decision.max_concurrent_children == 10
 
 
+def test_parallel_mixed_subtask_sizes_routes_to_native_codex_children() -> None:
+    decision = route_task(
+        TaskProfile(
+            description="Run mixed-size parallel audits",
+            task_type="research",
+            estimated_tokens=150_000,
+            parallel_subtasks=3,
+            subtask_token_samples=(12_000, 350_000, 9_000),
+            subtask_file_samples=(1, 7, 1),
+        )
+    )
+    assert decision.lane == "parallel_fanout"
+    assert decision.child_lane == "codex_native_subagent"
+    assert decision.child_model == "gpt-5.5"
+    assert decision.child_toolsets == ["file"]
+    assert decision.max_concurrent_children == 5
+
+
+def test_shared_state_plus_parallel_still_routes_to_parent() -> None:
+    decision = route_task(
+        TaskProfile(
+            description="Update shared truth after many audits",
+            task_type="inspection",
+            estimated_tokens=250_000,
+            parallel_subtasks=8,
+            shared_state_write=True,
+        )
+    )
+    assert decision.lane == "parent"
+
+
 def test_multi_domain_routes_to_gpt54_orchestrator() -> None:
     decision = route_task(
         TaskProfile(
@@ -95,21 +178,79 @@ def test_multi_domain_routes_to_gpt54_orchestrator() -> None:
     assert decision.max_concurrent_children == 2
 
 
-def test_parallel_large_subtasks_route_to_native_codex_children() -> None:
+def test_fallback_path_routes_to_parent() -> None:
     decision = route_task(
         TaskProfile(
-            description="Run three clean-room corpus syntheses in parallel",
-            task_type="research",
-            estimated_tokens=900_000,
-            parallel_subtasks=3,
-            subtask_estimated_tokens=320_000,
-            subtask_file_count=7,
-            clean_room=True,
+            description="General ambiguous task with moderate scope",
+            task_type="inspection",
+            estimated_tokens=250_000,
+            file_count=2,
+            structured_output=False,
+            pure_reasoning=False,
+            parallel_subtasks=0,
+            broad_domains=0,
         )
     )
-    assert decision.lane == "parallel_fanout"
-    assert decision.child_lane == "codex_native_subagent"
-    assert decision.child_model == "gpt-5.5"
-    assert decision.child_toolsets == ["file"]
-    assert decision.child_command is None
-    assert decision.max_concurrent_children == 5
+    assert decision.lane == "parent"
+
+
+def test_invalid_task_type_raises() -> None:
+    try:
+        TaskProfile(description="bad", task_type="finance")
+    except ValueError as exc:
+        assert "Invalid task_type" in str(exc)
+    else:
+        raise AssertionError("Expected ValueError for invalid task_type")
+
+
+def test_negative_counts_raise() -> None:
+    try:
+        TaskProfile(description="bad", estimated_tokens=-1)
+    except ValueError as exc:
+        assert "must be non-negative" in str(exc)
+    else:
+        raise AssertionError("Expected ValueError for negative tokens")
+
+
+def test_examples_render_clean_json() -> None:
+    proc = subprocess.run(
+        [sys.executable, str(SCRIPT_PATH), "--examples"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    payload = json.loads(proc.stdout)
+    assert isinstance(payload, list)
+    assert len(payload) == 5
+    assert payload[0]["decision"]["lane"] == "gpt55_specialist"
+
+
+def test_validate_flag_passes_and_returns_clean_json() -> None:
+    proc = subprocess.run(
+        [sys.executable, str(SCRIPT_PATH), "--validate"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    payload = json.loads(proc.stdout)
+    assert payload["ok"] is True
+    assert payload["case_count"] == 5
+
+
+def test_integration_status_documents_doctrine_artifact_state() -> None:
+    status = integration_status()
+    assert status["status"] == "doctrine_encoding_test_artifact"
+    assert status["runtime_invoked_by_core"] is False
+    assert "Further runtime integration" in status["implication"]
+
+
+def test_render_examples_matches_validation_examples() -> None:
+    rendered = render_examples()
+    assert len(rendered) == 5
+    assert rendered[1]["decision"]["lane"] == "codex_native_subagent"
+
+
+def test_run_validation_function_passes() -> None:
+    result = run_validation()
+    assert result["ok"] is True
+    assert len(result["results"]) == 5
