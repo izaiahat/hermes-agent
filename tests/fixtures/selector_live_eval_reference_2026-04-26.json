@@ -1,0 +1,355 @@
+{
+  "case_count": 30,
+  "precision": 0.975609756097561,
+  "recall": 1.0,
+  "results": [
+    {
+      "id": "debug_pytest_root_cause",
+      "expected": [
+        "systematic-debugging",
+        "test-driven-development"
+      ],
+      "loaded": [
+        "systematic-debugging",
+        "test-driven-development"
+      ],
+      "fp": 0,
+      "fn": 0
+    },
+    {
+      "id": "plan_only_oauth",
+      "expected": [
+        "plan",
+        "writing-plans"
+      ],
+      "loaded": [
+        "plan",
+        "writing-plans"
+      ],
+      "fp": 0,
+      "fn": 0
+    },
+    {
+      "id": "execute_saved_plan_subagents",
+      "expected": [
+        "delegation-routing-v2",
+        "subagent-driven-development",
+        "test-driven-development"
+      ],
+      "loaded": [
+        "delegation-routing-v2",
+        "subagent-driven-development",
+        "test-driven-development"
+      ],
+      "fp": 0,
+      "fn": 0
+    },
+    {
+      "id": "review_pr_security_quality",
+      "expected": [
+        "code-review",
+        "github-code-review"
+      ],
+      "loaded": [
+        "code-review",
+        "github-code-review"
+      ],
+      "fp": 0,
+      "fn": 0
+    },
+    {
+      "id": "git_push_auth_failure",
+      "expected": [
+        "github-auth"
+      ],
+      "loaded": [
+        "github-auth"
+      ],
+      "fp": 0,
+      "fn": 0
+    },
+    {
+      "id": "gmail_inbox_replies",
+      "expected": [
+        "gmail-python-direct"
+      ],
+      "loaded": [
+        "gmail-python-direct"
+      ],
+      "fp": 0,
+      "fn": 0
+    },
+    {
+      "id": "stripe_like_landing_page",
+      "expected": [
+        "popular-web-designs"
+      ],
+      "loaded": [
+        "popular-web-designs"
+      ],
+      "fp": 0,
+      "fn": 0
+    },
+    {
+      "id": "arxiv_grpo_summary",
+      "expected": [
+        "arxiv",
+        "grpo-rl-training"
+      ],
+      "loaded": [
+        "arxiv",
+        "grpo-rl-training"
+      ],
+      "fp": 0,
+      "fn": 0
+    },
+    {
+      "id": "axolotl_finetune",
+      "expected": [
+        "axolotl"
+      ],
+      "loaded": [
+        "axolotl"
+      ],
+      "fp": 0,
+      "fn": 0
+    },
+    {
+      "id": "lemonsqueezy_setup",
+      "expected": [
+        "lemonsqueezy-policy-first-setup"
+      ],
+      "loaded": [
+        "lemonsqueezy-policy-first-setup"
+      ],
+      "fp": 0,
+      "fn": 0
+    },
+    {
+      "id": "competitor_deck",
+      "expected": [
+        "powerpoint"
+      ],
+      "loaded": [
+        "powerpoint"
+      ],
+      "fp": 0,
+      "fn": 0
+    },
+    {
+      "id": "research_before_outreach",
+      "expected": [
+        "customer-research",
+        "research-first-execution"
+      ],
+      "loaded": [
+        "customer-research",
+        "research-first-execution"
+      ],
+      "fp": 0,
+      "fn": 0
+    },
+    {
+      "id": "storybrand_homepage",
+      "expected": [
+        "storybrand-messaging"
+      ],
+      "loaded": [
+        "storybrand-messaging"
+      ],
+      "fp": 0,
+      "fn": 0
+    },
+    {
+      "id": "ai_search_visibility",
+      "expected": [
+        "ai-seo",
+        "schema-markup",
+        "seo-audit"
+      ],
+      "loaded": [
+        "ai-seo",
+        "schema-markup",
+        "seo-audit"
+      ],
+      "fp": 0,
+      "fn": 0
+    },
+    {
+      "id": "analytics_privacy_setup",
+      "expected": [
+        "analytics-tracking"
+      ],
+      "loaded": [
+        "analytics-tracking"
+      ],
+      "fp": 0,
+      "fn": 0
+    },
+    {
+      "id": "cold_email_sequence",
+      "expected": [
+        "cold-email"
+      ],
+      "loaded": [
+        "cold-email"
+      ],
+      "fp": 0,
+      "fn": 0
+    },
+    {
+      "id": "launch_plan",
+      "expected": [
+        "digital-product-launch",
+        "launch-strategy"
+      ],
+      "loaded": [
+        "digital-product-launch",
+        "launch-strategy"
+      ],
+      "fp": 0,
+      "fn": 0
+    },
+    {
+      "id": "content_strategy_niche",
+      "expected": [
+        "content-strategy"
+      ],
+      "loaded": [
+        "content-strategy"
+      ],
+      "fp": 0,
+      "fn": 0
+    },
+    {
+      "id": "customer_research_interviews",
+      "expected": [
+        "customer-research",
+        "mom-test"
+      ],
+      "loaded": [
+        "customer-research",
+        "mom-test"
+      ],
+      "fp": 0,
+      "fn": 0
+    },
+    {
+      "id": "paid_ads_guardrails",
+      "expected": [
+        "paid-ads"
+      ],
+      "loaded": [
+        "paid-ads"
+      ],
+      "fp": 0,
+      "fn": 0
+    },
+    {
+      "id": "referral_program_design",
+      "expected": [
+        "referral-program"
+      ],
+      "loaded": [
+        "referral-program"
+      ],
+      "fp": 0,
+      "fn": 0
+    },
+    {
+      "id": "seo_audit_docs_site",
+      "expected": [
+        "seo-audit"
+      ],
+      "loaded": [
+        "seo-audit"
+      ],
+      "fp": 0,
+      "fn": 0
+    },
+    {
+      "id": "infographic_stats",
+      "expected": [
+        "baoyu-infographic"
+      ],
+      "loaded": [
+        "baoyu-infographic"
+      ],
+      "fp": 0,
+      "fn": 0
+    },
+    {
+      "id": "google_workspace_automation",
+      "expected": [
+        "google-workspace"
+      ],
+      "loaded": [
+        "google-workspace"
+      ],
+      "fp": 0,
+      "fn": 0
+    },
+    {
+      "id": "notion_workspace_template",
+      "expected": [
+        "content-strategy",
+        "notion"
+      ],
+      "loaded": [
+        "content-strategy",
+        "notion"
+      ],
+      "fp": 0,
+      "fn": 0
+    },
+    {
+      "id": "webhook_subscription_design",
+      "expected": [
+        "webhook-subscriptions"
+      ],
+      "loaded": [
+        "webhook-subscriptions"
+      ],
+      "fp": 0,
+      "fn": 0
+    },
+    {
+      "id": "jupyter_kernel",
+      "expected": [
+        "jupyter-live-kernel"
+      ],
+      "loaded": [
+        "jupyter-live-kernel"
+      ],
+      "fp": 0,
+      "fn": 0
+    },
+    {
+      "id": "discord_message_direct",
+      "expected": [
+        "discord-rest-messaging"
+      ],
+      "loaded": [
+        "discord-rest-messaging"
+      ],
+      "fp": 0,
+      "fn": 0
+    },
+    {
+      "id": "direct_firecrawl_scrape",
+      "expected": [],
+      "loaded": [
+        "firecrawl-mcp-hermes-setup"
+      ],
+      "fp": 1,
+      "fn": 0
+    },
+    {
+      "id": "stripe_payment_link_direct",
+      "expected": [],
+      "loaded": [],
+      "fp": 0,
+      "fn": 0
+    }
+  ]
+}
