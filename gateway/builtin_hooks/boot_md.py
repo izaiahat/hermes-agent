@@ -45,10 +45,18 @@ def _build_boot_prompt(content: str) -> str:
 def _run_boot_agent(content: str) -> None:
     """Spawn a one-shot agent session to execute the boot instructions."""
     try:
+        from hermes_cli.models import get_default_model_for_provider
+        from gateway.run import _resolve_gateway_model, _resolve_runtime_agent_kwargs
         from run_agent import AIAgent
 
         prompt = _build_boot_prompt(content)
+        runtime_kwargs = _resolve_runtime_agent_kwargs()
+        model = _resolve_gateway_model()
+        if not model:
+            model = get_default_model_for_provider(runtime_kwargs.get("provider") or "") or model
         agent = AIAgent(
+            **runtime_kwargs,
+            model=model,
             quiet_mode=True,
             skip_context_files=True,
             skip_memory=True,
