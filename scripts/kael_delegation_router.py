@@ -6,10 +6,10 @@ import json
 from dataclasses import asdict, dataclass
 
 CONCURRENCY = {
-    "gpt55_max_concurrent_children": 5,
-    "native_codex_max_concurrent_children": 2,
-    "gpt54_orchestrator_max_concurrent_children": 1,
-    "max_spawn_depth": 3,
+    "gpt55_max_concurrent_children": 10,
+    "native_codex_max_concurrent_children": 5,
+    "gpt54_orchestrator_max_concurrent_children": 2,
+    "max_spawn_depth": 4,
 }
 
 FAILURE_RECOVERY = {
