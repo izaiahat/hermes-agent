@@ -197,6 +197,43 @@ def test_feasibility_check_passes_config_context_length(mock_get_client, mock_ct
     )
 
 
+@patch("agent.model_metadata.get_model_context_length", return_value=1_000_000)
+@patch("agent.auxiliary_client.get_text_auxiliary_client")
+def test_feasibility_check_inherits_main_context_override_for_same_model(mock_get_client, mock_ctx_len):
+    """When compression uses the same model on the same route as the main
+    runtime, the main model.context_length override should apply to the
+    feasibility probe even if auxiliary.compression.context_length is unset."""
+    agent = _make_agent(main_context=1_000_000, threshold_percent=0.85)
+    agent.model = "gpt-5.4"
+    agent.provider = "openai-codex"
+    agent.base_url = "https://chatgpt.com/backend-api/codex"
+    agent.api_key = "codex-token"
+    agent.api_mode = "codex_responses"
+    agent._config_context_length = 1_000_000
+    agent._aux_compression_context_length_config = None
+
+    mock_client = MagicMock()
+    mock_client.base_url = "https://chatgpt.com/backend-api/codex"
+    mock_client.api_key = "codex-token"
+    mock_get_client.return_value = (mock_client, "gpt-5.4")
+
+    messages = []
+    agent._emit_status = lambda msg: messages.append(msg)
+    agent._check_compression_model_feasibility()
+
+    mock_ctx_len.assert_called_once_with(
+        "gpt-5.4",
+        base_url="https://chatgpt.com/backend-api/codex",
+        api_key="codex-token",
+        config_context_length=1_000_000,
+        provider="openai-codex",
+        custom_providers=[],
+    )
+    assert messages == []
+    assert agent._compression_warning is None
+    assert agent.context_compressor.threshold_tokens == 850_000
+
+
 @patch("agent.model_metadata.get_model_context_length", return_value=128_000)
 @patch("agent.auxiliary_client.get_text_auxiliary_client")
 def test_feasibility_check_ignores_invalid_context_length(mock_get_client, mock_ctx_len):
