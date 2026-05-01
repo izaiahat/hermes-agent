@@ -71,7 +71,7 @@ CODEX_NATIVE = {
     "provider": "openai-codex",
     "role": "leaf",
     "api_mode": "codex_responses",
-    "max_context_tokens": 1_000_000,
+    "max_context_tokens": 272_000,
     "timeout_seconds": 600,
     "default_toolsets": {
         "read": ["file"],
@@ -339,10 +339,12 @@ def choose_parallel_child(
 
     This uses the *largest* known subtask size, so mixed-size bursts route to a
     safe lane if any one subtask needs the heavier native-Codex treatment.
+    The caller is responsible for rejecting subtasks that exceed the live
+    native-Codex ceiling on the current route.
     """
     subtask_tokens = _largest_subtask_tokens(profile)
     subtask_files = _largest_subtask_file_count(profile)
-    if subtask_files >= 5 or subtask_tokens > 300_000 or profile.clean_room:
+    if subtask_files >= 5 or profile.clean_room:
         return (
             CODEX_NATIVE["lane"],
             CODEX_NATIVE["model"],
@@ -390,6 +392,12 @@ def route_task(profile: TaskProfile) -> RoutingDecision:
         ])
 
     if profile.parallel_subtasks >= 2:
+        largest_subtask_tokens = _largest_subtask_tokens(profile)
+        if largest_subtask_tokens > CODEX_NATIVE["max_context_tokens"]:
+            return make_parent([
+                "E/D guard: at least one parallel subtask exceeds the live native Codex ceiling (~272k)",
+                "keep orchestration in parent and decompose or segment the oversized subtask first",
+            ])
         child_lane, child_model, child_toolsets, child_command = choose_parallel_child(
             profile
         )
@@ -425,15 +433,19 @@ def route_task(profile: TaskProfile) -> RoutingDecision:
             max_concurrent_children=max_children,
         )
 
-    if (
-        profile.file_count >= 5
-        or profile.estimated_tokens > 300_000
-        or profile.clean_room
+    if profile.estimated_tokens > CODEX_NATIVE["max_context_tokens"] and (
+        profile.file_count >= 5 or profile.clean_room
     ):
+        return make_parent([
+            "D guard: single-corpus work exceeds the live native Codex ceiling (~272k)",
+            "keep it in parent or decompose it before using the native Codex child lane",
+        ])
+
+    if profile.file_count >= 5 or profile.clean_room:
         return make_codex(
             profile,
             [
-                "D: 5+ files, >300k tokens, or clean-room perspective routes to Hermes native Codex subagent"
+                "D: 5+ files or clean-room perspective that fits the live native Codex ceiling routes to Hermes native Codex subagent"
             ],
         )
 
@@ -467,9 +479,9 @@ def example_profiles() -> list[TaskProfile]:
             json_mode=True,
         ),
         TaskProfile(
-            description="Read 6 docs and summarize system drift",
+            description="Read 6 docs within the live Codex child ceiling and summarize system drift",
             task_type="research",
-            estimated_tokens=350_000,
+            estimated_tokens=220_000,
             file_count=6,
         ),
         TaskProfile(
