@@ -133,11 +133,20 @@ def check_compression_model_feasibility(agent: Any) -> None:
         _raw_aux_key = getattr(client, "api_key", "")
         aux_api_key = "" if (callable(_raw_aux_key) and not isinstance(_raw_aux_key, str)) else str(_raw_aux_key or "")
 
+        aux_context_config = getattr(
+            agent, "_aux_compression_context_length_config", None
+        )
+        if aux_context_config is None:
+            main_model = str(getattr(agent, "model", "") or "")
+            main_base_url = str(getattr(agent, "base_url", "") or "")
+            if aux_model == main_model and aux_base_url.rstrip("/") == main_base_url.rstrip("/"):
+                aux_context_config = getattr(agent, "_config_context_length", None)
+
         aux_context = get_model_context_length(
             aux_model,
             base_url=aux_base_url,
             api_key=aux_api_key,
-            config_context_length=getattr(agent, "_aux_compression_context_length_config", None),
+            config_context_length=aux_context_config,
             # Each model must be resolved with its own provider so that
             # provider-specific paths (e.g. Bedrock static table, OpenRouter API)
             # are invoked for the correct client, not inherited from the main model.
