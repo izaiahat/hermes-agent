@@ -115,6 +115,18 @@ def test_exactly_five_files_routes_to_native_codex_subagent() -> None:
     assert decision.max_concurrent_children == 5
 
 
+def test_multifile_over_live_codex_ceiling_routes_to_parent() -> None:
+    decision = route_task(
+        TaskProfile(
+            description="Analyze six files as one oversized corpus",
+            task_type="research",
+            estimated_tokens=350_000,
+            file_count=6,
+        )
+    )
+    assert decision.lane == "parent"
+
+
 def test_parallel_small_subtasks_route_to_gpt55_children() -> None:
     decision = route_task(
         TaskProfile(
@@ -139,7 +151,7 @@ def test_parallel_mixed_subtask_sizes_routes_to_native_codex_children() -> None:
             task_type="research",
             estimated_tokens=150_000,
             parallel_subtasks=3,
-            subtask_token_samples=(12_000, 350_000, 9_000),
+            subtask_token_samples=(12_000, 220_000, 9_000),
             subtask_file_samples=(1, 7, 1),
         )
     )
@@ -148,6 +160,20 @@ def test_parallel_mixed_subtask_sizes_routes_to_native_codex_children() -> None:
     assert decision.child_model == "gpt-5.5"
     assert decision.child_toolsets == ["file"]
     assert decision.max_concurrent_children == 5
+
+
+def test_parallel_subtask_over_live_codex_ceiling_routes_to_parent() -> None:
+    decision = route_task(
+        TaskProfile(
+            description="Run mixed-size parallel audits with one oversized subtask",
+            task_type="research",
+            estimated_tokens=150_000,
+            parallel_subtasks=3,
+            subtask_token_samples=(12_000, 350_000, 9_000),
+            subtask_file_samples=(1, 7, 1),
+        )
+    )
+    assert decision.lane == "parent"
 
 
 def test_shared_state_plus_parallel_still_routes_to_parent() -> None:
