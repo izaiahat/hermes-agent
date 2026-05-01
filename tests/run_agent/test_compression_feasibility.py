@@ -8,6 +8,7 @@ Two-phase design:
      status_callback (gateway platforms)
 """
 
+from typing import Any, cast
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -192,6 +193,41 @@ def test_feasibility_check_passes_config_context_length(mock_get_client, mock_ct
         provider="openrouter",
         custom_providers=[],
     )
+
+
+@patch("agent.model_metadata.get_model_context_length", return_value=1_000_000)
+@patch("agent.auxiliary_client.get_text_auxiliary_client")
+def test_feasibility_inherits_matching_main_context_override(
+    mock_get_client, mock_ctx_len
+):
+    agent = cast(Any, _make_agent(main_context=1_000_000, threshold_percent=0.85))
+    agent.model = "gpt-5.6-sol"
+    agent.provider = "openai-codex"
+    agent.base_url = "https://chatgpt.com/backend-api/codex"
+    agent.api_key = "codex-token"
+    agent.api_mode = "codex_responses"
+    agent._config_context_length = 1_000_000
+
+    mock_client = MagicMock()
+    mock_client.base_url = "https://chatgpt.com/backend-api/codex/"
+    mock_client.api_key = "codex-token"
+    mock_get_client.return_value = (mock_client, "gpt-5.6-sol")
+
+    messages = []
+    agent._emit_status = lambda message: messages.append(message)
+    agent._check_compression_model_feasibility()
+
+    mock_ctx_len.assert_called_once_with(
+        "gpt-5.6-sol",
+        base_url="https://chatgpt.com/backend-api/codex/",
+        api_key="codex-token",
+        config_context_length=1_000_000,
+        provider="openai-codex",
+        custom_providers=[],
+    )
+    assert messages == []
+    assert agent._compression_warning is None
+    assert agent.context_compressor.threshold_tokens == 850_000
 
 
 
