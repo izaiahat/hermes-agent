@@ -627,6 +627,7 @@ def mark_agent_created(skill_name: str) -> None:
     """
     def _apply(rec: Dict[str, Any]) -> None:
         rec["created_by"] = "agent"
+        rec["agent_created"] = True
     _mutate(skill_name, _apply, require_curation_eligible=True)
 
 
