@@ -138,14 +138,27 @@ def _get_child_timeout() -> Optional[float]:
         "delegation.child_timeout_seconds=%r is not a valid number; using default (no timeout)",
     )
 
+# This operator/runtime caps spawn depth to preserve bounded fanout: each extra
+# level multiplies API cost and memory, and the host admission gate is sized for
+# a flat tree. A configured value above the cap is clamped with a warning.
+_MAX_SPAWN_DEPTH_CAP = 4
+
+
 def _get_max_spawn_depth() -> int:
-    """delegation.max_spawn_depth floored at 1 (no ceiling). Depth 0 is the parent; agents at depths 0..N-1 may spawn,
+    """delegation.max_spawn_depth clamped to [1, 4]. Depth 0 is the parent; agents at depths 0..N-1 may spawn,
     depth N is the leaf floor. Default 1 is flat. Each extra level multiplies API cost."""
     def _floored(v):
         ival = int(v)
         if ival < _MIN_SPAWN_DEPTH:
             logger.warning("delegation.max_spawn_depth=%d below floor %d; using %d", ival, _MIN_SPAWN_DEPTH, _MIN_SPAWN_DEPTH)
-        return max(_MIN_SPAWN_DEPTH, ival)
+        floored = max(_MIN_SPAWN_DEPTH, ival)
+        capped = min(_MAX_SPAWN_DEPTH_CAP, floored)
+        if capped != floored:
+            logger.warning(
+                "delegation.max_spawn_depth=%d above cap %d; clamping to %d",
+                floored, _MAX_SPAWN_DEPTH_CAP, capped,
+            )
+        return capped
 
     return _knob(
         "max_spawn_depth", None, _floored, MAX_DEPTH,
