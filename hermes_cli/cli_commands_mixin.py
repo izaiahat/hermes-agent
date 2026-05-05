@@ -2031,7 +2031,10 @@ class CLICommandsMixin:
                     acp_args=turn_route["runtime"].get("args"),
                     max_tokens=turn_route["runtime"].get("max_tokens"),
                     max_iterations=self.max_turns,
-                    enabled_toolsets=self.enabled_toolsets,
+                    # /background is an independent operator lane rather than
+                    # a restricted child of the foreground conversation.
+                    enabled_toolsets=None,
+                    disabled_toolsets=[],
                     quiet_mode=True,
                     verbose_logging=False,
                     session_id=task_id,
