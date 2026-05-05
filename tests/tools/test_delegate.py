@@ -791,6 +791,29 @@ class TestDelegationCredentialResolution(unittest.TestCase):
             requested="crof.ai", target_model="deepseek-v4-pro-CEER"
         )
 
+    @patch("hermes_cli.runtime_provider.resolve_runtime_provider")
+    def test_runtime_default_model_used_when_delegation_model_missing(
+        self, mock_resolve
+    ):
+        mock_resolve.return_value = {
+            "provider": "custom",
+            "model": "server-default-model",
+            "base_url": "https://my-server.example/v1",
+            "api_key": "server-key",
+            "api_mode": "chat_completions",
+        }
+        parent = _make_mock_parent(depth=0)
+
+        creds = _resolve_delegation_credentials(
+            {"provider": "custom:my-server", "model": ""}, parent
+        )
+
+        self.assertEqual(creds["model"], "server-default-model")
+        self.assertEqual(creds["provider"], "custom:my-server")
+        mock_resolve.assert_called_once_with(
+            requested="custom:my-server", target_model=None
+        )
+
 class TestDelegationProviderIntegration(unittest.TestCase):
     """Integration tests: delegation config → _run_single_child → AIAgent construction."""
 
@@ -1223,6 +1246,46 @@ class TestDelegateHeartbeat(unittest.TestCase):
             f"Heartbeat stopped too early while child was waiting on the model; "
             f"got {len(touch_calls)} touches",
         )
+
+    def test_heartbeat_trips_idle_stale_without_progress(self):
+        from tools.delegate_tool import _run_single_child
+
+        parent = _make_mock_parent()
+        parent._touch_activity = MagicMock()
+        stale_seen = threading.Event()
+
+        child = MagicMock()
+        child.get_activity_summary.return_value = {
+            "current_tool": None,
+            "api_call_count": 3,
+            "max_iterations": 50,
+            "last_activity_desc": "waiting for API response",
+            "last_activity_ts": 1000.0,
+        }
+
+        def slow_run(**kwargs):
+            assert stale_seen.wait(2), "idle stale detector did not fire"
+            return {"final_response": "done", "completed": True, "api_calls": 3}
+
+        def capture_warning(message, *args, **kwargs):
+            if "appears stale" in message:
+                stale_seen.set()
+
+        child.run_conversation.side_effect = slow_run
+
+        with (
+            patch("tools.delegate_tool._HEARTBEAT_INTERVAL", 0.01),
+            patch("tools.delegate_tool._HEARTBEAT_STALE_CYCLES_IDLE", 2),
+            patch("tools.delegate_tool.logger.warning", side_effect=capture_warning),
+        ):
+            _run_single_child(
+                task_index=0,
+                goal="Test wedged child",
+                child=child,
+                parent_agent=parent,
+            )
+
+        self.assertTrue(stale_seen.is_set())
 
 
 class TestDelegationReasoningEffort(unittest.TestCase):
