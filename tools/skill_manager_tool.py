@@ -726,9 +726,13 @@ def _record_success(action, name, result, *, file_path, absorbed_into, task_id,
         # and `hermes curator restore` promises the skill can be brought back. Route through the recoverable
         # archive primitive instead of permanent rmtree so a misjudged consolidation can be undone (#29912).
         # Foreground, user-directed deletes keep their existing hard-delete semantics.
-        from tools.skill_provenance import is_background_review
         if action == "create":
-            record_created(name, agent_created=is_background_review(),
+            # EVERY skill created through the agent-facing tool is agent-authored
+            # procedural memory, so it opts into curator management at once - not
+            # only the background self-improvement fork's. Pin a mission-critical
+            # skill (`hermes curator pin <name>`) to keep the curator off it;
+            # unpinned skills stay recoverably archivable or consolidatable.
+            record_created(name, agent_created=True,
                            task_id=task_id, session_id=session_id)
         elif action in {"patch", "edit", "write_file", "remove_file"}:
             bump_patch(name, action=action, task_id=task_id, session_id=session_id)
