@@ -145,34 +145,38 @@ The same subcommands are available as the `/curator` slash command inside a runn
 
 ## What "agent-created" means
 
-The curator only manages skills explicitly marked as **agent-created** in
-`~/.hermes/skills/.usage.json`. A skill qualifies when ALL of the following
-are true:
+A skill is considered curator-managed when its
+`~/.hermes/skills/.usage.json` record is explicitly marked with
+`created_by: "agent"` or `agent_created: true`, and its name is **not** in:
 
-1. Its name is **not** in `~/.hermes/skills/.bundled_manifest` (bundled skills shipped with the repo).
-2. Its name is **not** in `~/.hermes/skills/.hub/lock.json` (hub-installed skills).
-3. Its `.usage.json` entry has `"created_by": "agent"` or `"agent_created": true`.
+1. `~/.hermes/skills/.hub/lock.json` (hub-installed skills), or
+2. `~/.hermes/skills/.bundled_manifest` unless
+   `curator.prune_builtins: true` is enabled.
 
-Currently, only the **background self-improvement review fork** sets this marker
-— when it creates a new umbrella skill during its periodic review pass (~every 10
-agent turns). The background fork runs with a write origin of `"background_review"`
-(via `tools/skill_provenance.py`), which is the only path that triggers the
-`mark_agent_created()` call in `skill_manage`.
+By default, skills created through `skill_manage(action="create")` are marked
+curator-managed so the curator can later keep, patch, consolidate, or archive
+them. The background self-improvement review uses the same marker for skills it
+creates. Bundled and hub-installed skills are maintained by their upstream
+sources; hub-installed skills stay off-limits, while bundled built-ins are only
+eligible when built-in pruning is explicitly enabled.
 
-Skills the foreground agent creates via `skill_manage(action="create")` during a
-conversation are **not** marked as agent-created — they are considered
-user-directed and the curator intentionally leaves them alone.
+Existing hand-written skills, migrated skill directories, and older skills that
+pre-date this policy are **not** inferred from filesystem location alone. Use
+the adoption workflow below if you want the curator to manage them, and pin
+anything mission-critical before the first live curator pass.
 
-:::warning Your hand-written skills are NOT curated
-If you manually created a `SKILL.md` or pointed Hermes at an external skill
-directory, that skill will have a `.usage.json` entry with `created_by: null`
-(or the field absent). The curator will not touch it. The same applies to
-skills the foreground agent created at your request.
+:::warning Pin critical local skills before adoption
+The curator can only act on curator-managed, unpinned local skills. Before
+bulk-adopting an existing private skill library:
 
-**To see which skills the curator actually manages**, run `hermes curator status`.
-If the agent-created count is 0, no skills are currently in the curator's
-jurisdiction — the LLM review pass is skipped and the report will show
-`Model: (not resolved) via (not resolved)` with `Duration: 0s`.
+1. Run `hermes curator run --dry-run` to see the current candidate set.
+2. Use `hermes curator pin <name>` for anything mission-critical after adopting
+   it, or set `pinned: true` in `.usage.json` before the first live pass.
+3. Mark or adopt only the intended local skills.
+4. Run another dry-run before the first live pass.
+
+Archives are recoverable via `hermes curator restore <name>`, but it is easier
+to pin up-front than to chase down a consolidation after the fact.
 :::
 
 ### Adopting unmanaged skills
@@ -198,8 +202,10 @@ for one of two reasons:
 - **pre-dates marker** — the record was written before `created_by` existed, so
   it carries no provenance signal at all. Authorship is genuinely unknowable
   from the record.
-- **foreground-created** — a foreground `skill_manage(create)` left the marker
-  unset by design, since skills you ask for belong to you.
+- **foreground-created** — an older foreground `skill_manage(create)` record
+  predates the current automatic curator-management policy and still has no
+  marker. New skills created through `skill_manage(create)` are marked
+  curator-managed automatically.
 
 A large library can therefore look fully curated while most of it is
 untouchable. `adopt` closes that gap by **declaration**:

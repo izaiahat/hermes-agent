@@ -342,28 +342,18 @@ class TestRemoveFile:
 
 class TestSkillManageDispatcher:
     def test_full_create_via_dispatcher(self, tmp_path):
-        """Foreground create does NOT mark the skill as agent-created.
-
-        Skills created by user-directed foreground turns belong to the user;
-        only the background self-improvement review fork should mark its
-        own sediment as agent-created (so the curator can later consolidate
-        or prune it).
-        """
+        """Every successful agent-facing create opts into curator management."""
         with _skill_dir(tmp_path):
             raw = skill_manage(action="create", name="test-skill", content=VALID_SKILL_CONTENT)
             from tools.skill_usage import load_usage
             usage = load_usage()
         result = json.loads(raw)
         assert result["success"] is True
-        # No provenance marker on a foreground create — record either missing
-        # entirely (telemetry best-effort) or present with created_by unset.
-        rec = usage.get("test-skill") or {}
-        assert rec.get("created_by") in {None, "", False}
+        assert usage["test-skill"]["created_by"] == "agent"
 
     def test_successful_mutations_emit_lifecycle_with_correlation(self, tmp_path):
         with (
             _skill_dir(tmp_path),
-            patch("tools.skill_provenance.is_background_review", return_value=False),
             patch("tools.skill_usage.record_created") as record_created,
             patch("tools.skill_usage.bump_patch") as bump_patch,
         ):
@@ -395,7 +385,7 @@ class TestSkillManageDispatcher:
         assert edited["success"] is True
         record_created.assert_called_once_with(
             "test-skill",
-            agent_created=False,
+            agent_created=True,
             task_id="task-mutation",
             session_id="session-mutation",
         )
