@@ -134,9 +134,7 @@ MAX_DEPTH = 1  # flat by default: parent (0) -> child (1); grandchild rejected u
 # Configurable depth cap consulted by _get_max_spawn_depth; MAX_DEPTH
 # stays as the default fallback and is still the symbol tests import.
 _MIN_SPAWN_DEPTH = 1
-# No upper ceiling on spawn depth — like max_concurrent_children, depth has a
-# floor of 1 and no ceiling. Deeper trees multiply API cost, so the default
-# stays flat (MAX_DEPTH = 1); raising the config knob is an explicit opt-in.
+_MAX_SPAWN_DEPTH_CAP = 4
 
 
 # ---------------------------------------------------------------------------
@@ -425,7 +423,7 @@ def _get_child_timeout() -> float:
 
 
 def _get_max_spawn_depth() -> int:
-    """Read delegation.max_spawn_depth from config, floored at 1 (no ceiling).
+    """Read delegation.max_spawn_depth from config, clamped to [1, 4].
 
     depth 0 = parent agent.  max_spawn_depth = N means agents at depths
     0..N-1 can spawn; depth N is the leaf floor.  Default 1 is flat:
@@ -436,8 +434,7 @@ def _get_max_spawn_depth() -> int:
     Raise to 2+ to unlock nested orchestration. role="orchestrator"
     removes the toolset strip for spawning children when
     max_spawn_depth >= 2, enabling them to spawn their own workers.
-    Like max_concurrent_children, there is no upper ceiling — but each
-    extra level multiplies API cost, so raise it deliberately.
+    For this operator/runtime, cap at 4 to preserve bounded fanout.
     """
     cfg = _load_config()
     val = cfg.get("max_spawn_depth")
@@ -460,7 +457,15 @@ def _get_max_spawn_depth() -> int:
             _MIN_SPAWN_DEPTH,
             floored,
         )
-    return floored
+    capped = min(_MAX_SPAWN_DEPTH_CAP, floored)
+    if capped != floored:
+        logger.warning(
+            "delegation.max_spawn_depth=%d above cap %d; clamping to %d",
+            floored,
+            _MAX_SPAWN_DEPTH_CAP,
+            capped,
+        )
+    return capped
 
 
 def _get_orchestrator_enabled() -> bool:
