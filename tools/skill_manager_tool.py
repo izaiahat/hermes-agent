@@ -38,6 +38,7 @@ import os
 import re
 import shutil
 import tempfile
+from datetime import datetime, timezone
 from pathlib import Path
 from hermes_constants import get_hermes_home, display_hermes_home
 from typing import Dict, Any, Optional, Tuple
@@ -288,6 +289,12 @@ def _find_skill(name: str) -> Optional[Dict[str, Any]]:
         if not skills_dir.exists():
             continue
         for skill_md in skills_dir.rglob("SKILL.md"):
+            try:
+                rel = skill_md.parent.relative_to(skills_dir)
+            except ValueError:
+                rel = Path(skill_md.parent.name)
+            if any(part.startswith(".") for part in rel.parts):
+                continue
             if skill_md.parent.name == name:
                 return {"path": skill_md.parent}
     return None
@@ -552,17 +559,55 @@ def _patch_skill(
     }
 
 
-def _delete_skill(name: str, absorbed_into: Optional[str] = None) -> Dict[str, Any]:
-    """Delete a skill.
+def _archive_skill_dir_for_delete(name: str, skill_dir: Path, skills_root: Path) -> Tuple[bool, str, Optional[Path]]:
+    """Move a deleted-by-curator skill directory into ``.archive/``.
 
-    ``absorbed_into`` declares intent:
-      - ``None`` / missing  → caller didn't declare (legacy / non-curator path);
-        accepted for backward compat but logs a warning because the curator
-        classification pipeline can't tell consolidation from pruning without it.
-      - ``""`` (empty)      → explicit "truly pruned, no forwarding target".
+    ``skill_manage(action="delete", absorbed_into=...)`` is the curator's
+    consolidation/prune path. The Curator report promises that removed skills
+    can be restored, so this path must move the *entire* skill directory tree
+    instead of calling ``rmtree``. Category nesting is preserved under
+    ``.archive/<original-path-suffix>/`` so support files survive intact.
+    """
+    try:
+        rel = skill_dir.relative_to(skills_root)
+    except ValueError:
+        rel = Path(skill_dir.name)
+
+    archive_root = skills_root / ".archive"
+    dest = archive_root / rel
+    if dest.exists():
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
+        dest = dest.with_name(f"{dest.name}-{stamp}")
+
+    try:
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            skill_dir.rename(dest)
+        except OSError:
+            shutil.move(str(skill_dir), str(dest))
+    except Exception as e:
+        return False, f"failed to archive skill before delete: {e}", None
+
+    try:
+        from tools import skill_usage
+        skill_usage.set_state(name, skill_usage.STATE_ARCHIVED)
+    except Exception:
+        logger.debug("failed to mark %s archived after delete archive", name, exc_info=True)
+
+    return True, f"archived to {dest}", dest
+
+
+def _delete_skill(name: str, absorbed_into: Optional[str] = None) -> Dict[str, Any]:
+    """Delete or archive a skill.
+
+    ``absorbed_into`` declares curator intent:
+      - ``None`` / missing  → legacy / non-curator hard-delete path;
+        accepted for backward compat.
+      - ``""`` (empty)      → explicit "truly pruned, no forwarding target";
+        archived for restore instead of permanently deleted.
       - ``"<skill-name>"``  → content was absorbed into that umbrella; the
         target must exist on disk. Validated here so the model can't claim an
-        umbrella that doesn't exist.
+        umbrella that doesn't exist. The removed skill is archived for restore.
     """
     existing = _find_skill(name)
     if not existing:
@@ -592,21 +637,33 @@ def _delete_skill(name: str, absorbed_into: Optional[str] = None) -> Dict[str, A
 
     skill_dir = existing["path"]
     skills_root = _containing_skills_root(skill_dir)
-    shutil.rmtree(skill_dir)
+    archive_for_restore = absorbed_into is not None
+    archive_path = None
 
-    # Clean up empty category directories (don't remove the skills root itself)
+    if archive_for_restore:
+        ok, archive_message, archive_path = _archive_skill_dir_for_delete(name, skill_dir, skills_root)
+        if not ok:
+            return {"success": False, "error": archive_message}
+    else:
+        shutil.rmtree(skill_dir)
+
+    # Clean up empty category directories (don't remove the skills root itself or .archive parents)
     parent = skill_dir.parent
     if parent != skills_root and parent.exists() and not any(parent.iterdir()):
         parent.rmdir()
 
-    message = f"Skill '{name}' deleted."
+    message = f"Skill '{name}' archived for restore." if archive_for_restore else f"Skill '{name}' deleted."
     if absorbed_into is not None and isinstance(absorbed_into, str) and absorbed_into.strip():
         message += f" Content absorbed into '{absorbed_into.strip()}'."
 
-    return {
+    result = {
         "success": True,
         "message": message,
+        "archived": archive_for_restore,
     }
+    if archive_path is not None:
+        result["archive_path"] = str(archive_path)
+    return result
 
 
 def _write_file(name: str, file_path: str, file_content: str) -> Dict[str, Any]:
@@ -778,7 +835,13 @@ def skill_manage(
             elif action in ("patch", "edit", "write_file", "remove_file"):
                 bump_patch(name)
             elif action == "delete":
-                forget(name)
+                if result.get("archived"):
+                    # Curator-declared deletes are recoverable archives. Keep the
+                    # usage record so `hermes curator restore <name>` and audit
+                    # state continue to agree with the filesystem.
+                    pass
+                else:
+                    forget(name)
         except Exception:
             pass
 
@@ -801,11 +864,14 @@ SKILL_MANAGE_SCHEMA = {
         "delete, write_file, remove_file.\n\n"
         "On delete, pass `absorbed_into=<umbrella>` when you're merging this "
         "skill's content into another one, or `absorbed_into=\"\"` when you're "
-        "pruning it with no forwarding target. This lets the curator tell "
+        "pruning it with no forwarding target. Declared delete intents move the "
+        "entire skill directory into `.archive/` so `hermes curator restore <name>` "
+        "can recover SKILL.md and support files. This lets the curator tell "
         "consolidation from pruning without guessing, so downstream consumers "
         "(cron jobs that reference the old skill name, etc.) get updated "
         "correctly. The target you name in `absorbed_into` must already "
-        "exist — create/patch the umbrella first, then delete.\n\n"
+        "exist — create/patch the umbrella first, then delete. Omitting "
+        "`absorbed_into` is the legacy non-curator hard-delete path.\n\n"
         "Create when: complex task succeeded (5+ calls), errors overcome, "
         "user-corrected approach worked, non-trivial workflow discovered, "
         "or user asks you to remember a procedure. New skills created through "
@@ -895,10 +961,12 @@ SKILL_MANAGE_SCHEMA = {
                     "Pass the umbrella skill name when this skill's content "
                     "was merged into another (the target must already exist). "
                     "Pass an empty string when the skill is truly stale and "
-                    "being pruned with no forwarding target. Omitting the arg "
-                    "on delete is supported for backward compatibility but "
-                    "downstream tooling (e.g. cron-job skill reference "
-                    "rewriting) will have to guess at intent."
+                    "being pruned with no forwarding target. Declared delete "
+                    "intents archive the full skill directory for restore. "
+                    "Omitting the arg on delete is supported for backward "
+                    "compatibility as a legacy hard delete, but downstream "
+                    "tooling (e.g. cron-job skill reference rewriting) will "
+                    "have to guess at intent."
                 )
             },
         },

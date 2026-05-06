@@ -174,3 +174,25 @@ def test_status_no_skills_produces_clean_empty_output(curator_status_env):
     # None of the ranking sections render
     assert "most active" not in out
     assert "least active" not in out
+
+
+def test_repair_usage_command_prints_summary(monkeypatch, capsys):
+    from hermes_cli import curator as curator_cli
+    import tools.skill_usage as skill_usage
+
+    monkeypatch.setattr(
+        skill_usage,
+        "repair_orphan_usage_records",
+        lambda: {
+            "marked_active": ["restored-skill"],
+            "marked_archived": ["archived-skill"],
+            "removed": ["missing-skill"],
+        },
+    )
+
+    assert curator_cli._cmd_repair_usage(Namespace()) == 0
+    out = capsys.readouterr().out
+    assert "curator: repaired usage records" in out
+    assert "marked_active: restored-skill" in out
+    assert "marked_archived: archived-skill" in out
+    assert "removed: missing-skill" in out

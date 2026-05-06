@@ -309,12 +309,15 @@ def test_archive_skill_moves_directory(skills_home):
     from tools.skill_usage import archive_skill, get_record, STATE_ARCHIVED
     skills_dir = skills_home / "skills"
     skill_dir = _write_skill(skills_dir, "old-skill")
+    (skill_dir / "references").mkdir()
+    (skill_dir / "references" / "api.md").write_text("support payload", encoding="utf-8")
     assert skill_dir.exists()
 
     ok, msg = archive_skill("old-skill")
     assert ok, msg
     assert not skill_dir.exists()
     assert (skills_dir / ".archive" / "old-skill" / "SKILL.md").exists()
+    assert (skills_dir / ".archive" / "old-skill" / "references" / "api.md").read_text() == "support payload"
     assert get_record("old-skill")["state"] == "archived"
     assert get_record("old-skill")["archived_at"] is not None
 
@@ -354,14 +357,109 @@ def test_archive_missing_skill_returns_error(skills_home):
 def test_restore_skill_moves_back(skills_home):
     from tools.skill_usage import archive_skill, restore_skill, get_record
     skills_dir = skills_home / "skills"
-    _write_skill(skills_dir, "temp-skill")
+    skill_dir = _write_skill(skills_dir, "temp-skill")
+    (skill_dir / "templates").mkdir()
+    (skill_dir / "templates" / "prompt.md").write_text("support kept", encoding="utf-8")
     archive_skill("temp-skill")
     assert not (skills_dir / "temp-skill").exists()
 
     ok, msg = restore_skill("temp-skill")
     assert ok, msg
     assert (skills_dir / "temp-skill" / "SKILL.md").exists()
+    assert (skills_dir / "temp-skill" / "templates" / "prompt.md").read_text() == "support kept"
     assert get_record("temp-skill")["state"] == "active"
+
+
+def test_restore_skill_finds_category_preserved_archive_by_frontmatter(skills_home):
+    from tools.skill_usage import restore_skill
+
+    skills_dir = skills_home / "skills"
+    archived = skills_dir / ".archive" / "devops" / "nested-skill"
+    archived.mkdir(parents=True)
+    (archived / "SKILL.md").write_text(
+        "---\nname: nested-skill\ndescription: test\n---\n\n# body\n",
+        encoding="utf-8",
+    )
+    (archived / "scripts").mkdir()
+    (archived / "scripts" / "run.py").write_text("print('kept')", encoding="utf-8")
+
+    ok, msg = restore_skill("nested-skill")
+
+    assert ok, msg
+    assert not archived.exists()
+    assert (skills_dir / "nested-skill" / "SKILL.md").exists()
+    assert (skills_dir / "nested-skill" / "scripts" / "run.py").read_text() == "print('kept')"
+
+
+def test_restore_skill_does_not_match_prefix_only_archive(skills_home):
+    from tools.skill_usage import restore_skill
+
+    skills_dir = skills_home / "skills"
+    archived = skills_dir / ".archive" / "foo-extra"
+    archived.mkdir(parents=True)
+    (archived / "SKILL.md").write_text(
+        "---\nname: foo-extra\ndescription: test\n---\n\n# body\n",
+        encoding="utf-8",
+    )
+
+    ok, msg = restore_skill("foo")
+
+    assert ok is False
+    assert "not found in archive" in msg
+    assert (archived / "SKILL.md").exists()
+
+
+def test_restore_skill_does_not_match_exact_dir_when_frontmatter_names_other_skill(skills_home):
+    from tools.skill_usage import restore_skill
+
+    skills_dir = skills_home / "skills"
+    archived = skills_dir / ".archive" / "foo"
+    archived.mkdir(parents=True)
+    (archived / "SKILL.md").write_text(
+        "---\nname: bar\ndescription: test\n---\n\n# body\n",
+        encoding="utf-8",
+    )
+
+    ok, msg = restore_skill("foo")
+
+    assert ok is False
+    assert "not found in archive" in msg
+    assert (archived / "SKILL.md").exists()
+
+
+def test_restore_skill_rejects_pathlike_skill_names(skills_home):
+    from tools.skill_usage import restore_skill
+
+    for bad in ("../outside", "nested/name", "/absolute", "bad name"):
+        ok, msg = restore_skill(bad)
+        assert ok is False
+        assert "Invalid skill name" in msg
+
+
+def test_restore_skill_prefers_newest_matching_frontmatter(skills_home):
+    from tools.skill_usage import restore_skill
+
+    skills_dir = skills_home / "skills"
+    older = skills_dir / ".archive" / "dup"
+    newer = skills_dir / ".archive" / "dup-20260506010101"
+    older.mkdir(parents=True)
+    newer.mkdir(parents=True)
+    for path, body in ((older, "older"), (newer, "newer")):
+        (path / "SKILL.md").write_text(
+            "---\nname: dup\ndescription: test\n---\n\n# body\n",
+            encoding="utf-8",
+        )
+        (path / "references").mkdir()
+        (path / "references" / "body.md").write_text(body, encoding="utf-8")
+    # Ensure deterministic mtime ordering for the new frontmatter-based lookup.
+    import os
+    os.utime(older, (1, 1))
+    os.utime(newer, (2, 2))
+
+    ok, msg = restore_skill("dup")
+
+    assert ok, msg
+    assert (skills_dir / "dup" / "references" / "body.md").read_text() == "newer"
 
 
 def test_restore_skill_finds_nested_archive_subdir(skills_home):
@@ -411,6 +509,56 @@ def test_archive_collision_gets_suffix(skills_home):
     archived = sorted(p.name for p in (skills_dir / ".archive").iterdir() if p.is_dir())
     assert "dup" in archived
     assert any(n.startswith("dup-") and n != "dup" for n in archived)
+
+
+def test_repair_orphan_usage_records_removes_missing_managed_record(skills_home):
+    from tools.skill_usage import load_usage, mark_agent_created, repair_orphan_usage_records
+
+    mark_agent_created("orphan")
+    assert "orphan" in load_usage()
+
+    summary = repair_orphan_usage_records()
+
+    assert summary["removed"] == ["orphan"]
+    assert "orphan" not in load_usage()
+
+
+def test_repair_orphan_usage_records_marks_archived_when_archive_exists(skills_home):
+    from tools.skill_usage import get_record, load_usage, mark_agent_created, repair_orphan_usage_records
+
+    skills_dir = skills_home / "skills"
+    archived = skills_dir / ".archive" / "imports" / "moved-skill"
+    archived.mkdir(parents=True)
+    (archived / "SKILL.md").write_text(
+        "---\nname: moved-skill\ndescription: test\n---\n\n# body\n",
+        encoding="utf-8",
+    )
+    mark_agent_created("moved-skill")
+    assert get_record("moved-skill")["state"] == "active"
+
+    summary = repair_orphan_usage_records()
+
+    assert summary["marked_archived"] == ["moved-skill"]
+    assert load_usage()["moved-skill"]["state"] == "archived"
+
+
+def test_repair_orphan_usage_records_does_not_match_prefix_only_archive(skills_home):
+    from tools.skill_usage import load_usage, mark_agent_created, repair_orphan_usage_records
+
+    skills_dir = skills_home / "skills"
+    archived = skills_dir / ".archive" / "foo-extra"
+    archived.mkdir(parents=True)
+    (archived / "SKILL.md").write_text(
+        "---\nname: foo-extra\ndescription: test\n---\n\n# body\n",
+        encoding="utf-8",
+    )
+    mark_agent_created("foo")
+
+    summary = repair_orphan_usage_records()
+
+    assert summary["removed"] == ["foo"]
+    assert "foo" not in load_usage()
+    assert (archived / "SKILL.md").exists()
 
 
 # ---------------------------------------------------------------------------

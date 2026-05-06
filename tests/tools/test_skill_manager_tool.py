@@ -32,7 +32,9 @@ def _skill_dir(tmp_path):
     """Patch both SKILLS_DIR and get_all_skills_dirs so _find_skill searches
     only the temp directory — not the real ~/.hermes/skills/."""
     with patch("tools.skill_manager_tool.SKILLS_DIR", tmp_path), \
-         patch("agent.skill_utils.get_all_skills_dirs", return_value=[tmp_path]):
+         patch("agent.skill_utils.get_all_skills_dirs", return_value=[tmp_path]), \
+         patch("tools.skill_usage._skills_dir", return_value=tmp_path), \
+         patch("tools.skill_usage._archive_dir", return_value=tmp_path / ".archive"):
         yield
 
 
@@ -57,6 +59,10 @@ description: Updated description.
 
 Step 1: Do the new thing.
 """
+
+
+def _skill_content_for(name: str) -> str:
+    return VALID_SKILL_CONTENT.replace("name: test-skill", f"name: {name}")
 
 
 # ---------------------------------------------------------------------------
@@ -375,17 +381,35 @@ class TestDeleteSkill:
         with _skill_dir(tmp_path):
             _create_skill("umbrella", VALID_SKILL_CONTENT)
             _create_skill("narrow", VALID_SKILL_CONTENT)
+            _write_file("narrow", "references/api.md", "support payload")
             result = _delete_skill("narrow", absorbed_into="umbrella")
         assert result["success"] is True
+        assert result["archived"] is True
         assert "absorbed into 'umbrella'" in result["message"]
         assert not (tmp_path / "narrow").exists()
+        assert (tmp_path / ".archive" / "narrow" / "SKILL.md").exists()
+        assert (tmp_path / ".archive" / "narrow" / "references" / "api.md").read_text() == "support payload"
         assert (tmp_path / "umbrella").exists()
+
+    def test_delete_with_absorbed_into_preserves_category_suffix(self, tmp_path):
+        with _skill_dir(tmp_path):
+            _create_skill("umbrella", VALID_SKILL_CONTENT)
+            _create_skill("narrow", VALID_SKILL_CONTENT, category="devops")
+            _write_file("narrow", "scripts/run.py", "print('kept')")
+            result = _delete_skill("narrow", absorbed_into="umbrella")
+        assert result["success"] is True
+        assert not (tmp_path / "devops" / "narrow").exists()
+        assert not (tmp_path / "devops").exists()
+        assert (tmp_path / ".archive" / "devops" / "narrow" / "SKILL.md").exists()
+        assert (tmp_path / ".archive" / "devops" / "narrow" / "scripts" / "run.py").read_text() == "print('kept')"
 
     def test_delete_with_absorbed_into_empty_string_means_pruned(self, tmp_path):
         with _skill_dir(tmp_path):
             _create_skill("stale-skill", VALID_SKILL_CONTENT)
             result = _delete_skill("stale-skill", absorbed_into="")
         assert result["success"] is True
+        assert result["archived"] is True
+        assert (tmp_path / ".archive" / "stale-skill" / "SKILL.md").exists()
         # Empty absorbed_into is explicit prune — no "absorbed into" suffix in message
         assert "absorbed into" not in result["message"]
 
@@ -412,15 +436,19 @@ class TestDeleteSkill:
             _create_skill("narrow", VALID_SKILL_CONTENT)
             result = _delete_skill("narrow", absorbed_into="   ")
         assert result["success"] is True
+        assert result["archived"] is True
+        assert (tmp_path / ".archive" / "narrow" / "SKILL.md").exists()
         assert "absorbed into" not in result["message"]
 
     def test_delete_without_absorbed_into_backward_compat(self, tmp_path):
-        # Legacy callers that don't pass the arg still work — the curator
-        # reconciler falls back to its heuristic+YAML logic for such deletes.
+        # Legacy callers that don't pass the arg still use the old hard-delete path.
         with _skill_dir(tmp_path):
             _create_skill("my-skill", VALID_SKILL_CONTENT)
             result = _delete_skill("my-skill")
         assert result["success"] is True
+        assert result["archived"] is False
+        assert not (tmp_path / "my-skill").exists()
+        assert not (tmp_path / ".archive" / "my-skill").exists()
 
 
 # ---------------------------------------------------------------------------
@@ -562,14 +590,58 @@ class TestSkillManageDispatcher:
 
     def test_delete_via_dispatcher_threads_absorbed_into(self, tmp_path):
         # Dispatcher must plumb absorbed_into through to _delete_skill so the
-        # validation + message suffix paths are exercised end-to-end.
+        # validation + archive + message suffix paths are exercised end-to-end.
         with _skill_dir(tmp_path):
             skill_manage(action="create", name="umbrella", content=VALID_SKILL_CONTENT)
             skill_manage(action="create", name="narrow", content=VALID_SKILL_CONTENT)
+            _write_file("narrow", "templates/prompt.md", "kept")
             raw = skill_manage(action="delete", name="narrow", absorbed_into="umbrella")
+            from tools.skill_usage import load_usage
+            usage = load_usage()
         result = json.loads(raw)
         assert result["success"] is True
+        assert result["archived"] is True
         assert "absorbed into 'umbrella'" in result["message"]
+        assert (tmp_path / ".archive" / "narrow" / "templates" / "prompt.md").read_text() == "kept"
+        assert usage["narrow"]["state"] == "archived"
+        assert usage["narrow"]["agent_created"] is True
+
+    def test_restore_after_dispatcher_absorbed_delete_roundtrip(self, tmp_path):
+        with _skill_dir(tmp_path):
+            skill_manage(action="create", name="umbrella", content=_skill_content_for("umbrella"))
+            skill_manage(action="create", name="narrow", content=_skill_content_for("narrow"))
+            _write_file("narrow", "references/api.md", "roundtrip")
+            raw = skill_manage(action="delete", name="narrow", absorbed_into="umbrella")
+            assert json.loads(raw)["success"] is True
+            from tools.skill_usage import restore_skill, get_record
+            ok, msg = restore_skill("narrow")
+            rec = get_record("narrow")
+        assert ok, msg
+        assert (tmp_path / "narrow" / "SKILL.md").exists()
+        assert (tmp_path / "narrow" / "references" / "api.md").read_text() == "roundtrip"
+        assert rec["state"] == "active"
+
+    def test_archived_skill_not_found_as_active_after_absorbed_delete(self, tmp_path):
+        with _skill_dir(tmp_path):
+            skill_manage(action="create", name="umbrella", content=VALID_SKILL_CONTENT)
+            skill_manage(action="create", name="narrow", content=VALID_SKILL_CONTENT)
+            assert json.loads(skill_manage(action="delete", name="narrow", absorbed_into="umbrella"))["success"] is True
+            recreated = json.loads(skill_manage(action="create", name="narrow", content=VALID_SKILL_CONTENT))
+        assert recreated["success"] is True
+        assert (tmp_path / "narrow" / "SKILL.md").exists()
+        assert (tmp_path / ".archive" / "narrow" / "SKILL.md").exists()
+
+    def test_absorbed_into_target_must_be_active_not_archived(self, tmp_path):
+        with _skill_dir(tmp_path):
+            skill_manage(action="create", name="umbrella", content=VALID_SKILL_CONTENT)
+            skill_manage(action="create", name="narrow", content=VALID_SKILL_CONTENT)
+            assert json.loads(skill_manage(action="delete", name="umbrella", absorbed_into=""))["success"] is True
+            raw = skill_manage(action="delete", name="narrow", absorbed_into="umbrella")
+        result = json.loads(raw)
+        assert result["success"] is False
+        assert "does not exist" in result["error"]
+        assert (tmp_path / "narrow" / "SKILL.md").exists()
+        assert (tmp_path / ".archive" / "umbrella" / "SKILL.md").exists()
 
     def test_delete_via_dispatcher_rejects_missing_absorbed_target(self, tmp_path):
         with _skill_dir(tmp_path):

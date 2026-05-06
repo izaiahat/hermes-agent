@@ -27,6 +27,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
@@ -41,6 +42,9 @@ STATE_ACTIVE = "active"
 STATE_STALE = "stale"
 STATE_ARCHIVED = "archived"
 _VALID_STATES = {STATE_ACTIVE, STATE_STALE, STATE_ARCHIVED}
+_MAX_SKILL_NAME_LENGTH = 64
+_VALID_SKILL_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9._-]*$")
+_ARCHIVE_TIMESTAMP_SUFFIX_RE = re.compile(r"-(\d{14})$")
 
 
 def _skills_dir() -> Path:
@@ -205,12 +209,40 @@ def list_agent_created_skill_names() -> List[str]:
     return sorted(set(names))
 
 
-def _read_skill_name(skill_md: Path, fallback: str) -> str:
-    """Parse the `name:` field from a SKILL.md YAML frontmatter."""
+def _validate_skill_name_for_path(skill_name: str) -> Optional[str]:
+    """Validate skill names before constructing filesystem destinations."""
+    if not skill_name:
+        return "Skill name is required."
+    if len(skill_name) > _MAX_SKILL_NAME_LENGTH:
+        return f"Skill name exceeds {_MAX_SKILL_NAME_LENGTH} characters."
+    candidate = Path(skill_name)
+    if candidate.is_absolute() or len(candidate.parts) != 1 or ".." in candidate.parts:
+        return f"Invalid skill name '{skill_name}'. Skill names must be a single path segment."
+    if not _VALID_SKILL_NAME_RE.match(skill_name):
+        return (
+            f"Invalid skill name '{skill_name}'. Use lowercase letters, numbers, "
+            "hyphens, dots, and underscores. Must start with a letter or digit."
+        )
+    return None
+
+
+def _archive_sort_key(path: Path) -> Tuple[str, float, str]:
+    """Prefer timestamp-suffixed archives, then newest mtime, then path."""
+    match = _ARCHIVE_TIMESTAMP_SUFFIX_RE.search(path.name)
+    stamp = match.group(1) if match else ""
+    try:
+        mtime = path.stat().st_mtime
+    except OSError:
+        mtime = 0.0
+    return (stamp, mtime, str(path))
+
+
+def _read_skill_name_field(skill_md: Path) -> Optional[str]:
+    """Parse the `name:` field from SKILL.md frontmatter, if present."""
     try:
         text = skill_md.read_text(encoding="utf-8", errors="replace")[:4000]
     except OSError:
-        return fallback
+        return None
     in_frontmatter = False
     for line in text.split("\n"):
         stripped = line.strip()
@@ -221,9 +253,13 @@ def _read_skill_name(skill_md: Path, fallback: str) -> str:
             continue
         if in_frontmatter and stripped.startswith("name:"):
             value = stripped.split(":", 1)[1].strip().strip("\"'")
-            if value:
-                return value
-    return fallback
+            return value or None
+    return None
+
+
+def _read_skill_name(skill_md: Path, fallback: str) -> str:
+    """Parse the `name:` field from a SKILL.md YAML frontmatter."""
+    return _read_skill_name_field(skill_md) or fallback
 
 
 def is_agent_created(skill_name: str) -> bool:
@@ -463,6 +499,10 @@ def restore_skill(skill_name: str) -> Tuple[bool, str]:
     Refuses to restore under a name that now collides with a bundled or
     hub-installed skill — that would shadow the upstream version.
     """
+    name_error = _validate_skill_name_for_path(skill_name)
+    if name_error:
+        return False, name_error
+
     # If a bundled or hub skill has since been installed under the same
     # name, refuse to restore rather than shadow it.
     if not is_agent_created(skill_name):
@@ -470,25 +510,16 @@ def restore_skill(skill_name: str) -> Tuple[bool, str]:
             f"skill '{skill_name}' is now bundled or hub-installed; "
             "restore would shadow the upstream version"
         )
-    archive_root = _archive_dir()
-    if not archive_root.exists():
-        return False, "no archive directory"
-
-    # Try exact name match first, then any prefix match (for timestamped dupes).
-    # Recursive walk handles nested archive layouts (e.g. .archive/<category>/<skill>/)
-    # left behind by older archive paths or external imports.
-    candidates = [p for p in archive_root.rglob("*") if p.is_dir() and p.name == skill_name]
-    if not candidates:
-        candidates = sorted(
-            [p for p in archive_root.rglob("*")
-             if p.is_dir() and p.name.startswith(f"{skill_name}-")],
-            reverse=True,
-        )
-    if not candidates:
+    src = _find_archived_skill_dir(skill_name)
+    if src is None:
         return False, f"skill '{skill_name}' not found in archive"
 
-    src = candidates[0]
-    dest = _skills_dir() / skill_name
+    skills_root = _skills_dir()
+    dest = skills_root / skill_name
+    from tools.path_security import validate_within_dir
+    path_error = validate_within_dir(dest, skills_root)
+    if path_error:
+        return False, path_error
     if dest.exists():
         return False, f"destination already exists: {dest}"
 
@@ -527,6 +558,85 @@ def _find_skill_dir(skill_name: str) -> Optional[Path]:
 
 
 # ---------------------------------------------------------------------------
+def _find_archived_skill_dir(skill_name: str) -> Optional[Path]:
+    """Locate an archived skill directory by frontmatter name.
+
+    Handles flat archives, category-preserving archives, and timestamp-suffixed
+    duplicate archive entries.
+    """
+    archive_root = _archive_dir()
+    if not archive_root.exists():
+        return None
+
+    matches: List[Path] = []
+    for skill_md in archive_root.rglob("SKILL.md"):
+        skill_dir = skill_md.parent
+        parsed_name = _read_skill_name_field(skill_md)
+        if parsed_name is not None:
+            if parsed_name == skill_name:
+                matches.append(skill_dir)
+            continue
+        if skill_dir.name == skill_name:
+            matches.append(skill_dir)
+    if matches:
+        # Collision archives get timestamp/name suffixes, but their SKILL.md
+        # frontmatter keeps the original skill name. Only fall back to exact
+        # directory-name matches when frontmatter lacks a name field; never use
+        # prefix-only matches (foo must not match foo-extra). Prefer explicit
+        # timestamp suffixes over mtime when duplicates exist.
+        return sorted(matches, key=_archive_sort_key, reverse=True)[0]
+    return None
+
+
+def repair_orphan_usage_records() -> Dict[str, List[str]]:
+    """Repair curator-managed usage records that no longer match the filesystem.
+
+    - active/stale record + archived dir exists -> mark archived
+    - archived record + active dir exists -> mark active
+    - managed record + no active dir + no archived dir -> remove as orphan
+
+    Returns a change summary. This is intentionally conservative: bundled,
+    hub-installed, and non-curator-managed records are left untouched.
+    """
+    data = load_usage()
+    removed: List[str] = []
+    marked_archived: List[str] = []
+    marked_active: List[str] = []
+
+    for name, rec in list(data.items()):
+        if not _is_curator_managed_record(rec):
+            continue
+        active_dir = _find_skill_dir(name)
+        archived_dir = _find_archived_skill_dir(name)
+        state = rec.get("state", STATE_ACTIVE)
+
+        if active_dir is not None:
+            if state == STATE_ARCHIVED:
+                rec["state"] = STATE_ACTIVE
+                rec["archived_at"] = None
+                marked_active.append(name)
+            continue
+
+        if archived_dir is not None:
+            if state != STATE_ARCHIVED:
+                rec["state"] = STATE_ARCHIVED
+                rec["archived_at"] = rec.get("archived_at") or _now_iso()
+                marked_archived.append(name)
+            continue
+
+        removed.append(name)
+        data.pop(name, None)
+
+    if removed or marked_archived or marked_active:
+        save_usage(data)
+
+    return {
+        "removed": sorted(removed),
+        "marked_archived": sorted(marked_archived),
+        "marked_active": sorted(marked_active),
+    }
+
+
 # Reporting — for the curator CLI / slash command
 # ---------------------------------------------------------------------------
 

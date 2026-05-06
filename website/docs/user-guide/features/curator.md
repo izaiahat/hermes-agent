@@ -32,7 +32,7 @@ If you want to see what the curator *would* do before it runs for real, run `her
 A run has two phases:
 
 1. **Automatic transitions** (deterministic, no LLM). Skills unused for `stale_after_days` (30) become `stale`; skills unused for `archive_after_days` (90) are moved to `~/.hermes/skills/.archive/`.
-2. **LLM review** (single aux-model pass, `max_iterations=8`). The forked agent surveys the agent-created skills, can read any of them with `skill_view`, and decides per-skill whether to keep, patch (via `skill_manage`), consolidate overlapping ones, or archive via the terminal tool.
+2. **LLM review** (single aux-model pass, `max_iterations=8`). The forked agent surveys the agent-created skills, can read any of them with `skill_view`, and decides per-skill whether to keep, patch (via `skill_manage`), consolidate overlapping ones, or archive/consolidate via `skill_manage(action="delete", absorbed_into=...)` so the full directory remains restorable.
 
 Pinned skills are off-limits to both the curator's auto-transitions and the agent's own `skill_manage` tool. See [Pinning a skill](#pinning-a-skill) below.
 
@@ -97,6 +97,7 @@ hermes curator resume
 hermes curator pin <skill>    # never auto-transition this skill
 hermes curator unpin <skill>
 hermes curator restore <skill>  # move an archived skill back to active
+hermes curator repair-usage      # sync curator usage records with active/.archive dirs
 ```
 
 ## Backups and rollback
@@ -142,12 +143,12 @@ Existing hand-written skills or migrated skill directories are **not** inferred 
 :::warning Pin critical local skills before adoption
 The curator can only act on curator-managed, unpinned local skills. Before bulk-adopting an existing private skill library:
 
-1. Run `hermes curator run --dry-run` to see the current candidate set.
+1. Run `hermes curator run --dry-run` if you want an audit preview of the current candidate set.
 2. Use `hermes curator pin <name>` or set `pinned: true` in `.usage.json` for anything mission-critical.
 3. Mark only the intended local skills as `created_by: "agent"` / `agent_created: true`.
-4. Run another dry-run before the first live pass.
+4. Let the curator continue on its autonomous schedule, or run `hermes curator run` deliberately if you want an immediate live pass.
 
-Archives are always recoverable via `hermes curator restore <name>`, but it is easier to pin up-front than to chase down a consolidation after the fact.
+Archives are recoverable via `hermes curator restore <name>` because curator-declared deletes move the full skill directory tree into `.archive/`, but it is easier to pin up-front than to chase down a consolidation after the fact.
 :::
 
 If you want to protect a specific local curator-managed skill from ever being archived — for example a hand-authored skill you rely on — use `hermes curator pin <name>`. See the next section.
