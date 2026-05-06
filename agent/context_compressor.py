@@ -545,6 +545,7 @@ class ContextCompressor(ContextEngine):
         self._last_summary_fallback_used = False
         self._last_aux_model_failure_error = None
         self._last_aux_model_failure_model = None
+        self._summary_force_main_model = False
         self._last_compression_savings_pct = 100.0
         self._ineffective_compression_count = 0
         self._summary_failure_cooldown_until = 0.0  # transient errors must not block a fresh session
@@ -671,6 +672,7 @@ class ContextCompressor(ContextEngine):
         self.awaiting_real_usage_after_compression = False
 
         self.summary_model = summary_model_override or ""
+        self._summary_force_main_model = False
 
         # Stores the previous compaction summary for iterative updates
         self._previous_summary: Optional[str] = None
@@ -1228,6 +1230,7 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
         self._last_aux_model_failure_error = _err_text
         self._last_aux_model_failure_model = self.summary_model
         self.summary_model = ""  # empty = use main model
+        self._summary_force_main_model = True
         self._summary_failure_cooldown_until = 0.0  # no cooldown — retry immediately
 
     def _generate_summary(
@@ -1437,7 +1440,20 @@ The user has requested that this compaction PRIORITISE preserving all informatio
                 "max_tokens": int(summary_budget * 1.3),
                 # timeout resolved from auxiliary.compression.timeout config by call_llm
             }
-            if self.summary_model:
+            if getattr(self, "_summary_force_main_model", False):
+                # Bypass auxiliary.compression.* overrides on retry and use
+                # the live main model directly.  Passing only ``model`` is not
+                # enough because call_llm(task="compression") would otherwise
+                # keep the task-level provider/model config in force.
+                if self.provider:
+                    call_kwargs["provider"] = self.provider
+                call_kwargs["model"] = self.model
+                if (self.provider or "").startswith("custom"):
+                    if self.base_url:
+                        call_kwargs["base_url"] = self.base_url
+                    if self.api_key:
+                        call_kwargs["api_key"] = self.api_key
+            elif self.summary_model:
                 call_kwargs["model"] = self.summary_model
             response = call_llm(**call_kwargs)
             content = response.choices[0].message.content
@@ -1451,11 +1467,13 @@ The user has requested that this compaction PRIORITISE preserving all informatio
             self._previous_summary = summary
             self._summary_failure_cooldown_until = 0.0
             self._summary_model_fallen_back = False
+            self._summary_force_main_model = False
             self._last_summary_error = None
             return self._with_summary_prefix(summary)
         except RuntimeError:
             # No provider configured — long cooldown, unlikely to self-resolve
             self._summary_failure_cooldown_until = time.monotonic() + _SUMMARY_FAILURE_COOLDOWN_SECONDS
+            self._summary_force_main_model = False
             self._last_summary_error = "no auxiliary LLM provider configured"
             logger.warning("Context compression: no provider available for "
                             "summary. Middle turns will be dropped without summary "
@@ -1553,6 +1571,7 @@ The user has requested that this compaction PRIORITISE preserving all informatio
             if len(err_text) > 220:
                 err_text = err_text[:217].rstrip() + "..."
             self._last_summary_error = err_text
+            self._summary_force_main_model = False
             logger.warning(
                 "Failed to generate context summary: %s. "
                 "Further summary attempts paused for %d seconds.",

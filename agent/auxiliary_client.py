@@ -2454,14 +2454,17 @@ def _is_connection_error(exc: Exception) -> bool:
         pass
     # urllib3 / httpx / httpcore connection errors
     err_type = type(exc).__name__
-    if any(kw in err_type for kw in ("Connection", "Timeout", "DNS", "SSL")):
+    if any(kw in err_type for kw in (
+        "Connection", "Timeout", "DNS", "SSL",
+        "RemoteProtocol", "ReadError", "ChunkedEncoding",
+    )):
         return True
     err_lower = str(exc).lower()
     if any(kw in err_lower for kw in (
         "connection refused", "name or service not known",
         "no route to host", "network is unreachable",
-        "timed out", "connection reset",
-        # httpcore / httpx streaming premature-close errors.  These surface
+        "timed out", "connection reset", "connection closed",
+        # httpcore / httpx streaming premature-close errors. These surface
         # when a proxy or provider drops the connection mid-stream and are
         # transient by nature — the request should be retried or rerouted.
         # See issue #18458.
@@ -2471,6 +2474,7 @@ def _is_connection_error(exc: Exception) -> bool:
         "unexpected eof",
         "remoteprotocolerror",
         "localprotocolerror",
+        "server disconnected", "broken pipe", "remote protocol",
     )):
         return True
     return False

@@ -198,6 +198,44 @@ class TestAgentConfigSignature:
 
         assert sig_before != sig_after
 
+    def test_auxiliary_compression_model_change_busts_cache(self):
+        """Changing the aux summary model must rebuild cached gateway agents."""
+        from gateway.run import GatewayRunner
+
+        runtime = {"api_key": "k", "base_url": "u", "provider": "p"}
+        sig_before = GatewayRunner._agent_config_signature(
+            "m", runtime, [], "",
+            cache_keys={"auxiliary.compression.model": "gpt-5.4"},
+        )
+        sig_after = GatewayRunner._agent_config_signature(
+            "m", runtime, [], "",
+            cache_keys={"auxiliary.compression.model": "gpt-5.5"},
+        )
+
+        assert sig_before != sig_after
+
+
+class TestResolveAgentMaxIterations:
+    """Gateway should read the live config budget like TUI agent creation."""
+
+    def test_prefers_config_agent_max_turns_over_env(self, monkeypatch):
+        from gateway.run import GatewayRunner
+
+        monkeypatch.setenv("HERMES_MAX_ITERATIONS", "90")
+        assert GatewayRunner._resolve_agent_max_iterations({"agent": {"max_turns": 2200}}) == 2200
+
+    def test_falls_back_to_env_when_config_missing(self, monkeypatch):
+        from gateway.run import GatewayRunner
+
+        monkeypatch.setenv("HERMES_MAX_ITERATIONS", "250")
+        assert GatewayRunner._resolve_agent_max_iterations({}) == 250
+
+    def test_invalid_config_falls_back_to_env(self, monkeypatch):
+        from gateway.run import GatewayRunner
+
+        monkeypatch.setenv("HERMES_MAX_ITERATIONS", "300")
+        assert GatewayRunner._resolve_agent_max_iterations({"agent": {"max_turns": "bad"}}) == 300
+
 
 class TestExtractCacheBustingConfig:
     """Verify _extract_cache_busting_config pulls the documented subset of
@@ -217,6 +255,34 @@ class TestExtractCacheBustingConfig:
         )
         assert out["model.context_length"] == 272_000
         assert out["model.max_tokens"] == 4096
+
+    def test_reads_agent_max_turns(self):
+        from gateway.run import GatewayRunner
+
+        out = GatewayRunner._extract_cache_busting_config({"agent": {"max_turns": 2200}})
+        assert out["agent.max_turns"] == 2200
+
+    def test_reads_auxiliary_compression_subkeys(self):
+        from gateway.run import GatewayRunner
+
+        out = GatewayRunner._extract_cache_busting_config(
+            {
+                "auxiliary": {
+                    "compression": {
+                        "provider": "auto",
+                        "model": "gpt-5.4",
+                        "base_url": "https://chatgpt.com/backend-api/codex",
+                        "context_length": 1_000_000,
+                        "timeout": 120,
+                    }
+                }
+            }
+        )
+        assert out["auxiliary.compression.provider"] == "auto"
+        assert out["auxiliary.compression.model"] == "gpt-5.4"
+        assert out["auxiliary.compression.base_url"] == "https://chatgpt.com/backend-api/codex"
+        assert out["auxiliary.compression.context_length"] == 1_000_000
+        assert out["auxiliary.compression.timeout"] == 120
 
     def test_reads_compression_subkeys(self):
         from gateway.run import GatewayRunner
