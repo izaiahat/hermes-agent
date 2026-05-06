@@ -1603,6 +1603,7 @@ class ContextCompressor(ContextEngine):
         self._last_feasibility_skip = False
         self._last_aux_model_failure_error = None
         self._last_aux_model_failure_model = None
+        self._summary_force_main_model = False
         self._last_compression_savings_pct = 100.0
         self._ineffective_compression_count = 0
         self._anti_thrash_recovery_deadline = 0.0
@@ -2665,6 +2666,7 @@ class ContextCompressor(ContextEngine):
         self.summary_model = summary_model_override or ""
         self._session_db: Any = None
         self._session_id: str = ""
+        self._summary_force_main_model = False
 
         # Stores the previous compaction summary for iterative updates
         self._previous_summary: Optional[str] = None
@@ -3881,6 +3883,7 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
             telemetry["fallback_used"] = True
             telemetry["failure_class"] = telemetry.get("failure_class") or "aux_model_fallback"
         self.summary_model = ""  # empty = use main model
+        self._summary_force_main_model = True
         self._clear_compression_failure_cooldown()  # no cooldown — retry immediately
 
     def _generate_summary(
@@ -4201,7 +4204,20 @@ This compaction should PRIORITISE preserving all information related to the focu
                 # fall back to the model's native output ceiling.
                 # timeout resolved from auxiliary.compression.timeout config by call_llm
             }
-            if self.summary_model:
+            if getattr(self, "_summary_force_main_model", False):
+                # Bypass auxiliary.compression.* overrides on retry and use
+                # the live main model directly.  Passing only ``model`` is not
+                # enough because call_llm(task="compression") would otherwise
+                # keep the task-level provider/model config in force.
+                if self.provider:
+                    call_kwargs["provider"] = self.provider
+                call_kwargs["model"] = self.model
+                if (self.provider or "").startswith("custom"):
+                    if self.base_url:
+                        call_kwargs["base_url"] = self.base_url
+                    if self.api_key:
+                        call_kwargs["api_key"] = self.api_key
+            elif self.summary_model:
                 call_kwargs["model"] = self.summary_model
             _aux_provider = ""
             _aux_model = self.summary_model or ""
@@ -4290,6 +4306,7 @@ This compaction should PRIORITISE preserving all information related to the focu
             self._previous_summary = summary
             self._clear_compression_failure_cooldown()
             self._summary_model_fallen_back = False
+            self._summary_force_main_model = False
             self._last_summary_error = None
             self._last_summary_auth_failure = False
             self._last_summary_network_failure = False
@@ -4462,6 +4479,7 @@ This compaction should PRIORITISE preserving all information related to the focu
             # the auth-failure carve-out; independent of abort_on_summary_failure.
             if _is_streaming_closed:
                 self._last_summary_network_failure = True
+            self._summary_force_main_model = False
             logger.warning(
                 "Failed to generate context summary: %s. "
                 "Further summary attempts paused for %d seconds.",

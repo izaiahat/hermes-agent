@@ -105,10 +105,65 @@ class TestAgentConfigSignature:
         )
         assert sig_a == sig_b
 
+    def test_auxiliary_compression_model_change_busts_cache(self):
+        from gateway.run import GatewayRunner
+
+        runtime = {"api_key": "k", "base_url": "u", "provider": "p"}
+        sig_before = GatewayRunner._agent_config_signature(
+            "m", runtime, [], "",
+            cache_keys={"auxiliary.compression.model": "gpt-5.4"},
+        )
+        sig_after = GatewayRunner._agent_config_signature(
+            "m", runtime, [], "",
+            cache_keys={"auxiliary.compression.model": "gpt-5.6-sol"},
+        )
+
+        assert sig_before != sig_after
+
 
 class TestExtractCacheBustingConfig:
     """Verify _extract_cache_busting_config pulls the documented subset of
     config values that must invalidate the cached agent on change."""
+
+    def test_reads_agent_and_native_compaction_settings(self):
+        from gateway.run import GatewayRunner
+
+        out = GatewayRunner._extract_cache_busting_config(
+            {
+                "agent": {"max_turns": 2200},
+                "compression": {
+                    "codex_responses_native": True,
+                    "codex_responses_compact_threshold": 200_000,
+                },
+            }
+        )
+
+        assert out["agent.max_turns"] == 2200
+        assert out["compression.codex_responses_native"] is True
+        assert out["compression.codex_responses_compact_threshold"] == 200_000
+
+    def test_reads_auxiliary_compression_subkeys(self):
+        from gateway.run import GatewayRunner
+
+        out = GatewayRunner._extract_cache_busting_config(
+            {
+                "auxiliary": {
+                    "compression": {
+                        "provider": "auto",
+                        "model": "gpt-5.6-sol",
+                        "base_url": "https://chatgpt.com/backend-api/codex",
+                        "context_length": 1_000_000,
+                        "timeout": 120,
+                    }
+                }
+            }
+        )
+
+        assert out["auxiliary.compression.provider"] == "auto"
+        assert out["auxiliary.compression.model"] == "gpt-5.6-sol"
+        assert out["auxiliary.compression.base_url"] == "https://chatgpt.com/backend-api/codex"
+        assert out["auxiliary.compression.context_length"] == 1_000_000
+        assert out["auxiliary.compression.timeout"] == 120
 
 
     def test_reads_compression_subkeys(self):

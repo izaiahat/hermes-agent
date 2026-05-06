@@ -23090,6 +23090,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     _CACHE_BUSTING_CONFIG_KEYS: tuple = (
         ("model", "context_length"),
         ("model", "max_tokens"),
+        ("agent", "max_turns"),
         ("compression", "enabled"),
         ("compression", "progress_notices"),
         ("compression", "threshold"),
@@ -23097,12 +23098,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         ("compression", "threshold_tokens"),
         ("compression", "codex_gpt55_autoraise"),
         ("compression", "codex_app_server_auto"),
+        ("compression", "codex_responses_native"),
+        ("compression", "codex_responses_compact_threshold"),
         ("compression", "target_ratio"),
         ("compression", "protect_last_n"),
         ("compression", "proactive_prune_tokens"),
         ("compression", "proactive_prune_min_result_chars"),
         ("compression", "proactive_prune_min_reclaim_tokens"),
         ("compression", "min_tail_user_messages"),
+        ("auxiliary.compression", "provider"),
+        ("auxiliary.compression", "model"),
+        ("auxiliary.compression", "base_url"),
+        ("auxiliary.compression", "context_length"),
+        ("auxiliary.compression", "timeout"),
         ("agent", "disabled_toolsets"),
         ("memory", "provider"),
         ("checkpoints", "enabled"),
@@ -23171,7 +23179,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         out: Dict[str, Any] = {}
         cfg = user_config if isinstance(user_config, dict) else {}
         for section, key in cls._CACHE_BUSTING_CONFIG_KEYS:
-            section_val = cfg.get(section)
+            section_val: Any = cfg
+            for part in section.split("."):
+                if isinstance(section_val, dict):
+                    section_val = section_val.get(part)
+                else:
+                    section_val = None
+                    break
             if section == "checkpoints" and isinstance(section_val, bool):
                 # Preserve legacy ``checkpoints: true`` behavior.  A live
                 # toggle must still rebuild the cached agent.

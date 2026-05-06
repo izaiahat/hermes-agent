@@ -969,8 +969,8 @@ class TestSummaryFallbackToMainModel:
         assert mock_call.call_count == 2
         # First call used the misconfigured aux model
         assert mock_call.call_args_list[0].kwargs.get("model") == "broken-aux-model"
-        # Second call used the main model (no model kwarg → call_llm uses main)
-        assert "model" not in mock_call.call_args_list[1].kwargs
+        # Second call bypassed auxiliary.compression.* and selected main directly.
+        assert mock_call.call_args_list[1].kwargs.get("model") == "main-model"
         assert result is not None
         assert "summary via main model" in result
         # Aux-model failure is recorded even though retry succeeded — this is
@@ -979,6 +979,42 @@ class TestSummaryFallbackToMainModel:
         assert c._last_aux_model_failure_model == "broken-aux-model"
         assert c._last_aux_model_failure_error is not None
         assert "404" in c._last_aux_model_failure_error
+
+    def test_retry_bypasses_task_aux_config_with_live_main_provider(self):
+        mock_ok = MagicMock()
+        mock_ok.choices = [MagicMock()]
+        mock_ok.choices[0].message.content = "summary via gpt-5.6"
+        err = Exception(
+            "peer closed connection without sending complete message body"
+        )
+
+        with patch(
+            "agent.context_compressor.get_model_context_length",
+            return_value=1_000_000,
+        ):
+            c = ContextCompressor(
+                model="gpt-5.6-sol",
+                provider="openai-codex",
+                base_url="https://chatgpt.com/backend-api/codex",
+                api_key="codex-token",
+                api_mode="codex_responses",
+                summary_model_override="broken-aux-model",
+                quiet_mode=True,
+            )
+
+        with patch(
+            "agent.context_compressor.call_llm",
+            side_effect=[err, mock_ok],
+        ) as mock_call:
+            result = c._generate_summary(self._msgs())
+
+        assert mock_call.call_count == 2
+        assert mock_call.call_args_list[0].kwargs.get("model") == "broken-aux-model"
+        retry_kwargs = mock_call.call_args_list[1].kwargs
+        assert retry_kwargs.get("provider") == "openai-codex"
+        assert retry_kwargs.get("model") == "gpt-5.6-sol"
+        assert result is not None
+        assert "summary via gpt-5.6" in result
 
 
     def test_no_fallback_when_summary_model_equals_main_model(self):
@@ -1038,7 +1074,7 @@ class TestSummaryFallbackToMainModel:
 
         assert mock_call.call_count == 2
         assert mock_call.call_args_list[0].kwargs.get("model") == "aux-via-broken-proxy"
-        assert "model" not in mock_call.call_args_list[1].kwargs
+        assert mock_call.call_args_list[1].kwargs.get("model") == "main-model"
         assert result is not None
         assert "summary via main model" in result
         # Aux-model failure recorded so /usage / gateway warnings can surface it
@@ -1095,7 +1131,7 @@ class TestStreamingClosedFallback:
 
         assert mock_call.call_count == 2
         assert mock_call.call_args_list[0].kwargs.get("model") == "aux-stream-model"
-        assert "model" not in mock_call.call_args_list[1].kwargs
+        assert mock_call.call_args_list[1].kwargs.get("model") == "main-model"
         assert result is not None
         assert "summary via main model" in result
 
