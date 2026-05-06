@@ -12086,7 +12086,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             disabled_toolsets = agent_cfg.get("disabled_toolsets") or None
 
             pr = self._provider_routing
-            max_iterations = _current_max_iterations()
+            max_iterations = self._resolve_agent_max_iterations(user_config)
             reasoning_config = self._resolve_session_reasoning_config(source=source)
             self._reasoning_config = reasoning_config
             self._service_tier = self._load_service_tier()
@@ -14312,10 +14312,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     _CACHE_BUSTING_CONFIG_KEYS: tuple = (
         ("model", "context_length"),
         ("model", "max_tokens"),
+        ("agent", "max_turns"),
         ("compression", "enabled"),
         ("compression", "threshold"),
         ("compression", "target_ratio"),
         ("compression", "protect_last_n"),
+        ("auxiliary.compression", "provider"),
+        ("auxiliary.compression", "model"),
+        ("auxiliary.compression", "base_url"),
+        ("auxiliary.compression", "context_length"),
+        ("auxiliary.compression", "timeout"),
         ("agent", "disabled_toolsets"),
         ("memory", "provider"),
     )
@@ -14363,6 +14369,36 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception:
             return cls._empty_honcho_cache_busting_config()
 
+    @staticmethod
+    def _resolve_agent_max_iterations(user_config: dict | None = None) -> int:
+        """Resolve the live per-turn agent iteration budget.
+
+        Gateway processes are long-lived, while the TUI reads ``config.yaml``
+        every time it creates an agent.  Prefer the current ``agent.max_turns``
+        value from the freshly loaded gateway config, falling back to the env
+        bridge only when the key is missing or invalid.  This keeps Discord and
+        TUI budgets in parity after a config edit without relying on a gateway
+        restart.
+        """
+        raw = None
+        cfg = user_config if isinstance(user_config, dict) else {}
+        agent_cfg = cfg.get("agent")
+        if isinstance(agent_cfg, dict):
+            raw = agent_cfg.get("max_turns")
+        if raw is None:
+            raw = os.getenv("HERMES_MAX_ITERATIONS", "90")
+        try:
+            value = int(raw)
+            if value > 0:
+                return value
+        except (TypeError, ValueError):
+            pass
+        try:
+            fallback = int(os.getenv("HERMES_MAX_ITERATIONS", "90"))
+            return fallback if fallback > 0 else 90
+        except (TypeError, ValueError):
+            return 90
+
     @classmethod
     def _extract_cache_busting_config(cls, user_config: dict | None) -> dict:
         """Pull values that must bust the cached agent.
@@ -14380,7 +14416,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         out: Dict[str, Any] = {}
         cfg = user_config if isinstance(user_config, dict) else {}
         for section, key in cls._CACHE_BUSTING_CONFIG_KEYS:
-            section_val = cfg.get(section)
+            section_val: Any = cfg
+            for part in section.split("."):
+                if isinstance(section_val, dict):
+                    section_val = section_val.get(part)
+                else:
+                    section_val = None
+                    break
             if isinstance(section_val, dict):
                 out[f"{section}.{key}"] = section_val.get(key)
             else:
@@ -16234,6 +16276,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # --session-key argv, a separate process) — so removing this in-process
             # gateway write does not affect any of them.
 
+            # Read from the freshly loaded config first so long-lived gateway
+            # sessions stay in parity with the TUI after agent.max_turns edits.
+            max_iterations = self._resolve_agent_max_iterations(user_config)
+
             # Map platform enum to the platform hint key the agent understands.
             # Platform.LOCAL ("local") maps to "cli"; others pass through as-is.
             platform_key = "cli" if source.platform == Platform.LOCAL else source.platform.value
@@ -16246,8 +16292,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 combined_ephemeral = (combined_ephemeral + "\n\n" + event_channel_prompt).strip()
             if self._ephemeral_system_prompt:
                 combined_ephemeral = (combined_ephemeral + "\n\n" + self._ephemeral_system_prompt).strip()
-
-            max_iterations = _current_max_iterations()
 
             try:
                 model, runtime_kwargs = self._resolve_session_agent_runtime(
