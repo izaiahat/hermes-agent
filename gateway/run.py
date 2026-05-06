@@ -4201,7 +4201,8 @@ class GatewayRunner(
     # cached agent or a mid-gateway edit is silently ignored. Add new baked-in settings here.
     # _MAX_INTERRUPT_DEPTH = 3  # Cap recursive interrupt handling (#816)
     _CACHE_BUSTING_CONFIG_KEYS: tuple = (
-        ("model", "context_length"), ("compression", "enabled"),
+        ("model", "context_length"), ("model", "max_tokens"), ("agent", "max_turns"),
+        ("compression", "enabled"),
         ("compression", "progress_notices"), ("compression", "threshold"),
         ("compression", "model_thresholds"), ("compression", "threshold_tokens"),
         ("compression", "codex_gpt55_autoraise"), ("compression", "codex_app_server_auto"),
@@ -4214,7 +4215,13 @@ class GatewayRunner(
         ("compression", "proactive_prune_tokens"),
         ("compression", "proactive_prune_min_result_chars"),
         ("compression", "proactive_prune_min_reclaim_tokens"),
-        ("compression", "min_tail_user_messages"), ("agent", "disabled_toolsets"),
+        ("compression", "min_tail_user_messages"),
+        # Dotted sections: the gateway must rebuild its cached agent when the
+        # auxiliary compression route changes, exactly as the TUI does.
+        ("auxiliary.compression", "provider"), ("auxiliary.compression", "model"),
+        ("auxiliary.compression", "base_url"), ("auxiliary.compression", "context_length"),
+        ("auxiliary.compression", "timeout"),
+        ("agent", "disabled_toolsets"),
         ("memory", "provider"), ("checkpoints", "enabled"), ("checkpoints", "max_snapshots"),
         ("checkpoints", "max_total_size_mb"), ("checkpoints", "max_file_size_mb"))
 

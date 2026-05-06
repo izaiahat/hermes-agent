@@ -3089,14 +3089,19 @@ def _is_connection_error(exc: Exception) -> bool:
         from openai import APIConnectionError, APITimeoutError
         if isinstance(exc, (APIConnectionError, APITimeoutError)):
             return True
-    if _contains_any(type(exc).__name__, ("Connection", "Timeout", "DNS", "SSL")):
+    if _contains_any(type(exc).__name__, (
+        "Connection", "Timeout", "DNS", "SSL",
+        # httpx/httpcore/requests stream faults arrive under these type names.
+        "RemoteProtocol", "ReadError", "ChunkedEncoding",
+    )):
         return True
     return _contains_any(str(exc).lower(), (
         "connection refused", "name or service not known", "no route to host",
-        "network is unreachable", "timed out", "connection reset",
+        "network is unreachable", "timed out", "connection reset", "connection closed",
         # httpcore/httpx premature stream close — transient, retry/reroute.
         "incomplete chunked read", "peer closed connection", "response ended prematurely",
         "unexpected eof", "remoteprotocolerror", "localprotocolerror",
+        "server disconnected", "broken pipe", "remote protocol",
     ))
 
 
