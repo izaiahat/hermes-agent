@@ -312,8 +312,8 @@ class TestSummaryFallbackToMainModel:
         assert mock_call.call_count == 2
         # First call used the misconfigured aux model
         assert mock_call.call_args_list[0].kwargs.get("model") == "broken-aux-model"
-        # Second call used the main model (no model kwarg → call_llm uses main)
-        assert "model" not in mock_call.call_args_list[1].kwargs
+        # Second call bypassed auxiliary.compression.* and used the main model directly.
+        assert mock_call.call_args_list[1].kwargs.get("model") == "main-model"
         assert result is not None
         assert "summary via main model" in result
         # Aux-model failure is recorded even though retry succeeded — this is
@@ -351,13 +351,46 @@ class TestSummaryFallbackToMainModel:
 
         assert mock_call.call_count == 2
         assert mock_call.call_args_list[0].kwargs.get("model") == "broken-aux-model"
-        assert "model" not in mock_call.call_args_list[1].kwargs
+        assert mock_call.call_args_list[1].kwargs.get("model") == "main-model"
         assert result is not None
         assert "summary via main model" in result
         # Aux-model failure recorded despite successful recovery
         assert c._last_aux_model_failure_model == "broken-aux-model"
         assert c._last_aux_model_failure_error is not None
         assert "400" in c._last_aux_model_failure_error
+
+    def test_retry_bypasses_task_level_aux_model_with_main_provider(self):
+        """Live aux config can set auxiliary.compression.model. On retry,
+        call_llm must receive the main provider+model explicitly so the task
+        config does not silently select the broken aux model again."""
+        mock_ok = MagicMock()
+        mock_ok.choices = [MagicMock()]
+        mock_ok.choices[0].message.content = "summary via gpt-5.5"
+        err = Exception("peer closed connection without sending complete message body")
+
+        with patch("agent.context_compressor.get_model_context_length", return_value=272000):
+            c = ContextCompressor(
+                model="gpt-5.5",
+                provider="openai-codex",
+                base_url="https://chatgpt.com/backend-api/codex",
+                api_key="codex-token",
+                api_mode="codex_responses",
+                summary_model_override="gpt-5.4",
+                quiet_mode=True,
+            )
+
+        with patch(
+            "agent.context_compressor.call_llm",
+            side_effect=[err, mock_ok],
+        ) as mock_call:
+            result = c._generate_summary(self._msgs())
+
+        assert mock_call.call_count == 2
+        assert mock_call.call_args_list[0].kwargs.get("model") == "gpt-5.4"
+        assert mock_call.call_args_list[1].kwargs.get("provider") == "openai-codex"
+        assert mock_call.call_args_list[1].kwargs.get("model") == "gpt-5.5"
+        assert result is not None
+        assert "summary via gpt-5.5" in result
 
     def test_no_fallback_when_summary_model_equals_main_model(self):
         """If the aux model IS the main model, there's nowhere to fall back

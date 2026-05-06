@@ -11392,7 +11392,7 @@ class GatewayRunner:
             disabled_toolsets = agent_cfg.get("disabled_toolsets") or None
 
             pr = self._provider_routing
-            max_iterations = int(os.getenv("HERMES_MAX_ITERATIONS", "90"))
+            max_iterations = self._resolve_agent_max_iterations(user_config)
             reasoning_config = self._resolve_session_reasoning_config(source=source)
             self._reasoning_config = reasoning_config
             self._service_tier = self._load_service_tier()
@@ -14637,12 +14637,48 @@ class GatewayRunner:
     _CACHE_BUSTING_CONFIG_KEYS: tuple = (
         ("model", "context_length"),
         ("model", "max_tokens"),
+        ("agent", "max_turns"),
         ("compression", "enabled"),
         ("compression", "threshold"),
         ("compression", "target_ratio"),
         ("compression", "protect_last_n"),
+        ("auxiliary.compression", "provider"),
+        ("auxiliary.compression", "model"),
+        ("auxiliary.compression", "base_url"),
+        ("auxiliary.compression", "context_length"),
+        ("auxiliary.compression", "timeout"),
         ("agent", "disabled_toolsets"),
     )
+
+    @staticmethod
+    def _resolve_agent_max_iterations(user_config: dict | None = None) -> int:
+        """Resolve the live per-turn agent iteration budget.
+
+        Gateway processes are long-lived, while the TUI reads ``config.yaml``
+        every time it creates an agent.  Prefer the current ``agent.max_turns``
+        value from the freshly loaded gateway config, falling back to the env
+        bridge only when the key is missing or invalid.  This keeps Discord and
+        TUI budgets in parity after a config edit without relying on a gateway
+        restart.
+        """
+        raw = None
+        cfg = user_config if isinstance(user_config, dict) else {}
+        agent_cfg = cfg.get("agent")
+        if isinstance(agent_cfg, dict):
+            raw = agent_cfg.get("max_turns")
+        if raw is None:
+            raw = os.getenv("HERMES_MAX_ITERATIONS", "90")
+        try:
+            value = int(raw)
+            if value > 0:
+                return value
+        except (TypeError, ValueError):
+            pass
+        try:
+            fallback = int(os.getenv("HERMES_MAX_ITERATIONS", "90"))
+            return fallback if fallback > 0 else 90
+        except (TypeError, ValueError):
+            return 90
 
     @classmethod
     def _extract_cache_busting_config(cls, user_config: dict | None) -> dict:
@@ -14661,7 +14697,13 @@ class GatewayRunner:
         out: Dict[str, Any] = {}
         cfg = user_config if isinstance(user_config, dict) else {}
         for section, key in cls._CACHE_BUSTING_CONFIG_KEYS:
-            section_val = cfg.get(section)
+            section_val: Any = cfg
+            for part in section.split("."):
+                if isinstance(section_val, dict):
+                    section_val = section_val.get(part)
+                else:
+                    section_val = None
+                    break
             if isinstance(section_val, dict):
                 out[f"{section}.{key}"] = section_val.get(key)
             else:
@@ -16098,8 +16140,9 @@ class GatewayRunner:
             # (concurrency-safe). Keep os.environ as fallback for CLI/cron.
             os.environ["HERMES_SESSION_KEY"] = session_key or ""
 
-            # Read from env var or use default (same as CLI)
-            max_iterations = int(os.getenv("HERMES_MAX_ITERATIONS", "90"))
+            # Read from the freshly loaded config first so long-lived gateway
+            # sessions stay in parity with the TUI after agent.max_turns edits.
+            max_iterations = self._resolve_agent_max_iterations(user_config)
             
             # Map platform enum to the platform hint key the agent understands.
             # Platform.LOCAL ("local") maps to "cli"; others pass through as-is.

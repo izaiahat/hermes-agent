@@ -1360,6 +1360,23 @@ class TestIsConnectionError:
         err = Exception("Name or service not known")
         assert _is_connection_error(err) is True
 
+    def test_incomplete_chunked_read(self):
+        from agent.auxiliary_client import _is_connection_error
+        err = Exception(
+            "peer closed connection without sending complete message body "
+            "(incomplete chunked read)"
+        )
+        assert _is_connection_error(err) is True
+
+    def test_remote_protocol_error_type(self):
+        from agent.auxiliary_client import _is_connection_error
+
+        class RemoteProtocolError(Exception):
+            pass
+
+        err = RemoteProtocolError("server disconnected without response")
+        assert _is_connection_error(err) is True
+
     def test_normal_api_error_not_connection(self):
         from agent.auxiliary_client import _is_connection_error
         err = Exception("Bad Request: invalid model")
