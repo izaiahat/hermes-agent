@@ -15870,7 +15870,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 plugin_handler = get_plugin_command_handler(command.replace("_", "-"))
                 if plugin_handler:
                     user_args = event.get_command_args().strip()
-                    result = plugin_handler(user_args)
+                    try:
+                        import inspect as _inspect_plugin_cmd
+                        _sig = _inspect_plugin_cmd.signature(plugin_handler)
+                    except (TypeError, ValueError):
+                        # Some legacy callables do not expose an inspectable
+                        # signature. Preserve their original one-arg contract.
+                        result = plugin_handler(user_args)
+                    else:
+                        _supports_context_kwargs = any(
+                            param.kind == param.VAR_KEYWORD
+                            for param in _sig.parameters.values()
+                        )
+                        if _supports_context_kwargs or "event" in _sig.parameters:
+                            result = plugin_handler(user_args, event=event, source=source)
+                        elif len(_sig.parameters) >= 2:
+                            result = plugin_handler(user_args, event)
+                        else:
+                            result = plugin_handler(user_args)
                     if asyncio.iscoroutine(result):
                         result = await result
                     return str(result) if result else None

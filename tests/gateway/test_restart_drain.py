@@ -56,6 +56,39 @@ async def test_restart_command_while_busy_requests_drain_without_interrupt(monke
     runner.request_restart.assert_called_once_with(detached=True, via_service=False)
 
 
+@pytest.mark.asyncio
+async def test_plugin_command_handler_can_receive_event_and_source(monkeypatch):
+    runner, _adapter = make_restart_runner()
+    runner.hooks.emit_collect = AsyncMock(return_value=[])
+    seen = {}
+
+    def handler(user_args, *, event=None, source=None):
+        seen["args"] = user_args
+        seen["event"] = event
+        seen["source"] = source
+        return "plugin-ok"
+
+    monkeypatch.setattr(
+        "hermes_cli.plugins.get_plugin_command_handler",
+        lambda name: handler if name == "sample-cmd" else None,
+    )
+    event = MessageEvent(
+        text="/sample_cmd alpha beta",
+        message_type=MessageType.TEXT,
+        source=make_restart_source(),
+        message_id="m4",
+    )
+
+    result = await runner._handle_message(event)
+
+    assert result == "plugin-ok"
+    assert seen == {
+        "args": "alpha beta",
+        "event": event,
+        "source": event.source,
+    }
+
+
 def test_load_busy_text_mode_follows_input_mode_and_honors_legacy(tmp_path, monkeypatch):
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
     monkeypatch.delenv("HERMES_GATEWAY_BUSY_TEXT_MODE", raising=False)
