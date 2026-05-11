@@ -306,6 +306,25 @@ def _as_user(fn, skill: str) -> int:
     return 0 if ok else 1
 
 
+
+def _cmd_repair_usage(args) -> int:
+    """Synchronize curator-managed usage records with active/archive dirs."""
+    from tools import skill_usage
+
+    summary = skill_usage.repair_orphan_usage_records()
+    changed = sum(len(v) for v in summary.values())
+    if changed == 0:
+        print("curator: usage records already match filesystem")
+        return 0
+
+    print("curator: repaired usage records")
+    for key in ("marked_active", "marked_archived", "removed"):
+        names = summary.get(key) or []
+        if names:
+            print(f"  {key}: {', '.join(names)}")
+    return 0
+
+
 def _cmd_restore(args) -> int:
     from tools import skill_usage
     return _as_user(skill_usage.restore_skill, args.skill)
@@ -640,6 +659,7 @@ _SUBCOMMANDS = (
              help="List what would be adopted without writing anything"),
         _arg("--yes", **_STORE_TRUE, help="Skip the confirmation prompt for --all-unmanaged")),
     ("restore", "Restore an archived skill", _cmd_restore, _SKILL),
+    ("repair-usage", "Reconcile curator-managed usage records with disk state", _cmd_repair_usage),
     ("list-archived", "List archived skills", _cmd_list_archived),
     ("archive", "Manually archive a skill (move to .archive/, excluded from prompt)", _cmd_archive,
      _SKILL),

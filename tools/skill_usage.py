@@ -608,6 +608,39 @@ def archive_skill(skill_name: str) -> Tuple[bool, str]:
     return _relocate(skill_dir, dest, skill_name, "archive", complete_package=True, skill=skill_name)
 
 
+
+def _find_archived_skill_candidates(skill_name: str) -> List[Path]:
+    """Return archive directories that ``restore_skill`` can restore by name.
+
+    Archive entries are either an exact directory-name match or the
+    ``<skill>-YYYYMMDDHHMMSS`` collision form written by ``archive_skill``.
+    Frontmatter names are deliberately not used: repair and restore must agree
+    about whether a record is recoverable.
+    """
+    archive_root = _archive_dir()
+    if not archive_root.exists():
+        return []
+
+    exact = sorted(
+        p for p in archive_root.rglob("*")
+        if p.is_dir() and p.name == skill_name
+    )
+    if exact:
+        return exact
+
+    prefix = f"{skill_name}-"
+    return sorted(
+        (
+            p for p in archive_root.rglob("*")
+            if p.is_dir()
+            and p.name.startswith(prefix)
+            and len(p.name) - len(prefix) == 14
+            and p.name[len(prefix):].isdigit()
+        ),
+        reverse=True,
+    )
+
+
 def restore_skill(skill_name: str) -> Tuple[bool, str]:
     """Move an archived skill back to the flat layout (nesting NOT reconstructed). Refuses a name now colliding with
     a hub skill, or a bundled built-in unless ``curator.prune_builtins`` is on (restoring lifts a prune)."""
@@ -740,3 +773,63 @@ def remove_suppressed_name(skill_name: str) -> None:
         names.discard(skill_name)
         _write_suppressed_names(names)
 # ---- END PLUGIN-COMPAT ----
+
+
+
+def repair_orphan_usage_records() -> Dict[str, List[str]]:
+    """Repair curator-managed usage records that do not match disk state.
+
+    Reconciles only records explicitly opted into curator management and still
+    eligible for local curation. Bundled, hub-installed, and unmanaged records
+    are left untouched. An archive counts only when ``restore_skill()`` can
+    resolve it by the same exact-directory or timestamped-collision rules.
+
+    Returns a summary with three sorted lists:
+    - ``marked_active``: archived records whose skill dir is active again
+    - ``marked_archived``: active/stale records whose skill dir is restorable
+    - ``removed``: managed records with no active or restorable archived skill
+    """
+    removed: List[str] = []
+    marked_archived: List[str] = []
+    marked_active: List[str] = []
+
+    with _usage_file_lock():
+        data = load_usage()
+        for name, rec in list(data.items()):
+            if not _is_curator_managed_record(rec) or not is_agent_created(name):
+                continue
+
+            active_dir = _find_skill_dir(name)
+            archived_candidates = _find_archived_skill_candidates(name)
+            state = rec.get("state", STATE_ACTIVE)
+
+            if active_dir is not None:
+                if state == STATE_ARCHIVED:
+                    rec["state"] = STATE_ACTIVE
+                    rec["archived_at"] = None
+                    marked_active.append(name)
+                continue
+
+            if archived_candidates:
+                if state != STATE_ARCHIVED:
+                    rec["state"] = STATE_ARCHIVED
+                    rec["archived_at"] = rec.get("archived_at") or _now_iso()
+                    marked_archived.append(name)
+                continue
+
+            removed.append(name)
+            data.pop(name, None)
+
+        if removed or marked_archived or marked_active:
+            save_usage(data)
+
+    return {
+        "marked_active": sorted(marked_active),
+        "marked_archived": sorted(marked_archived),
+        "removed": sorted(removed),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Reporting — for the curator CLI / slash command
+# ---------------------------------------------------------------------------

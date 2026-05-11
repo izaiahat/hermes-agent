@@ -120,7 +120,14 @@ hermes curator ledger           # list the per-mutation audit ledger (all actors
 hermes curator ledger --skill <name> --limit 50  # filter/paginate ledger entries
 hermes curator rollback <entry-id>  # undo a single mutation from the ledger
 hermes curator purge [--days N] [--dry-run]  # delete archived skills older than the TTL (explicit only)
+hermes curator repair-usage     # reconcile curator-managed usage records with restorable skills
 ```
+
+`repair-usage` is a recovery command for stale `.usage.json` records left by
+interrupted or manual filesystem changes. It changes usage metadata only; it
+does not move skill directories. Archived records are retained only when
+`hermes curator restore <name>` can resolve the same exact archive-directory or
+timestamped-collision name. Curator-ineligible records are left untouched.
 
 ## Backups and rollback
 
