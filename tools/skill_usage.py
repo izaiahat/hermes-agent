@@ -754,6 +754,38 @@ def archive_skill(skill_name: str) -> Tuple[bool, str]:
     return True, f"archived to {dest}"
 
 
+def _find_archived_skill_candidates(skill_name: str) -> List[Path]:
+    """Return archive directories that ``restore_skill`` can restore by name.
+
+    Archive entries are either an exact directory-name match or the
+    ``<skill>-YYYYMMDDHHMMSS`` collision form written by ``archive_skill``.
+    Frontmatter names are deliberately not used: repair and restore must agree
+    about whether a record is recoverable.
+    """
+    archive_root = _archive_dir()
+    if not archive_root.exists():
+        return []
+
+    exact = sorted(
+        p for p in archive_root.rglob("*")
+        if p.is_dir() and p.name == skill_name
+    )
+    if exact:
+        return exact
+
+    prefix = f"{skill_name}-"
+    return sorted(
+        (
+            p for p in archive_root.rglob("*")
+            if p.is_dir()
+            and p.name.startswith(prefix)
+            and len(p.name) - len(prefix) == 14
+            and p.name[len(prefix):].isdigit()
+        ),
+        reverse=True,
+    )
+
+
 def restore_skill(skill_name: str) -> Tuple[bool, str]:
     """Move an archived skill back to ~/.hermes/skills/. Restores to the flat
     top-level layout; original category nesting is NOT reconstructed.
@@ -782,29 +814,7 @@ def restore_skill(skill_name: str) -> Tuple[bool, str]:
     if not archive_root.exists():
         return False, "no archive directory"
 
-    # Try exact name match first, then the timestamped-duplicate fallback.
-    # Recursive walk handles nested archive layouts (e.g. .archive/<category>/<skill>/)
-    # left behind by older archive paths or external imports.
-    candidates = [p for p in archive_root.rglob("*") if p.is_dir() and p.name == skill_name]
-    if not candidates:
-        # A name collision makes archive_skill() disambiguate by appending its
-        # UTC timestamp ("<skill>-YYYYMMDDHHMMSS", a 14-digit suffix), so only
-        # that exact shape is another copy of THIS skill. A bare
-        # startswith(f"{skill_name}-") also swallows unrelated sibling skills —
-        # restoring "git" would otherwise pull an archived "git-helpers" out of
-        # the archive and rename it to "git", destroying the sibling's only
-        # copy. Require the suffix to be the timestamp archive_skill writes.
-        prefix = f"{skill_name}-"
-        candidates = sorted(
-            [
-                p for p in archive_root.rglob("*")
-                if p.is_dir()
-                and p.name.startswith(prefix)
-                and len(p.name) - len(prefix) == 14
-                and p.name[len(prefix):].isdigit()
-            ],
-            reverse=True,
-        )
+    candidates = _find_archived_skill_candidates(skill_name)
     if not candidates:
         return False, f"skill '{skill_name}' not found in archive"
 
@@ -861,6 +871,60 @@ def _find_external_skill_dir(skill_name: str) -> Optional[Path]:
             if _read_skill_name(skill_md, fallback=skill_md.parent.name) == skill_name:
                 return skill_md.parent
     return None
+
+
+def repair_orphan_usage_records() -> Dict[str, List[str]]:
+    """Repair curator-managed usage records that do not match disk state.
+
+    Reconciles only records explicitly opted into curator management and still
+    eligible for local curation. Bundled, hub-installed, and unmanaged records
+    are left untouched. An archive counts only when ``restore_skill()`` can
+    resolve it by the same exact-directory or timestamped-collision rules.
+
+    Returns a summary with three sorted lists:
+    - ``marked_active``: archived records whose skill dir is active again
+    - ``marked_archived``: active/stale records whose skill dir is restorable
+    - ``removed``: managed records with no active or restorable archived skill
+    """
+    removed: List[str] = []
+    marked_archived: List[str] = []
+    marked_active: List[str] = []
+
+    with _usage_file_lock():
+        data = load_usage()
+        for name, rec in list(data.items()):
+            if not _is_curator_managed_record(rec) or not is_agent_created(name):
+                continue
+
+            active_dir = _find_skill_dir(name)
+            archived_candidates = _find_archived_skill_candidates(name)
+            state = rec.get("state", STATE_ACTIVE)
+
+            if active_dir is not None:
+                if state == STATE_ARCHIVED:
+                    rec["state"] = STATE_ACTIVE
+                    rec["archived_at"] = None
+                    marked_active.append(name)
+                continue
+
+            if archived_candidates:
+                if state != STATE_ARCHIVED:
+                    rec["state"] = STATE_ARCHIVED
+                    rec["archived_at"] = rec.get("archived_at") or _now_iso()
+                    marked_archived.append(name)
+                continue
+
+            removed.append(name)
+            data.pop(name, None)
+
+        if removed or marked_archived or marked_active:
+            save_usage(data)
+
+    return {
+        "marked_active": sorted(marked_active),
+        "marked_archived": sorted(marked_archived),
+        "removed": sorted(removed),
+    }
 
 
 # ---------------------------------------------------------------------------
