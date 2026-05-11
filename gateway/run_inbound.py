@@ -995,7 +995,25 @@ class GatewayInboundMixin:
                 from hermes_cli.plugins import get_plugin_command_handler
                 plugin_handler = get_plugin_command_handler(command.replace("_", "-"))
                 if plugin_handler:
-                    result = plugin_handler(event.get_command_args().strip())
+                    # A plugin command that wants the triggering event/source gets
+                    # them; a legacy one-arg handler keeps its contract. Some
+                    # callables expose no inspectable signature at all.
+                    _user_args = event.get_command_args().strip()
+                    try:
+                        import inspect as _inspect_plugin_cmd
+                        _sig = _inspect_plugin_cmd.signature(plugin_handler)
+                    except (TypeError, ValueError):
+                        result = plugin_handler(_user_args)
+                    else:
+                        _accepts_kwargs = any(
+                            param.kind == param.VAR_KEYWORD for param in _sig.parameters.values()
+                        )
+                        if _accepts_kwargs or "event" in _sig.parameters:
+                            result = plugin_handler(_user_args, event=event, source=source)
+                        elif len(_sig.parameters) >= 2:
+                            result = plugin_handler(_user_args, event)
+                        else:
+                            result = plugin_handler(_user_args)
                     if asyncio.iscoroutine(result):
                         result = await result
                     return True, str(result) if result else None, command
