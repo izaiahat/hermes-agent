@@ -563,6 +563,88 @@ def test_restore_prefers_timestamped_dupe_over_unrelated_sibling(skills_home):
     assert sibling.exists()        # the unrelated sibling stayed put
 
 
+def test_repair_orphan_usage_records_reconciles_managed_records(skills_home):
+    import tools.skill_usage as skill_usage
+
+    skills_dir = skills_home / "skills"
+
+    _write_skill(skills_dir, "back-active")
+    skill_usage.mark_agent_created("back-active")
+    skill_usage.set_state("back-active", skill_usage.STATE_ARCHIVED)
+
+    archived = skills_dir / ".archive" / "imports" / "archived-only"
+    archived.mkdir(parents=True)
+    (archived / "SKILL.md").write_text(
+        "---\nname: archived-only\ndescription: archived\n---\n",
+        encoding="utf-8",
+    )
+    skill_usage.mark_agent_created("archived-only")
+
+    skill_usage.mark_agent_created("missing-skill")
+    data = skill_usage.load_usage()
+    data["manual-record"] = {"created_by": None, "state": skill_usage.STATE_ACTIVE}
+    data["bundled-record"] = {"created_by": "agent", "state": skill_usage.STATE_ACTIVE}
+    skill_usage.save_usage(data)
+    (skills_dir / ".bundled_manifest").write_text("bundled-record:abc\n", encoding="utf-8")
+
+    summary = skill_usage.repair_orphan_usage_records()
+
+    assert summary == {
+        "marked_active": ["back-active"],
+        "marked_archived": ["archived-only"],
+        "removed": ["missing-skill"],
+    }
+    repaired = skill_usage.load_usage()
+    assert repaired["back-active"]["state"] == skill_usage.STATE_ACTIVE
+    assert repaired["back-active"]["archived_at"] is None
+    assert repaired["archived-only"]["state"] == skill_usage.STATE_ARCHIVED
+    assert repaired["archived-only"]["archived_at"] is not None
+    assert "missing-skill" not in repaired
+    assert repaired["manual-record"]["state"] == skill_usage.STATE_ACTIVE
+    assert repaired["bundled-record"]["state"] == skill_usage.STATE_ACTIVE
+
+
+def test_repair_orphan_usage_records_noops_when_already_consistent(skills_home):
+    import tools.skill_usage as skill_usage
+
+    skills_dir = skills_home / "skills"
+    _write_skill(skills_dir, "steady")
+    skill_usage.mark_agent_created("steady")
+
+    assert skill_usage.repair_orphan_usage_records() == {
+        "marked_active": [],
+        "marked_archived": [],
+        "removed": [],
+    }
+
+
+def test_repair_does_not_accept_frontmatter_only_archive_match(skills_home):
+    """Repair must not claim an archive is recoverable when restore cannot
+    resolve its directory name, even if SKILL.md frontmatter matches."""
+    import tools.skill_usage as skill_usage
+
+    skills_dir = skills_home / "skills"
+    renamed = skills_dir / ".archive" / "imports" / "renamed-directory"
+    renamed.mkdir(parents=True)
+    (renamed / "SKILL.md").write_text(
+        "---\nname: orphan-record\ndescription: archived\n---\n",
+        encoding="utf-8",
+    )
+    skill_usage.mark_agent_created("orphan-record")
+
+    ok, msg = skill_usage.restore_skill("orphan-record")
+    assert not ok
+    assert "not found" in msg.lower()
+
+    assert skill_usage.repair_orphan_usage_records() == {
+        "marked_active": [],
+        "marked_archived": [],
+        "removed": ["orphan-record"],
+    }
+    assert "orphan-record" not in skill_usage.load_usage()
+    assert renamed.exists()
+
+
 # ---------------------------------------------------------------------------
 # Reporting
 # ---------------------------------------------------------------------------
