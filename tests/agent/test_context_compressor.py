@@ -472,7 +472,7 @@ class TestSummaryFallbackToMainModel:
 
         assert mock_call.call_count == 2
         assert mock_call.call_args_list[0].kwargs.get("model") == "aux-via-broken-proxy"
-        assert "model" not in mock_call.call_args_list[1].kwargs
+        assert mock_call.call_args_list[1].kwargs.get("model") == "main-model"
         assert result is not None
         assert "summary via main model" in result
         # Aux-model failure recorded so /usage / gateway warnings can surface it
@@ -584,7 +584,7 @@ class TestStreamingClosedFallback:
 
         assert mock_call.call_count == 2
         assert mock_call.call_args_list[0].kwargs.get("model") == "aux-stream-model"
-        assert "model" not in mock_call.call_args_list[1].kwargs
+        assert mock_call.call_args_list[1].kwargs.get("model") == "main-model"
         assert result is not None
         assert "summary via main model" in result
 
