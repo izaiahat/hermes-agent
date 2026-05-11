@@ -89,6 +89,39 @@ async def test_draining_rejects_new_session_messages():
     assert result == "⏳ Gateway is restarting and is not accepting new work right now."
 
 
+@pytest.mark.asyncio
+async def test_plugin_command_handler_can_receive_event_and_source(monkeypatch):
+    runner, _adapter = make_restart_runner()
+    runner.hooks.emit_collect = AsyncMock(return_value=[])
+    seen = {}
+
+    def handler(user_args, *, event=None, source=None):
+        seen["args"] = user_args
+        seen["event"] = event
+        seen["source"] = source
+        return "plugin-ok"
+
+    monkeypatch.setattr(
+        "hermes_cli.plugins.get_plugin_command_handler",
+        lambda name: handler if name == "sample-cmd" else None,
+    )
+    event = MessageEvent(
+        text="/sample_cmd alpha beta",
+        message_type=MessageType.TEXT,
+        source=make_restart_source(),
+        message_id="m4",
+    )
+
+    result = await runner._handle_message(event)
+
+    assert result == "plugin-ok"
+    assert seen == {
+        "args": "alpha beta",
+        "event": event,
+        "source": event.source,
+    }
+
+
 def test_load_busy_input_mode_prefers_env_then_config_then_default(tmp_path, monkeypatch):
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
     monkeypatch.delenv("HERMES_GATEWAY_BUSY_INPUT_MODE", raising=False)
