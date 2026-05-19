@@ -15,8 +15,10 @@ module:
      OpenClaw calls "migrate native codex plugins" — the YouTube-video-
      worthy bit Pash highlighted: Canva, GitHub, Calendar, Gmail
      pre-configured.)
-  3. Writes a [permissions] default profile so users on this runtime
-     don't get an approval prompt on every write attempt.
+  3. Writes a default permission profile so the app-server runtime starts
+     in a write-capable profile instead of Codex's compiled-in read-only
+     default. Unattended worker no-approval behavior is configured at the
+     worker app-server spawn site.
 
 What translates (MCP servers):
   Hermes mcp_servers.<n>.command/args/env  → codex stdio transport
@@ -270,8 +272,8 @@ def render_codex_toml_section(
     if default_permission_profile:
         # Codex's config schema: `default_permissions` is a top-level
         # string referencing a profile name. Built-in profile names start
-        # with ":" (":workspace-write", ":read-only", ":full-access"). The
-        # [permissions] table is for *user-defined* named profiles with
+        # with ":" (for example ":workspace").
+        # The [permissions] table is for *user-defined* named profiles with
         # structured fields — not what we want.
         normalized = (
             default_permission_profile
@@ -627,14 +629,15 @@ def migrate(
             into [plugins."<name>@<marketplace>"] entries. Set False to
             skip the subprocess spawn (for tests or restricted environments).
         default_permission_profile: when set (default ":workspace"), write
-            top-level `default_permissions = "<name>"` so users on this
-            runtime don't get an approval prompt on every write attempt.
-            Built-in codex profile names are ":workspace", ":read-only",
-            ":danger-no-sandbox" (note the leading ":"). Also accepts a
-            user-defined profile name (no leading ":") that the user has
-            configured in their own [permissions.<name>] table. Set None
-            to leave permissions unset and let codex use its compiled-in
-            default (which is read-only).
+            top-level `default_permissions = "<name>"` so the app-server
+            runtime starts in Codex's write-capable workspace profile
+            instead of its compiled-in read-only default. Unattended worker
+            no-approval behavior is configured at the worker app-server spawn
+            site with `sandbox_mode="danger-full-access"` and
+            `approval_policy="never"`. Built-in codex profile names use a
+            leading ":". Also accepts a user-defined profile name (no leading
+            ":") that the user has configured in their own
+            [permissions.<name>] table. Set None to leave permissions unset.
         expose_hermes_tools: when True (default), register Hermes' own
             tool surface (web_search, browser_*, delegate_task, vision,
             memory, skills, etc.) as an MCP server in ~/.codex/config.toml
