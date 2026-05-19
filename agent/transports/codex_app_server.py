@@ -81,32 +81,23 @@ class CodexAppServerClient:
             spawn_env["CODEX_HOME"] = codex_home
 
         app_server_args = list(extra_args or [])
-        # Kanban workers must be able to write their handoff/status back to
-        # the board DB, which lives outside the per-task workspace. Keep the
-        # Codex sandbox on, but add the Kanban root as the only extra writable
-        # root. Without this, codex-runtime workers finish their actual work
-        # but crash/block when kanban_complete/kanban_block writes SQLite.
+        # Kanban workers are Hermes-managed child agents, not interactive
+        # human approval sessions. They must be able to read their task,
+        # inspect the checkout, run commands, patch files, and call
+        # kanban_complete/kanban_block without waiting on an approval prompt
+        # no human will answer. A narrower workspace-write sandbox plus a
+        # Kanban writable root still deadlocks in practice because Codex asks
+        # for approvals on basic inspection before the worker can even load
+        # task context. Use Codex's explicit CLI config surface for worker
+        # sessions only; the dispatcher has already selected the task,
+        # workspace, profile, and lifecycle envelope.
         if spawn_env.get("HERMES_KANBAN_TASK"):
-            kanban_db = spawn_env.get("HERMES_KANBAN_DB")
-            kanban_root = (
-                os.path.dirname(kanban_db)
-                if kanban_db
-                else spawn_env.get(
-                    "HERMES_KANBAN_ROOT",
-                    os.path.join(
-                        spawn_env.get("HERMES_HOME", os.path.expanduser("~/.hermes")),
-                        "kanban",
-                    ),
-                )
-            )
             app_server_args.extend(
                 [
                     "-c",
-                    'sandbox_mode="workspace-write"',
+                    'sandbox_mode="danger-full-access"',
                     "-c",
-                    f'sandbox_workspace_write.writable_roots=["{kanban_root}"]',
-                    "-c",
-                    "sandbox_workspace_write.network_access=false",
+                    'approval_policy="never"',
                 ]
             )
 

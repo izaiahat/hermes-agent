@@ -242,11 +242,14 @@ class TestSpawnEnvIsolation:
         # And HOME still passes through unchanged
         assert captured["env"].get("HOME") == "/users/alice"
 
-    def test_kanban_worker_adds_only_kanban_writable_root(self, monkeypatch):
-        """Codex-runtime Kanban workers need to write board state outside
-        their scratch/worktree workspace, but should not fall back to
-        danger-full-access. Hermes passes a narrow app-server config override
-        for the Kanban root only.
+    def test_kanban_worker_uses_unattended_no_sandbox_config(self, monkeypatch):
+        """Codex-runtime Kanban workers are unattended child agents.
+
+        They must not wait on human approval prompts for basic repo/task
+        inspection or kanban_complete writes; the dispatcher already scoped
+        the worker to a task/workspace/profile. Use Codex's built-in no-sandbox
+        config for these worker sessions instead of a workspace sandbox that
+        deadlocks on approvals.
         """
         import subprocess
         from agent.transports import codex_app_server as cas
@@ -289,10 +292,6 @@ class TestSpawnEnvIsolation:
 
         cmd = captured["cmd"]
         assert cmd[:2] == ["codex", "app-server"]
-        assert 'sandbox_mode="workspace-write"' in cmd
-        assert (
-            'sandbox_workspace_write.writable_roots=["/users/alice/.hermes/kanban/boards/smoke"]'
-            in cmd
-        )
-        assert "sandbox_workspace_write.network_access=false" in cmd
-        assert all("danger" not in part for part in cmd)
+        assert 'sandbox_mode="danger-full-access"' in cmd
+        assert 'approval_policy="never"' in cmd
+        assert all("sandbox_workspace_write" not in part for part in cmd)
