@@ -3093,7 +3093,18 @@ class AIAgent:
         except Exception:
             pass
 
-        # 5. Close the OpenAI/httpx client
+        # 5. Close the Codex app-server subprocess/session if one was opened.
+        try:
+            codex_session = getattr(self, "_codex_session", None)
+            if codex_session is not None:
+                try:
+                    codex_session.close()
+                finally:
+                    self._codex_session = None
+        except Exception:
+            pass
+
+        # 6. Close the OpenAI/httpx client
         try:
             client = getattr(self, "client", None)
             if client is not None:

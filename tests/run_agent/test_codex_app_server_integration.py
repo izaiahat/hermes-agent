@@ -70,6 +70,34 @@ class TestApiModeAccepted:
         assert agent.api_mode == "codex_app_server"
 
 
+class TestCodexSessionCleanup:
+    def test_agent_close_closes_codex_app_server_session(self):
+        """AIAgent.close() must own the app-server subprocess lifetime.
+
+        The CLI/gateway/cron cleanup paths call close() at session boundaries;
+        leaving _codex_session attached lets the Codex subprocess and native
+        reader threads survive into interpreter shutdown, which can abort the
+        process after an otherwise successful one-shot turn.
+        """
+
+        agent = _make_codex_agent()
+
+        class FakeCodexSession:
+            def __init__(self):
+                self.closed = 0
+
+            def close(self):
+                self.closed += 1
+
+        fake = FakeCodexSession()
+        agent._codex_session = fake
+
+        agent.close()
+
+        assert fake.closed == 1
+        assert agent._codex_session is None
+
+
 class TestRunConversationCodexPath:
     def test_run_conversation_returns_codex_shape(self, fake_session):
         agent = _make_codex_agent()
