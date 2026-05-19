@@ -87,6 +87,12 @@ class CodexAppServerClient:
                 "-c", 'sandbox_mode="workspace-write"',
                 "-c", f'sandbox_workspace_write.writable_roots=["{kanban_root}"]',
                 "-c", "sandbox_workspace_write.network_access=false",
+                # A Kanban worker is a Hermes-managed child agent, not an
+                # interactive session: there is no human to answer an approval
+                # prompt, and Codex asks for one on basic inspection before the
+                # worker can even load its task context, so the worker hangs.
+                # Never ask — the sandbox above, not a prompt, is the bound.
+                "-c", 'approval_policy="never"',
             ]
         # Codex emits tracing to stderr; default WARN keeps it quiet for users.
         spawn_env.setdefault("RUST_LOG", "warn")
