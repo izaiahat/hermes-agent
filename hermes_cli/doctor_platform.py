@@ -428,6 +428,52 @@ def _check_required_packages(should_fix: bool, f: Finding) -> None:
 
 
 @doctor_check()
+def _check_venv_pin_drift(should_fix: bool, f: Finding) -> None:
+    """WARN when an installed version differs from a ``==`` pin in pyproject.toml.
+
+    Added after the 2026-05-26 incident where the venv carried openai 2.30.0
+    while pyproject.toml pinned 2.24.0. Drift wasn't causal there, but it is a
+    real class of supply-chain / behaviour-divergence fault. Non-blocking: some
+    pins are deliberately tighter than what is installed (a hotfix branch), so
+    this only warns and never fails the doctor run.
+    """
+    import re
+    from importlib import metadata
+
+    from hermes_cli.doctor import PROJECT_ROOT
+
+    pyproject = PROJECT_ROOT / "pyproject.toml"
+    if not pyproject.exists():
+        return
+    pin_re = re.compile(r'"\s*([A-Za-z0-9][A-Za-z0-9._-]*)\s*==\s*([^"\s]+?)\s*"')
+    seen: set[str] = set()
+    pins: list[tuple[str, str]] = []
+    try:
+        lines = pyproject.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return
+    for line in lines:
+        if line.strip().startswith("#"):  # a commented-out pin is not a pin
+            continue
+        for match in pin_re.finditer(line):
+            name = match.group(1)
+            if name.lower() not in seen:  # a package may appear in several extras
+                seen.add(name.lower())
+                pins.append((name, match.group(2)))
+    drifted = 0
+    for name, pinned in pins:
+        try:
+            installed = metadata.version(name)
+        except Exception:
+            continue
+        if installed != pinned:
+            drifted += 1
+            check_warn(f"{name} pin drift", f"(pyproject pins {pinned}, installed {installed})")
+    if pins and not drifted:
+        check_ok("Venv pins match pyproject.toml", f"({len(pins)} pinned)")
+
+
+@doctor_check()
 def _check_gateway_supervision(should_fix: bool, f: Finding) -> None:
     _check_gateway_service_linger(f.issues)
     _check_s6_supervision(f.issues)
