@@ -596,7 +596,76 @@ def run_doctor(args):
             check_ok(name, "(optional)")
         except ImportError:
             check_warn(name, "(optional, not installed)")
-    
+
+    # Venv pin drift: any `==`-pinned dependency in pyproject.toml whose
+    # installed version differs from the pin. Added 2026-05-27 after the
+    # 2026-05-26 incident where the venv had openai 2.30.0 while
+    # pyproject.toml pinned 2.24.0 — drift wasn't causal but is a real
+    # class of vulnerability (supply-chain, behavior divergence).
+    # Non-blocking: emits WARNINGs only — some pins are intentionally
+    # tighter than installed (e.g. someone running a hotfix branch).
+    try:
+        import re as _re_pin
+        _pyproject_path = PROJECT_ROOT / "pyproject.toml"
+        if _pyproject_path.exists():
+            _pin_re = _re_pin.compile(r'"\s*([A-Za-z0-9][A-Za-z0-9._-]*)\s*==\s*([^"\s]+?)\s*"')
+            _pins: list[tuple[str, str]] = []
+            for _line in _pyproject_path.read_text(encoding="utf-8").splitlines():
+                _stripped = _line.strip()
+                # Skip commented lines so disabled pins are not checked.
+                if _stripped.startswith("#"):
+                    continue
+                for _m in _pin_re.finditer(_line):
+                    _pins.append((_m.group(1), _m.group(2)))
+            # Deduplicate (a package may appear in multiple optional groups).
+            _seen: set[str] = set()
+            _unique_pins: list[tuple[str, str]] = []
+            for _pkg, _ver in _pins:
+                _key = _pkg.lower()
+                if _key in _seen:
+                    continue
+                _seen.add(_key)
+                _unique_pins.append((_pkg, _ver))
+            if _unique_pins:
+                try:
+                    from importlib.metadata import (
+                        version as _pkg_version,
+                        PackageNotFoundError as _PkgNotFound,
+                    )
+                except Exception:
+                    _pkg_version = None
+                    _PkgNotFound = Exception
+                if _pkg_version is not None:
+                    _drifts: list[str] = []
+                    for _pkg, _pinned in _unique_pins:
+                        try:
+                            _installed = _pkg_version(_pkg)
+                        except _PkgNotFound:
+                            continue
+                        except Exception:
+                            continue
+                        if _installed != _pinned:
+                            _drifts.append(
+                                f"{_pkg}: pinned {_pinned}, installed {_installed}"
+                            )
+                    if _drifts:
+                        check_warn(
+                            f"venv pin drift ({len(_drifts)} package(s))",
+                            "(pyproject.toml pin != installed)",
+                        )
+                        for _d in _drifts:
+                            check_info(_d)
+                        check_info(
+                            "Fix: cd "
+                            + str(PROJECT_ROOT)
+                            + " && venv/bin/python -m pip install -e ."
+                        )
+                    else:
+                        check_ok(f"venv pins ({len(_unique_pins)}) match pyproject.toml")
+    except Exception as _pin_err:
+        # Never let the pin check block the rest of doctor.
+        check_warn(f"venv pin check failed: {_pin_err}")
+
     _section("Configuration Files")
     # Check ~/.hermes/.env (primary location for user config)
     env_path = HERMES_HOME / '.env'
