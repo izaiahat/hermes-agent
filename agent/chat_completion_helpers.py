@@ -27,6 +27,7 @@ from typing import Any, Dict, Optional
 
 from hermes_cli.timeouts import get_provider_request_timeout, get_provider_stale_timeout
 from hermes_constants import PARTIAL_STREAM_STUB_ID, FINISH_REASON_LENGTH
+from agent import codex_throttle
 from agent.error_classifier import FailoverReason
 from agent.model_metadata import is_local_endpoint
 from agent.message_sanitization import (
@@ -191,7 +192,18 @@ def interruptible_api_call(agent, api_kwargs: dict):
             agent._close_request_openai_client(request_client, reason=reason)
 
     def _call():
+        _gate = None
         try:
+            if _is_openai_codex_backend(agent):
+                # Box-wide gate: bound concurrent Codex requests across every Hermes
+                # process (gateway, dashboards, slash_workers) and sub-agent thread so
+                # we never burst past the ChatGPT/Codex *per-account* concurrency
+                # limit (which returns 429 {"detail": "Rate limit exceeded"}).
+                _gate = codex_throttle.codex_request_gate(
+                    interrupt_check=lambda: bool(getattr(agent, "_interrupt_requested", False)),
+                    touch=getattr(agent, "_touch_activity", None),
+                )
+                _gate.__enter__()
             if agent.api_mode == "codex_responses":
                 request_client = _set_request_client(
                     agent._create_request_openai_client(
@@ -251,6 +263,11 @@ def interruptible_api_call(agent, api_kwargs: dict):
                 return
             result["error"] = e
         finally:
+            if _gate is not None:
+                try:
+                    _gate.__exit__(None, None, None)
+                except Exception:
+                    pass
             _close_request_client_once("request_complete")
 
     # ── Stale-call timeout (mirrors streaming stale detector) ────────
@@ -547,7 +564,20 @@ def interruptible_api_call(agent, api_kwargs: dict):
                 pass
             raise InterruptedError("Agent interrupted during API call")
     if result["error"] is not None:
+        # On a Codex 429, set a box-wide cooldown so every other local Codex
+        # caller (other processes, sub-agent threads) pauses too, instead of each
+        # independently hammering the backend with its own 1s retry storm.
+        if _is_openai_codex_backend(agent):
+            try:
+                codex_throttle.note_rate_limited_from_error(result["error"])
+            except Exception:
+                pass
         raise result["error"]
+    if _is_openai_codex_backend(agent):
+        try:
+            codex_throttle.note_success()
+        except Exception:
+            pass
     return result["response"]
 
 
