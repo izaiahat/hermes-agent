@@ -1827,7 +1827,11 @@ class SessionDB:
                     "      SELECT ended_at FROM sessions "
                     "      WHERE id = ? AND end_reason = 'compression'"
                     "  ) "
-                    "ORDER BY started_at DESC LIMIT 1",
+                    # The real compression continuation is created immediately
+                    # after the parent is ended. Later child sessions can exist
+                    # under the same parent (for example a resumed/branched UI
+                    # view) and must not steal the lineage tip.
+                    "ORDER BY started_at ASC LIMIT 1",
                     (current, current),
                 )
                 row = cursor.fetchone()
@@ -1971,9 +1975,16 @@ class SessionDB:
                     SELECT c.root_id, child.id
                     FROM chain c
                     JOIN sessions parent ON parent.id = c.cur_id
-                    JOIN sessions child ON child.parent_session_id = c.cur_id
+                    JOIN sessions child ON child.id = (
+                        SELECT child2.id
+                        FROM sessions child2
+                        WHERE child2.parent_session_id = c.cur_id
+                          AND child2.started_at >= parent.ended_at
+                        ORDER BY child2.started_at ASC
+                        LIMIT 1
+                    )
                     WHERE parent.end_reason = 'compression'
-                      AND child.started_at >= parent.ended_at
+                      AND parent.ended_at IS NOT NULL
                 ),
                 chain_max AS (
                     SELECT

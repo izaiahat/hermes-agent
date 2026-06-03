@@ -2889,6 +2889,47 @@ class TestCompressionChainProjection:
         # root1's tip must be tip1 (via mid1), not delegate1.
         assert db.get_compression_tip("root1") == "tip1"
 
+    def test_get_compression_tip_uses_immediate_child_when_later_child_exists(self, db):
+        """A later child under a compressed parent can be a UI branch/resume,
+        not the compression continuation. The continuation is the immediate
+        child created right after parent.end_session(compression).
+        """
+        import time as _time
+        t0 = _time.time() - 3600
+        self._build_compression_chain(db, t0)
+
+        db.create_session("late_branch", "cli", parent_session_id="root1")
+        db._conn.execute(
+            "UPDATE sessions SET started_at=? WHERE id=?",
+            (t0 + 1900, "late_branch"),
+        )
+        db.append_message("late_branch", "user", "later branch should not steal tip")
+        db._conn.commit()
+
+        assert db.get_compression_tip("root1") == "tip1"
+
+    def test_order_by_last_active_follows_immediate_compression_child(self, db):
+        """The SQL ordering CTE must use the same continuation rule as
+        get_compression_tip; otherwise a later branch child can hide the live
+        compression tip from Desktop recents.
+        """
+        import time as _time
+        t0 = _time.time() - 3600
+        self._build_compression_chain(db, t0)
+
+        db.create_session("late_branch", "cli", parent_session_id="root1")
+        db._conn.execute(
+            "UPDATE sessions SET started_at=? WHERE id=?",
+            (t0 + 1900, "late_branch"),
+        )
+        db.append_message("late_branch", "user", "later branch should not steal list")
+        db._conn.commit()
+
+        sessions = db.list_sessions_rich(source="cli", limit=20, order_by_last_active=True)
+        ids = [s["id"] for s in sessions]
+        assert "tip1" in ids
+        assert "late_branch" not in ids
+
     def test_list_surfaces_tip_for_compressed_root(self, db):
         """The list must show the tip's id/message_count/preview in place of
         the root row, so users can see and resume the live conversation.
