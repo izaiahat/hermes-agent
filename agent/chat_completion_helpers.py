@@ -29,6 +29,7 @@ from typing import Any, Dict, Optional
 
 from hermes_cli.timeouts import get_provider_request_timeout, get_provider_stale_timeout
 from hermes_constants import PARTIAL_STREAM_STUB_ID, FINISH_REASON_LENGTH
+from agent import codex_throttle
 from agent.error_classifier import FailoverReason
 from agent.errors import EmptyStreamError
 from agent.turn_context import substitute_api_content
@@ -952,7 +953,19 @@ def interruptible_api_call(agent, api_kwargs: dict):
             agent._close_request_openai_client(request_client, reason=reason)
 
     def _call():
+        _gate = None
         try:
+            if _is_openai_codex_backend(agent):
+                # Bound subscription-backed Codex requests across Hermes
+                # processes and delegate threads before entering the shared
+                # upstream transport dispatcher.
+                _gate = codex_throttle.codex_request_gate(
+                    interrupt_check=lambda: bool(
+                        getattr(agent, "_interrupt_requested", False)
+                    ),
+                    touch=getattr(agent, "_touch_activity", None),
+                )
+                _gate.__enter__()
             # _set_request_client registers each per-request client with the
             # stranger-thread abort machinery above; the shared dispatch helper
             # builds it via this callback (openai- or anthropic-kind) so the
@@ -984,6 +997,11 @@ def interruptible_api_call(agent, api_kwargs: dict):
                 return
             result["error"] = e
         finally:
+            if _gate is not None:
+                try:
+                    _gate.__exit__(None, None, None)
+                except Exception:
+                    pass
             # Reuse reason only on a clean response; any other outcome —
             # error, or the cancel-swallow return above (which leaves both
             # result slots None) — really closes so the next attempt builds
@@ -1318,11 +1336,24 @@ def interruptible_api_call(agent, api_kwargs: dict):
                 pass
             raise InterruptedError("Agent interrupted during API call")
     if result["error"] is not None:
+        # On a Codex 429, set a box-wide cooldown so every other local Codex
+        # caller (other processes, sub-agent threads) pauses too, instead of each
+        # independently hammering the backend with its own 1s retry storm.
+        if _is_openai_codex_backend(agent):
+            try:
+                codex_throttle.note_rate_limited_from_error(result["error"])
+            except Exception:
+                pass
         raise result["error"]
     # Success — clear the circuit breaker (#58962): the provider proved
     # responsive.  See the canonical comment block above ``_stale_streak()``.
     if result["response"] is not None:
         _reset_stale_streak(agent)
+    if _is_openai_codex_backend(agent):
+        try:
+            codex_throttle.note_success()
+        except Exception:
+            pass
     return result["response"]
 
 
