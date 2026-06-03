@@ -64,8 +64,18 @@ class _NonStreamRequest:
 
     def _call(self):
         watchdog_state_var = watchdog_context_token = None
+        gate = None
         try:
             self._install_codex_request_token()
+            if h._is_openai_codex_backend(self.agent):
+                # Bound subscription-backed Codex requests across Hermes
+                # processes and delegate threads before entering the shared
+                # transport dispatcher.
+                gate = h.codex_throttle.codex_request_gate(
+                    interrupt_check=lambda: bool(getattr(self.agent, "_interrupt_requested", False)),
+                    touch=getattr(self.agent, "_touch_activity", None),
+                )
+                gate.__enter__()
             if self.codex_watchdog_state is not None:
                 from agent.codex_runtime import _codex_watchdog_state_var
 
@@ -89,6 +99,11 @@ class _NonStreamRequest:
                 return
             self.result["error"] = e
         finally:
+            if gate is not None:
+                try:
+                    gate.__exit__(None, None, None)
+                except Exception:
+                    pass
             if watchdog_state_var is not None:
                 watchdog_state_var.reset(watchdog_context_token)
             # Retire first: close_once can raise, and a leaked token would let
@@ -278,8 +293,21 @@ class _NonStreamRequest:
             if agent._interrupt_requested:
                 self._interrupt(elapsed)
         if self.result["error"] is not None:
+            # On a Codex 429, set a box-wide cooldown so every other local Codex
+            # caller (other processes, sub-agent threads) pauses too, instead of
+            # each independently hammering the backend with its own 1s retry.
+            if h._is_openai_codex_backend(agent):
+                try:
+                    h.codex_throttle.note_rate_limited_from_error(self.result["error"])
+                except Exception:
+                    pass
             raise self.result["error"]
         # Success — the provider proved responsive: clear the breaker (#58962).
         if self.result["response"] is not None:
             h._reset_stale_streak(agent)
+        if h._is_openai_codex_backend(agent):
+            try:
+                h.codex_throttle.note_success()
+            except Exception:
+                pass
         return self.result["response"]

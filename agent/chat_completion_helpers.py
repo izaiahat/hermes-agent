@@ -25,6 +25,11 @@ from typing import Any, Dict, Optional
 
 from hermes_cli.timeouts import get_provider_request_timeout, get_provider_stale_timeout
 from hermes_constants import PARTIAL_STREAM_STUB_ID, FINISH_REASON_LENGTH
+# Box-wide Codex throttle: codex_request_gate bounds concurrent
+# subscription-backed requests across Hermes processes and delegate threads;
+# note_rate_limited_from_error / note_success carry a 429 cooldown and its
+# release to every other local caller. Used by agent/chat_completion_nonstream.py.
+from agent import codex_throttle
 from agent.error_classifier import (FailoverReason, PROVIDER_STREAM_NON_JSON_ERROR_CODE)
 from agent.errors import EmptyStreamError
 from agent.chat_completion_stream_monitor import StreamingWaitMonitor
