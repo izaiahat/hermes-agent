@@ -71,6 +71,29 @@ logger = logging.getLogger(__name__)
 INTERRUPT_WAITING_FOR_MODEL_PREFIX = "Operation interrupted: waiting for model response ("
 
 
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
+def _is_openai_codex_backend_agent(agent: Any) -> bool:
+    """True when this turn is using ChatGPT-account Codex, not public OpenAI API."""
+    provider = (getattr(agent, "provider", "") or "").strip().lower()
+    if provider == "openai-codex":
+        return True
+    base_lower = (getattr(agent, "base_url", "") or "").strip().lower().rstrip("/")
+    return base_url_host_matches(base_lower, "chatgpt.com") and "/backend-api/codex" in base_lower
+
+
 def _ollama_context_limit_error(agent: Any, request_tokens: int) -> Optional[str]:
     """Return a user-facing error when Ollama is loaded with too little context."""
     if not getattr(agent, "tools", None):
@@ -800,6 +823,16 @@ def run_conversation(
         retry_count = 0
         max_retries = agent._api_max_retries
         _retry = TurnRetryState()
+        if _is_openai_codex_backend_agent(agent):
+            # ChatGPT-account Codex rate limits are admission/burst limits, not
+            # necessarily quota exhaustion. Three quick retries used to fail
+            # large Desktop/gateway turns even though the account had plenty of
+            # weekly usage left. Give the shared Codex gate enough attempts to
+            # cool the account down and recover.
+            max_retries = max(
+                max_retries,
+                max(1, _env_int("HERMES_CODEX_RATE_LIMIT_MAX_RETRIES", 6)),
+            )
         max_compression_attempts = 3
 
         finish_reason = "stop"
@@ -3199,6 +3232,23 @@ def run_conversation(
                                 _retry_after = min(float(_ra_raw), 120)  # Cap at 2 minutes
                             except (TypeError, ValueError):
                                 pass
+                    if _is_openai_codex_backend_agent(agent):
+                        # The ChatGPT Codex backend frequently returns
+                        # Retry-After: 1 while continuing to reject large turns
+                        # for 30-90s. Sleep for the shared gate's recommended
+                        # cooldown here so the visible retry timer matches the
+                        # real recovery window instead of doing a hidden gate
+                        # wait on the next attempt.
+                        try:
+                            from agent import codex_throttle as _codex_throttle
+
+                            _codex_delay = _codex_throttle.recommended_retry_delay()
+                        except Exception:
+                            _codex_delay = _env_float(
+                                "HERMES_CODEX_RATE_LIMIT_COOLDOWN_SECONDS", 60.0
+                            )
+                        if _codex_delay > 0:
+                            _retry_after = max(float(_retry_after or 0.0), _codex_delay)
                 wait_time = _retry_after if _retry_after else jittered_backoff(retry_count, base_delay=2.0, max_delay=60.0)
                 if is_rate_limited:
                     agent._buffer_status(f"⏱️ Rate limited. Waiting {wait_time:.1f}s (attempt {retry_count + 1}/{max_retries})...")

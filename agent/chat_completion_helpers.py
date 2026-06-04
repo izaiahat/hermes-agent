@@ -200,6 +200,7 @@ def interruptible_api_call(agent, api_kwargs: dict):
                 # we never burst past the ChatGPT/Codex *per-account* concurrency
                 # limit (which returns 429 {"detail": "Rate limit exceeded"}).
                 _gate = codex_throttle.codex_request_gate(
+                    est_tokens=estimate_request_context_tokens(api_kwargs),
                     interrupt_check=lambda: bool(getattr(agent, "_interrupt_requested", False)),
                     touch=getattr(agent, "_touch_activity", None),
                 )
