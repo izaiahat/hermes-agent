@@ -72,6 +72,7 @@ class _NonStreamRequest:
                 # processes and delegate threads before entering the shared
                 # transport dispatcher.
                 gate = h.codex_throttle.codex_request_gate(
+                    est_tokens=h.estimate_request_context_tokens(self.api_kwargs),
                     interrupt_check=lambda: bool(getattr(self.agent, "_interrupt_requested", False)),
                     touch=getattr(self.agent, "_touch_activity", None),
                 )

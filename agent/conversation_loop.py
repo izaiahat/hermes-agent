@@ -378,6 +378,29 @@ def _pressure_with_real_floor(compressor: Any, rough_tokens: int) -> int:
     return rough_tokens
 
 
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
+def _is_openai_codex_backend_agent(agent: Any) -> bool:
+    """True when this turn is using ChatGPT-account Codex, not the public OpenAI API."""
+    provider = (getattr(agent, "provider", "") or "").strip().lower()
+    if provider == "openai-codex":
+        return True
+    base_lower = (getattr(agent, "base_url", "") or "").strip().lower().rstrip("/")
+    return base_url_host_matches(base_lower, "chatgpt.com") and "/backend-api/codex" in base_lower
+
+
 def _ollama_context_limit_error(agent: Any, request_tokens: int) -> Optional[str]:
     """Return a user-facing error when Ollama is loaded with too little context."""
     runtime_ctx = getattr(agent, "_ollama_num_ctx", None)
@@ -1526,6 +1549,13 @@ def _run_conversation_turn(
         _run_phase(announce_api_call, agent, s)
 
         s.api_start_time, s.retry_count, s.max_retries = time.time(), 0, agent._api_max_retries
+        if _is_openai_codex_backend_agent(agent):
+            # ChatGPT-account Codex rate limits are admission/burst limits, not
+            # necessarily quota exhaustion. Three quick retries used to fail large
+            # Desktop/gateway turns even though the account had plenty of weekly
+            # usage left. Give the shared Codex gate enough attempts to cool the
+            # account down and recover.
+            s.max_retries = max(s.max_retries, max(1, _env_int("HERMES_CODEX_RATE_LIMIT_MAX_RETRIES", 6)))
         s._retry, s.finish_reason, s.response, s.api_kwargs = TurnRetryState(), "stop", None, None
         s.api_request_id = agent._current_api_request_id = f"{s.turn_id}:api:{s.api_call_count}"
 

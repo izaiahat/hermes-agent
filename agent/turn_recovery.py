@@ -1054,6 +1054,21 @@ def compute_error_backoff(
             # past, which the parser clamps to 0.0) carries no usable wait —
             # treat it as absent so we never hot-loop the provider.
             _retry_after = None
+    from agent.conversation_loop import _env_float, _is_openai_codex_backend_agent
+
+    if _is_openai_codex_backend_agent(agent):
+        # The ChatGPT Codex backend frequently returns Retry-After: 1 while it
+        # keeps rejecting large turns for 30-90s. Wait for the shared gate's
+        # recommended cooldown here so the visible retry timer matches the real
+        # recovery window instead of doing a hidden gate wait on the next attempt.
+        try:
+            from agent import codex_throttle as _codex_throttle
+
+            _codex_delay = _codex_throttle.recommended_retry_delay()
+        except Exception:
+            _codex_delay = _env_float("HERMES_CODEX_RATE_LIMIT_COOLDOWN_SECONDS", 60.0)
+        if _codex_delay > 0:
+            _retry_after = max(float(_retry_after or 0.0), _codex_delay)
     wait_time = _retry_after if _retry_after is not None else jittered_backoff(retry_count, base_delay=2.0, max_delay=60.0)
     _backoff_policy = None
     _adaptive = is_rate_limited or is_zai_coding_overload
