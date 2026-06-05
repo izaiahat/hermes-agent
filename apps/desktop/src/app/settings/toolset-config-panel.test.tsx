@@ -101,8 +101,12 @@ describe('ToolsetConfigPanel', () => {
     const elevenlabs = await screen.findByRole('button', { name: /ElevenLabs/ })
     fireEvent.click(elevenlabs)
 
-    // Click "Set" to reveal the input for the unset key.
-    fireEvent.click(await screen.findByRole('button', { name: 'Set' }))
+    // Click the actions menu, then "Set", to reveal the input for the unset key.
+    fireEvent.pointerDown(await screen.findByRole('button', { name: 'Actions for ELEVENLABS_API_KEY' }), {
+      button: 0,
+      ctrlKey: false
+    })
+    fireEvent.click(await screen.findByRole('menuitem', { name: 'Set' }))
 
     const input = await screen.findByPlaceholderText('ElevenLabs API key')
     fireEvent.change(input, { target: { value: 'sk-test-123' } })

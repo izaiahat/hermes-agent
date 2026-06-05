@@ -671,7 +671,10 @@ describe('assistant-ui streaming renderer', () => {
     const { container } = render(<RunningReasoningHarness />)
     const ui = within(container)
 
-    fireEvent.click(ui.getByRole('button', { name: /thinking/i }))
+    const thinkingButton = ui.getByRole('button', { name: /thinking/i })
+    if (thinkingButton.getAttribute('aria-expanded') !== 'true') {
+      fireEvent.click(thinkingButton)
+    }
 
     await waitFor(() => {
       expect(container.querySelector('[data-slot="code-card"]')).toBeTruthy()
