@@ -423,6 +423,12 @@ export function useGatewayBoot({
           reconcileBusyStatesOnReconnect()
           await callbacksRef.current.refreshHermesConfig().catch(() => undefined)
           await callbacksRef.current.refreshSessions().catch(() => undefined)
+          // A prolonged reconnect failure leaves the boot overlay showing an
+          // error the user can no longer act on; clear it once we are actually
+          // back so recovery is visible instead of a stuck error screen.
+          if (!cancelled && $desktopBoot.get().error) {
+            completeDesktopBoot('Hermes gateway reconnected')
+          }
         }
       } catch (err) {
         // OAuth session expired mid-reconnect: surface the actionable "sign in
