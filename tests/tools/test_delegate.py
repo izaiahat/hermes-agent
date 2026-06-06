@@ -904,6 +904,7 @@ class TestBlockedTools(unittest.TestCase):
     def test_constants(self):
         from tools.delegate_tool import (
             _get_max_spawn_depth, _get_orchestrator_enabled,
+            _MAX_SPAWN_DEPTH_CAP,
             _MIN_SPAWN_DEPTH,
         )
         self.assertEqual(_get_max_concurrent_children(), 3)
