@@ -96,6 +96,7 @@ export function useGatewayBoot({
     let reconnecting = false
     let reconnectTimer: ReturnType<typeof setTimeout> | null = null
     let reconnectAttempt = 0
+    const recoverableReconnectErrorAfterAttempts = 6
     // Surface "sign in again" once per disconnect episode, not on every backoff
     // tick — a stale OAuth ticket fails every attempt and would otherwise stack
     // identical error toasts (and their haptics). Reset on the next clean open.
@@ -153,6 +154,9 @@ export function useGatewayBoot({
         // Resync state that may have moved on the backend while we were asleep.
         await callbacksRef.current.refreshHermesConfig().catch(() => undefined)
         await callbacksRef.current.refreshSessions().catch(() => undefined)
+        if (!cancelled && $desktopBoot.get().error) {
+          completeDesktopBoot('Hermes gateway reconnected')
+        }
       } catch (err) {
         // OAuth session expired mid-reconnect: surface the actionable "sign in
         // again" message once instead of silently looping the backoff against a
@@ -166,6 +170,15 @@ export function useGatewayBoot({
         reconnecting = false
 
         if (!cancelled && !gatewayOpen()) {
+          if (
+            bootCompleted &&
+            reconnectAttempt >= recoverableReconnectErrorAfterAttempts &&
+            !$desktopBoot.get().error
+          ) {
+            failDesktopBoot(
+              'Hermes gateway connection dropped and could not reconnect. Use Retry, sign in again, or switch to a local gateway.'
+            )
+          }
           scheduleReconnect()
         }
       }
