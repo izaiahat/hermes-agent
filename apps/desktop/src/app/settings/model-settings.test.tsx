@@ -82,13 +82,36 @@ describe('ModelSettings', () => {
     await waitFor(() => expect(getGlobalModelInfo).toHaveBeenCalled())
     await waitFor(() => expect(getGlobalModelOptions).toHaveBeenCalled())
 
-    // Open the provider Select — only configured providers should be listed.
+    // Open the provider Select — every provider from the full payload should be
+    // listed, including unconfigured providers before they have models.
     const triggers = await screen.findAllByRole('combobox')
     fireEvent.click(triggers[0])
 
-    // "Nous" shows in both the trigger and the open list.
+    // "Nous" shows in both the trigger and the open list; the unconfigured
+    // provider is the unique signal of the full universe.
     expect((await screen.findAllByText('Nous')).length).toBeGreaterThan(0)
-    expect(screen.queryByText(/DeepSeek/)).toBeNull()
+    expect(await screen.findByText(/DeepSeek/)).toBeTruthy()
+  })
+
+  it('activates an unconfigured api_key provider inline by saving its key', async () => {
+    await renderModelSettings()
+
+    await waitFor(() => expect(getGlobalModelOptions).toHaveBeenCalled())
+
+    // Open the provider Select and pick the unconfigured provider.
+    const triggers = screen.getAllByRole('combobox')
+    fireEvent.click(triggers[0])
+    const deepseekOption = await screen.findByText(/DeepSeek/)
+    fireEvent.click(deepseekOption)
+
+    // The inline key input appears for an api_key provider that needs setup.
+    const keyInput = await screen.findByPlaceholderText(/Paste DEEPSEEK_API_KEY/)
+    fireEvent.change(keyInput, { target: { value: 'sk-test-123' } })
+
+    const activate = await screen.findByRole('button', { name: /Activate/ })
+    fireEvent.click(activate)
+
+    await waitFor(() => expect(setEnvVar).toHaveBeenCalledWith('DEEPSEEK_API_KEY', 'sk-test-123'))
   })
 
   it('writes the profile default speed (service_tier) when the fast switch is toggled', async () => {
