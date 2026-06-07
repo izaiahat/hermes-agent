@@ -465,7 +465,9 @@ describe('assistant-ui streaming renderer', () => {
       expect(container.querySelector('[data-slot="code-card"]')).toBeTruthy()
     })
 
-    expect(container.textContent).toContain('const answer = 42')
+    await waitFor(() => {
+      expect(container.textContent).toContain('const answer = 42')
+    })
     expect(container.textContent).not.toContain('```ts')
   })
 
