@@ -1,7 +1,7 @@
 import { AssistantRuntimeProvider, type ThreadMessage, useExternalStoreRuntime } from '@assistant-ui/react'
 import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { useEffect, useState } from 'react'
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { beforeEach, afterEach, describe, expect, it, vi } from 'vitest'
 
 import { Thread } from './thread'
 
@@ -44,10 +44,54 @@ class TestResizeObserver {
 }
 
 vi.stubGlobal('ResizeObserver', TestResizeObserver)
-vi.stubGlobal('requestAnimationFrame', (callback: FrameRequestCallback) =>
-  window.setTimeout(() => callback(performance.now()), 0)
-)
-vi.stubGlobal('cancelAnimationFrame', (id: number) => window.clearTimeout(id))
+const rafTimers = new Set<number>()
+const requestAnimationFrameMock = (callback: FrameRequestCallback) => {
+  const id = window.setTimeout(() => {
+    rafTimers.delete(id)
+    installAnimationFrameMocks()
+    callback(performance.now())
+  }, 0)
+  rafTimers.add(id)
+  return id
+}
+const cancelAnimationFrameMock = (id: number) => {
+  rafTimers.delete(id)
+  window.clearTimeout(id)
+}
+
+function installAnimationFrameMocks() {
+  vi.stubGlobal('requestAnimationFrame', requestAnimationFrameMock)
+  vi.stubGlobal('cancelAnimationFrame', cancelAnimationFrameMock)
+  Object.defineProperty(window, 'requestAnimationFrame', {
+    configurable: true,
+    writable: true,
+    value: requestAnimationFrameMock
+  })
+  Object.defineProperty(window, 'cancelAnimationFrame', {
+    configurable: true,
+    writable: true,
+    value: cancelAnimationFrameMock
+  })
+  Object.defineProperty(Window.prototype, 'requestAnimationFrame', {
+    configurable: true,
+    writable: true,
+    value: requestAnimationFrameMock
+  })
+  Object.defineProperty(Window.prototype, 'cancelAnimationFrame', {
+    configurable: true,
+    writable: true,
+    value: cancelAnimationFrameMock
+  })
+}
+
+installAnimationFrameMocks()
+
+afterEach(() => {
+  for (const id of rafTimers) {
+    window.clearTimeout(id)
+  }
+  rafTimers.clear()
+})
 
 Element.prototype.scrollTo = function scrollTo() {}
 
