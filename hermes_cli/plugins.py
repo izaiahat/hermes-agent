@@ -971,6 +971,12 @@ class PluginContext:
                 kind,
                 ", ".join(sorted(VALID_MIDDLEWARE)),
             )
+        if not hasattr(self._manager, "_middleware"):
+            # Long-lived dashboard/TUI processes can survive source updates.
+            # If an older PluginManager singleton predates middleware support,
+            # hydrate the field instead of letting a plugin registration break
+            # the entire LLM request path.
+            self._manager._middleware = {}  # type: ignore[attr-defined]
         self._manager._middleware.setdefault(kind, []).append(callback)
         logger.debug("Plugin %s registered middleware: %s", self.manifest.name, kind)
 
@@ -1046,6 +1052,32 @@ class PluginManager:
         # description, defaults, plugin}. See PluginContext.register_auxiliary_task.
         self._aux_tasks: Dict[str, Dict[str, Any]] = {}
 
+    def _ensure_runtime_fields(self) -> None:
+        """Hydrate fields added after a long-lived manager was constructed.
+
+        Dashboard/TUI services can stay up across git updates. A process may
+        keep an older ``PluginManager`` singleton while newer middleware helper
+        code expects fields such as ``_middleware``. Missing runtime fields must
+        fail open, not abort provider calls.
+        """
+        defaults = {
+            "_plugins": dict,
+            "_hooks": dict,
+            "_middleware": dict,
+            "_plugin_tool_names": set,
+            "_plugin_platform_names": set,
+            "_cli_commands": dict,
+            "_context_engine": lambda: None,
+            "_plugin_commands": dict,
+            "_discovered": lambda: False,
+            "_cli_ref": lambda: None,
+            "_plugin_skills": dict,
+            "_aux_tasks": dict,
+        }
+        for attr, factory in defaults.items():
+            if not hasattr(self, attr):
+                setattr(self, attr, factory())
+
     # -----------------------------------------------------------------------
     # Public
     # -----------------------------------------------------------------------
@@ -1057,6 +1089,7 @@ class PluginManager:
         changes or newly-added bundled backends become visible in long-lived
         sessions without requiring a full agent restart.
         """
+        self._ensure_runtime_fields()
         if self._discovered and not force:
             return
         if force:
@@ -1591,6 +1624,7 @@ class PluginManager:
         are reused.  All injected context is ephemeral — never
         persisted to session DB.
         """
+        self._ensure_runtime_fields()
         kwargs.setdefault("telemetry_schema_version", OBSERVER_SCHEMA_VERSION)
         callbacks = self._hooks.get(hook_name, [])
         results: List[Any] = []
@@ -1610,10 +1644,12 @@ class PluginManager:
 
     def has_hook(self, hook_name: str) -> bool:
         """Return True when at least one callback is registered for a hook."""
+        self._ensure_runtime_fields()
         return bool(self._hooks.get(hook_name))
 
     def has_middleware(self, kind: str) -> bool:
         """Return True when at least one callback is registered for middleware."""
+        self._ensure_runtime_fields()
         return bool(self._middleware.get(kind))
 
     def invoke_middleware(self, kind: str, **kwargs: Any) -> List[Any]:
@@ -1623,6 +1659,7 @@ class PluginManager:
         path. Middleware that wants to change behavior must return the shape
         documented by the caller-specific contract.
         """
+        self._ensure_runtime_fields()
         callbacks = self._middleware.get(kind, [])
         results: List[Any] = []
         for cb in callbacks:
@@ -1695,12 +1732,41 @@ class PluginManager:
 _plugin_manager: Optional[PluginManager] = None
 
 
+def _ensure_plugin_manager_state(manager: PluginManager) -> PluginManager:
+    """Backfill runtime fields on an existing global manager singleton."""
+    ensure = getattr(manager, "_ensure_runtime_fields", None)
+    if callable(ensure):
+        ensure()
+        return manager
+
+    # Defensive fallback for a manager object constructed by an older class in
+    # a long-lived process where the module has since been reloaded.
+    fallback_defaults = {
+        "_plugins": dict,
+        "_hooks": dict,
+        "_middleware": dict,
+        "_plugin_tool_names": set,
+        "_plugin_platform_names": set,
+        "_cli_commands": dict,
+        "_context_engine": lambda: None,
+        "_plugin_commands": dict,
+        "_discovered": lambda: False,
+        "_cli_ref": lambda: None,
+        "_plugin_skills": dict,
+        "_aux_tasks": dict,
+    }
+    for attr, factory in fallback_defaults.items():
+        if not hasattr(manager, attr):
+            setattr(manager, attr, factory())
+    return manager
+
+
 def get_plugin_manager() -> PluginManager:
     """Return (and lazily create) the global PluginManager singleton."""
     global _plugin_manager
     if _plugin_manager is None:
         _plugin_manager = PluginManager()
-    return _plugin_manager
+    return _ensure_plugin_manager_state(_plugin_manager)
 
 
 def discover_plugins(force: bool = False) -> None:

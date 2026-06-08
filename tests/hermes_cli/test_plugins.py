@@ -25,6 +25,7 @@ from hermes_cli.middleware import (
     VALID_MIDDLEWARE,
     apply_llm_request_middleware,
     apply_tool_request_middleware,
+    run_llm_execution_middleware,
     run_tool_execution_middleware,
 )
 
@@ -169,6 +170,34 @@ class TestPluginDiscovery:
         assert tool_result.trace == []
         assert run_tool_execution_middleware("terminal", args, lambda payload: payload) is args
         assert has_middleware("tool_request") is False
+
+    def test_middleware_helpers_tolerate_legacy_manager_without_middleware_attr(self, monkeypatch):
+        """Old long-lived PluginManager singletons should fail open."""
+        manager = types.SimpleNamespace()
+        monkeypatch.setattr("hermes_cli.plugins.get_plugin_manager", lambda: manager)
+
+        request = {"messages": []}
+        args = {"path": "README.md"}
+
+        assert run_llm_execution_middleware(request, lambda payload: ("llm", payload)) == (
+            "llm",
+            request,
+        )
+        assert run_tool_execution_middleware("read_file", args, lambda payload: ("tool", payload)) == (
+            "tool",
+            args,
+        )
+
+    def test_global_plugin_manager_hydrates_legacy_singleton(self, monkeypatch):
+        import hermes_cli.plugins as plugins_mod
+
+        manager = PluginManager()
+        del manager._middleware
+        monkeypatch.setattr(plugins_mod, "_plugin_manager", manager)
+
+        assert plugins_mod.has_middleware("llm_request") is False
+        assert hasattr(manager, "_middleware")
+        assert manager._middleware == {}
 
     def test_request_middleware_changed_tracks_trace_not_deep_equality(self, monkeypatch):
         def same_payload_middleware(**kwargs):
