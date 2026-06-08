@@ -1425,6 +1425,27 @@ class PluginManager(PluginLoaderMixin, PluginDispatchMixin, PluginLedgerMixin):
         """Read manifests under *path* (see :func:`scan_directory`)."""
         return scan_directory(path, source, skip_names=skip_names)
 
+    def _ensure_runtime_fields(self) -> None:
+        """Hydrate fields added after a long-lived manager was constructed.
+
+        Dashboard/TUI/gateway services stay up across a source update — exactly
+        what the nightly Hermes updater does — so a process can keep an older
+        ``PluginManager`` singleton while newer code expects fields such as
+        ``_middleware``. A missing runtime field must fail OPEN, not abort the
+        provider call path.
+        """
+        defaults = {
+            "_plugins": dict, "_hooks": dict, "_middleware": dict,
+            "_plugin_tool_names": set, "_plugin_platform_names": set,
+            "_cli_commands": dict, "_plugin_commands": dict,
+            "_plugin_skills": dict, "_aux_tasks": dict,
+            "_context_engine": lambda: None, "_discovered": lambda: False,
+            "_cli_ref": lambda: None,
+        }
+        for attr, factory in defaults.items():
+            if not hasattr(self, attr):
+                setattr(self, attr, factory())
+
     def _scan_entry_points(self) -> List[PluginManifest]:
         """Read installed plugin entry points (see :func:`discover_entrypoint_manifests`)."""
         return discover_entrypoint_manifests()
@@ -1533,13 +1554,35 @@ def get_plugin_manager() -> PluginManager:
         # keyed cache doesn't know about at all.
         if _plugin_manager is not None and _plugin_manager not in _plugin_managers_by_home.values():
             _plugin_managers_by_home[current_home] = _plugin_manager
-            return _plugin_manager
+            return _ensure_plugin_manager_state(_plugin_manager)
         manager = _plugin_managers_by_home.get(current_home)
         if manager is None:
             manager = PluginManager(scope_key=hermes_home_key(current_home))
             _plugin_managers_by_home[current_home] = manager
         _plugin_manager = manager
-        return manager
+        return _ensure_plugin_manager_state(manager)
+
+
+def _ensure_plugin_manager_state(manager):
+    """Hydrate a manager that predates a field newer code expects; never raises.
+
+    An adopted or long-cached singleton may have been built by the previous
+    source generation (the nightly updater restarts sources under live
+    services), so registration and middleware lookup must not explode on a
+    field that simply did not exist yet.
+    """
+    ensure = getattr(manager, "_ensure_runtime_fields", None)
+    if callable(ensure):
+        try:
+            ensure()
+        except Exception:
+            pass
+    elif not hasattr(manager, "_middleware"):
+        try:
+            manager._middleware = {}  # type: ignore[attr-defined]
+        except Exception:
+            pass
+    return manager
 
 
 def _reset_plugin_managers_for_tests() -> None:
