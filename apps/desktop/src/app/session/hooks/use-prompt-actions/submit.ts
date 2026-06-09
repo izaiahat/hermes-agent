@@ -174,7 +174,8 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
           sid,
           state => ({
             ...state,
-            messages: state.messages.map(message => (message.id === optimisticId ? buildUserMessage() : message))
+            messages: state.messages.map(message => (message.id === optimisticId ? buildUserMessage() : message)),
+            interrupted: false
           }),
           selectedStoredSessionIdRef.current
         )
