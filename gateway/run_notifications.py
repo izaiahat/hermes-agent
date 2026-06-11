@@ -770,6 +770,51 @@ class GatewayNotificationsMixin:
             logger.warning(failure_fmt, platform.value, home.chat_id, exc)
             return False
 
+    def _restart_cause_summary(self) -> str:
+        """Best-effort one-liner describing why the previous instance exited.
+
+        Reads the exit-path diagnostics log written by the gateway lifecycle
+        ledger (``logs/gateway-exit-diag.log``) and summarises the previous
+        pid's last lifecycle events. A previous instance with a
+        ``gateway.start`` but no exit record was almost certainly hard-killed
+        (SIGKILL after stop-timeout, OOM, or host reset) — which is exactly the
+        case an operator reading the boot heartbeat needs to see. Never raises.
+        """
+        try:
+            import os
+
+            from hermes_constants import get_hermes_home
+
+            diag = get_hermes_home() / "logs" / "gateway-exit-diag.log"
+            if not diag.exists():
+                return "restart cause: unknown (no exit-diag log)"
+            events: list[dict] = []
+            with diag.open(encoding="utf-8", errors="replace") as handle:
+                for line in handle.readlines()[-80:]:
+                    try:
+                        events.append(json.loads(line))
+                    except Exception:
+                        continue
+            prev = [e for e in events if e.get("pid") != os.getpid()]
+            if not prev:
+                return "restart cause: unknown (no prior lifecycle records)"
+            prev_pid = prev[-1].get("pid")
+            prev = [e for e in prev if e.get("pid") == prev_pid]
+            exits = [e for e in prev if e.get("tag") != "gateway.start"]
+            if not exits:
+                return (
+                    f"restart cause: previous instance (pid {prev_pid}) left no exit "
+                    "record — hard kill likely (stop-timeout SIGKILL/OOM/host reset)"
+                )
+            last = exits[-1]
+            detail = f" success={last.get('success')}" if last.get("tag") == "asyncio.run.returned" else ""
+            return (
+                f"restart cause: prev pid {prev_pid} last event "
+                f"{last.get('tag')}{detail} at {last.get('ts')}"
+            )
+        except Exception:
+            return "restart cause: unavailable"
+
     def _free_tier_startup_line(self) -> Optional[str]:
         """Extra startup line when the gateway's inference is carried by the Nous free tier; None otherwise.
 
@@ -800,7 +845,10 @@ class GatewayNotificationsMixin:
         """
         delivered: set[tuple[str, str, Optional[str]]] = set()
         skipped = skip_targets or set()
-        message = "♻️ Gateway online — Hermes is back and ready."
+        message = (
+            "♻️ Gateway online — Hermes is back and ready.\n"
+            f"{self._restart_cause_summary()}"
+        )
         free_tier_line = self._free_tier_startup_line()
         if free_tier_line:
             message = f"{message}\n{free_tier_line}"
