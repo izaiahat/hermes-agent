@@ -285,6 +285,7 @@ def cron_edit(args):
         repeat=getattr(args, "repeat", None),
         skills=final_skills,
         script=getattr(args, "script", None),
+        script_timeout_seconds=getattr(args, "script_timeout_seconds", None),
         workdir=getattr(args, "workdir", None),
         profile=getattr(args, "profile", None),
         no_agent=getattr(args, "no_agent", None),
@@ -303,6 +304,8 @@ def cron_edit(args):
         print("  Skills: none")
     if updated.get("script"):
         print(f"  Script: {updated['script']}")
+    if updated.get("script_timeout_seconds") is not None:
+        print(f"  Script timeout: {updated['script_timeout_seconds']}s")
     if updated.get("no_agent"):
         print("  Mode: no-agent (script stdout delivered directly)")
     if updated.get("workdir"):

@@ -445,6 +445,8 @@ def _format_job(job: Dict[str, Any]) -> Dict[str, Any]:
     }
     if job.get("script"):
         result["script"] = job["script"]
+    if job.get("script_timeout_seconds") is not None:
+        result["script_timeout_seconds"] = job.get("script_timeout_seconds")
     if job.get("no_agent"):
         result["no_agent"] = True
     if job.get("enabled_toolsets"):
@@ -472,6 +474,7 @@ def cronjob(
     base_url: Optional[str] = None,
     reason: Optional[str] = None,
     script: Optional[str] = None,
+    script_timeout_seconds: Optional[int] = None,
     context_from: Optional[Union[str, List[str]]] = None,
     enabled_toolsets: Optional[List[str]] = None,
     workdir: Optional[str] = None,
@@ -653,6 +656,14 @@ def cronjob(
                     if script_error:
                         return tool_error(script_error, success=False)
                 updates["script"] = _normalize_optional_job_value(script) if script else None
+            if script_timeout_seconds is not None:
+                try:
+                    normalized_timeout = int(script_timeout_seconds)
+                except Exception:
+                    return tool_error("script_timeout_seconds must be a positive integer", success=False)
+                if normalized_timeout <= 0:
+                    return tool_error("script_timeout_seconds must be a positive integer", success=False)
+                updates["script_timeout_seconds"] = normalized_timeout
             if context_from is not None:
                 # Empty string / empty list clears the field; otherwise validate
                 # each referenced job exists before storing. Normalized to a list
@@ -793,6 +804,10 @@ Important safety rule: cron-run sessions should not recursively schedule more cr
             "script": {
                 "type": "string",
                 "description": f"Optional path to a script that runs each tick. In the default mode its stdout is injected into the agent's prompt as context (data-collection / change-detection pattern). With no_agent=True, the script IS the job and its stdout is delivered verbatim (classic watchdog pattern). Relative paths resolve under {display_hermes_home()}/scripts/. ``.sh``/``.bash`` extensions run via bash, everything else via Python. On update, pass empty string to clear."
+            },
+            "script_timeout_seconds": {
+                "type": "integer",
+                "description": "Optional per-job timeout in seconds for this job's script/no-agent watchdog. Overrides the global cron.script_timeout_seconds only for this job."
             },
             "no_agent": {
                 "type": "boolean",

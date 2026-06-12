@@ -117,6 +117,11 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
         ),
     )
     cron_edit.add_argument(
+        "--script-timeout-seconds",
+        type=int,
+        help="Per-job timeout in seconds for this job's script/no-agent watchdog.",
+    )
+    cron_edit.add_argument(
         "--no-agent",
         dest="no_agent",
         action="store_const",
