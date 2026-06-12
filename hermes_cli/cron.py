@@ -358,6 +358,7 @@ def cron_create(args):
         skill=getattr(args, "skill", None),
         skills=_normalize_skills(getattr(args, "skill", None), getattr(args, "skills", None)),
         script=getattr(args, "script", None),
+        script_timeout_seconds=getattr(args, "script_timeout_seconds", None),
         workdir=getattr(args, "workdir", None),
         model=getattr(args, "model", None),
         provider=getattr(args, "model_provider", None),
@@ -376,6 +377,8 @@ def cron_create(args):
     job_data = result.get("job", {})
     if job_data.get("script"):
         print(f"  Script: {job_data['script']}")
+    if job_data.get("script_timeout_seconds") is not None:
+        print(f"  Script timeout: {job_data['script_timeout_seconds']}s")
     if job_data.get("monitor_script"):
         print(f"  Monitor: {job_data['monitor_script']} (agent runs only on output change)")
     if job_data.get("monitor_url"):
@@ -429,6 +432,7 @@ def cron_edit(args):
         repeat=getattr(args, "repeat", None),
         skills=final_skills,
         script=getattr(args, "script", None),
+        script_timeout_seconds=getattr(args, "script_timeout_seconds", None),
         workdir=getattr(args, "workdir", None),
         model=getattr(args, "model", None),
         provider=getattr(args, "model_provider", None),
@@ -454,6 +458,8 @@ def cron_edit(args):
         print(f"  Monitor: {updated['monitor_script']} (agent runs only on output change)")
     if updated.get("monitor_url"):
         print(f"  Monitor: {updated['monitor_url']} (agent runs only on output change)")
+    if updated.get("script_timeout_seconds") is not None:
+        print(f"  Script timeout: {updated['script_timeout_seconds']}s")
     if updated.get("no_agent"):
         print("  Mode: no-agent (script stdout delivered directly)")
     if updated.get("workdir"):

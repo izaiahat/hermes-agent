@@ -2258,8 +2258,14 @@ _SCRIPT_TIMEOUT = _DEFAULT_SCRIPT_TIMEOUT
 _RUN_CLAIM_HEARTBEAT_SECONDS = 60.0
 
 
-def _get_script_timeout() -> int:
-    """Resolve cron pre-run script timeout from module/env/config with a safe default."""
+def _get_script_timeout(job: Optional[dict] = None) -> int:
+    """Resolve cron pre-run script timeout.
+
+    A no-agent/script job may carry ``script_timeout_seconds`` to override the
+    global cron watchdog for that one job.  This lets one intentionally slow,
+    paced watchdog run longer without widening the timeout for unrelated cron
+    scripts.
+    """
     if _SCRIPT_TIMEOUT != _DEFAULT_SCRIPT_TIMEOUT:
         try:
             timeout = int(float(_SCRIPT_TIMEOUT))
@@ -2267,6 +2273,20 @@ def _get_script_timeout() -> int:
                 return timeout
         except Exception:
             logger.warning("Invalid patched _SCRIPT_TIMEOUT=%r; using env/config/default", _SCRIPT_TIMEOUT)
+
+    if isinstance(job, dict):
+        job_timeout = job.get("script_timeout_seconds")
+        if job_timeout is not None:
+            try:
+                timeout = int(float(job_timeout))
+                if timeout > 0:
+                    return timeout
+            except Exception:
+                logger.warning(
+                    "Invalid script_timeout_seconds=%r for job %r; using env/config/default",
+                    job_timeout,
+                    job.get("id"),
+                )
 
     env_value = os.getenv("HERMES_CRON_SCRIPT_TIMEOUT", "").strip()
     if env_value:
@@ -2352,6 +2372,7 @@ def _windows_cron_python_invocation(python_exe: str) -> tuple[str, dict[str, str
 def _run_job_script(
     script_path: str,
     workdir: Optional[str] = None,
+    job: Optional[dict] = None,
 ) -> tuple[bool, str]:
     """Execute a cron job's data-collection script and capture its output.
 
@@ -2384,6 +2405,8 @@ def _run_job_script(
             mutated, avoiding the global-side-effect bug where a cron
             job's ``os.chdir()`` leaks into concurrent gateway sessions
             (#69396).
+        job: Optional job payload used to resolve a per-job
+            ``script_timeout_seconds`` override.
 
     Returns:
         (success, output) — on failure *output* contains the error message so the
@@ -2423,7 +2446,7 @@ def _run_job_script(
     if not path.is_file():
         return False, f"Script path is not a file: {path}"
 
-    script_timeout = _get_script_timeout()
+    script_timeout = _get_script_timeout(job)
 
     # Pick an interpreter by extension.  Bash for .sh/.bash, Python for
     # everything else.  We deliberately do NOT honour the file's own
@@ -2529,7 +2552,7 @@ def _run_job_script_with_claim_heartbeat(
         and schedule.get("kind") == "once"
         and owner
     ):
-        return _run_job_script(script_path, workdir=workdir)
+        return _run_job_script(script_path, workdir=workdir, job=job)
 
     job_id = str(job.get("id") or "")
     stop = threading.Event()
@@ -2560,10 +2583,10 @@ def _run_job_script_with_claim_heartbeat(
             job_id,
             exc_info=True,
         )
-        return _run_job_script(script_path, workdir=workdir)
+        return _run_job_script(script_path, workdir=workdir, job=job)
 
     try:
-        return _run_job_script(script_path, workdir=workdir)
+        return _run_job_script(script_path, workdir=workdir, job=job)
     finally:
         stop.set()
         # Event.wait() wakes immediately.  Keep completion bounded if the
@@ -2634,7 +2657,7 @@ def _build_job_prompt(
         if prerun_script is not None:
             success, script_output = prerun_script
         else:
-            success, script_output = _run_job_script(script_path)
+            success, script_output = _run_job_script(script_path, job=job)
         if success:
             if script_output:
                 prompt = (

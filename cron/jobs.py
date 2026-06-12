@@ -1579,6 +1579,7 @@ def create_job(
     provider: Optional[str] = None,
     base_url: Optional[str] = None,
     script: Optional[str] = None,
+    script_timeout_seconds: Optional[int] = None,
     context_from: Optional[Union[str, List[str]]] = None,
     enabled_toolsets: Optional[List[str]] = None,
     workdir: Optional[str] = None,
@@ -1610,6 +1611,8 @@ def create_job(
                 change-detection pattern). Paths resolve under
                 ~/.hermes/scripts/; ``.sh`` / ``.bash`` files run via bash,
                 anything else via Python.
+        script_timeout_seconds: Optional positive per-job override for the
+                script/no-agent subprocess timeout.
         context_from: Optional job ID (or list of job IDs) whose most recent output
                       is injected into the prompt as context before each run.
                       Useful for chaining cron jobs: job A finds data, job B processes it.
@@ -1670,6 +1673,14 @@ def create_job(
     normalized_base_url = _normalize_job_optional_text(base_url, strip_trailing_slash=True)
     normalized_script = str(script).strip() if isinstance(script, str) else None
     normalized_script = normalized_script or None
+    normalized_script_timeout: Optional[int] = None
+    if script_timeout_seconds is not None:
+        try:
+            normalized_script_timeout = int(script_timeout_seconds)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("script_timeout_seconds must be a positive integer") from exc
+        if normalized_script_timeout <= 0:
+            raise ValueError("script_timeout_seconds must be a positive integer")
     normalized_toolsets = [str(t).strip() for t in enabled_toolsets if str(t).strip()] if enabled_toolsets else None
     normalized_toolsets = normalized_toolsets or None
     normalized_workdir = _normalize_workdir(workdir)
@@ -1749,6 +1760,7 @@ def create_job(
         "model_snapshot": model_snapshot,
         "base_url": normalized_base_url,
         "script": normalized_script,
+        "script_timeout_seconds": normalized_script_timeout,
         "no_agent": normalized_no_agent,
         "monitor_script": normalized_monitor_script,
         "monitor_url": normalized_monitor_url,

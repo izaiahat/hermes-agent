@@ -588,6 +588,8 @@ def _format_job(job: Dict[str, Any]) -> Dict[str, Any]:
         result["monitor_url"] = job["monitor_url"]
     if job.get("monitor_state"):
         result["monitor_state"] = job["monitor_state"]
+    if job.get("script_timeout_seconds") is not None:
+        result["script_timeout_seconds"] = job.get("script_timeout_seconds")
     if job.get("no_agent"):
         result["no_agent"] = True
     if job.get("enabled_toolsets"):
@@ -1045,6 +1047,7 @@ def cronjob(
     base_url: Optional[str] = None,
     reason: Optional[str] = None,
     script: Optional[str] = None,
+    script_timeout_seconds: Optional[int] = None,
     context_from: Optional[Union[str, List[str]]] = None,
     enabled_toolsets: Optional[List[str]] = None,
     workdir: Optional[str] = None,
@@ -1133,6 +1136,7 @@ def cronjob(
                     provider=_normalize_optional_job_value(provider),
                     base_url=_normalize_optional_job_value(base_url, strip_trailing_slash=True),
                     script=_normalize_optional_job_value(script),
+                    script_timeout_seconds=script_timeout_seconds,
                     context_from=context_from,
                     enabled_toolsets=enabled_toolsets or None,
                     workdir=_normalize_optional_job_value(workdir),
@@ -1373,6 +1377,14 @@ def cronjob(
                         "clear one before setting the other.",
                         success=False,
                     )
+            if script_timeout_seconds is not None:
+                try:
+                    normalized_timeout = int(script_timeout_seconds)
+                except Exception:
+                    return tool_error("script_timeout_seconds must be a positive integer", success=False)
+                if normalized_timeout <= 0:
+                    return tool_error("script_timeout_seconds must be a positive integer", success=False)
+                updates["script_timeout_seconds"] = normalized_timeout
             if context_from is not None:
                 # Empty string / empty list clears the field; otherwise validate
                 # each referenced job exists before storing. Normalized to a list
@@ -1507,6 +1519,10 @@ Important safety rule: cron-run sessions should not recursively schedule more cr
             "monitor_url": {
                 "type": "string",
                 "description": "Optional http(s) URL used as the monitor source instead of a script — fetched with a bounded GET (30s timeout, 256KB cap) each tick. Same hash-suppression semantics as monitor_script. Mutually exclusive with monitor_script. On update, pass empty string to clear."
+            },
+            "script_timeout_seconds": {
+                "type": "integer",
+                "description": "Optional per-job timeout in seconds for this job's script/no-agent watchdog. Overrides the global cron.script_timeout_seconds only for this job."
             },
             "no_agent": {
                 "type": "boolean",

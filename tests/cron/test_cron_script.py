@@ -247,6 +247,29 @@ class TestRunJobScript:
         assert isinstance(output, str)
         assert output  # a message is always produced, never a silent drop
 
+    def test_per_job_script_timeout_reaches_subprocess(self, cron_env, monkeypatch):
+        from cron import scheduler as sched_mod
+        from cron.scheduler import _run_job_script
+
+        script = cron_env / "scripts" / "paced.py"
+        script.write_text('print("ok")\n')
+        captured = {}
+
+        def fake_run(argv, **kwargs):
+            captured["timeout"] = kwargs["timeout"]
+            return SimpleNamespace(returncode=0, stdout="ok\n", stderr="")
+
+        monkeypatch.setattr(sched_mod.subprocess, "run", fake_run)
+
+        success, output = _run_job_script(
+            str(script),
+            job={"id": "paced", "script_timeout_seconds": 17},
+        )
+
+        assert success is True
+        assert output == "ok"
+        assert captured["timeout"] == 17
+
 
 class TestBuildJobPromptWithScript:
     """Test that script output is injected into the prompt."""
@@ -290,6 +313,25 @@ class TestBuildJobPromptWithScript:
 class TestCronjobToolScript:
     """Test the cronjob tool's script parameter."""
 
+    def test_create_persists_per_job_script_timeout(self, cron_env, monkeypatch):
+        monkeypatch.setenv("HERMES_INTERACTIVE", "1")
+        from tools.cronjob_tools import cronjob
+
+        script = cron_env / "scripts" / "paced.py"
+        script.write_text('print("ok")\n')
+
+        result = json.loads(
+            cronjob(
+                action="create",
+                schedule="every 1h",
+                prompt="Monitor things",
+                script="paced.py",
+                script_timeout_seconds=17,
+            )
+        )
+
+        assert result["success"] is True
+        assert result["job"]["script_timeout_seconds"] == 17
 
     def test_clear_script(self, cron_env, monkeypatch):
         monkeypatch.setenv("HERMES_INTERACTIVE", "1")
