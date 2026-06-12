@@ -1604,6 +1604,25 @@ def _normalize_reasoning_effort(value: Any) -> Optional[str]:
     return text
 
 
+
+
+def _normalize_script_timeout_seconds(value: Any) -> Optional[int]:
+    """A positive per-job override for the script/no-agent subprocess timeout, or None.
+
+    Lets one intentionally slow, paced watchdog run longer without widening the
+    timeout for every unrelated cron script.
+    """
+    if value in {None, "", False}:
+        return None
+    try:
+        seconds = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("script_timeout_seconds must be a positive integer") from exc
+    if seconds <= 0:
+        raise ValueError("script_timeout_seconds must be a positive integer")
+    return seconds
+
+
 # Normalizers for create_job (all fields) / update_job (present fields). Invalid values raise BEFORE
 # storing.
 _CREATE_FIELD_NORMALIZERS: Dict[str, Callable[[Any], Any]] = {
@@ -1618,12 +1637,14 @@ _CREATE_FIELD_NORMALIZERS: Dict[str, Callable[[Any], Any]] = {
     "no_agent": bool,
     "context_from": _normalize_context_from,
     "failure_deliver": _normalize_failure_deliver,
+    "script_timeout_seconds": _normalize_script_timeout_seconds,
 }
 _UPDATE_FIELD_NORMALIZERS: Dict[str, Callable[[Any], Any]] = {
     "workdir": lambda v: None if v in {None, "", False} else _normalize_workdir(v),
     "monitor_script": _normalize_job_optional_text,
     "monitor_url": _normalize_job_optional_text,
     "reasoning_effort": _normalize_reasoning_effort,
+    "script_timeout_seconds": _normalize_script_timeout_seconds,
 }
 
 
@@ -1737,6 +1758,7 @@ def create_job(
     failure_deliver: Optional[str] = None,
     paused: bool = False,
     paused_reason: Optional[str] = None,
+    script_timeout_seconds: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Create a new cron job and return the stored record.
 
@@ -1832,6 +1854,7 @@ def create_job(
     # jobs.
     for key, value in (
         ("attach_to_session", normalized_attach), ("reasoning_effort", normalized_reasoning_effort),
+        ("script_timeout_seconds", f["script_timeout_seconds"]),
         ("failure_deliver", f["failure_deliver"]),
     ):
         if value is not None:

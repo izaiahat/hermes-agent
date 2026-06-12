@@ -69,6 +69,10 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
             "cron.model / model.default from config.yaml.")
     cron_create.add_argument("--provider", dest="model_provider",
         help="Inference provider paired with --model (e.g. 'openrouter', 'nous').")
+    cron_create.add_argument("--script-timeout", dest="script_timeout_seconds", type=int,
+        help="Per-job timeout in seconds for a script/no-agent job's subprocess. "
+            "Lets one intentionally slow, paced job run longer without widening "
+            "cron.script_timeout_seconds for every other cron script.")
     cron_create.add_argument("--reasoning-effort", dest="reasoning_effort",
         help="Pin this job's reasoning (thinking) effort: none, minimal, low, "
             "medium, high, xhigh, max, or ultra. Overrides agent.reasoning_effort "
@@ -132,6 +136,8 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
             "clear the pin and follow cron.model / model.default.")
     cron_edit.add_argument("--provider", dest="model_provider",
         help="Inference provider paired with --model. Pass empty string to clear.")
+    cron_edit.add_argument("--script-timeout", dest="script_timeout_seconds", type=int,
+        help="Per-job script/no-agent subprocess timeout in seconds.")
     cron_edit.add_argument("--reasoning-effort", dest="reasoning_effort",
         help="Pin this job's reasoning (thinking) effort: none, minimal, low, "
             "medium, high, xhigh, max, or ultra. Pass empty string to clear "

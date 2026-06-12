@@ -63,8 +63,26 @@ def _timeout_from_env_or_config(
     return None
 
 
-def _get_script_timeout() -> int:
-    """Resolve cron pre-run script timeout from module/env/config with a safe default."""
+def _get_script_timeout(job: Optional[dict] = None) -> int:
+    """Resolve the cron script timeout, honouring a per-job override.
+
+    A no-agent/script job may carry ``script_timeout_seconds`` to override the
+    global cron watchdog for that one job, so one intentionally slow, paced
+    watchdog can run longer without widening the timeout for unrelated scripts.
+    Module/env/config resolution is unchanged when no override is present.
+    """
+    if isinstance(job, dict):
+        job_timeout = job.get("script_timeout_seconds")
+        if job_timeout is not None:
+            try:
+                timeout = int(float(job_timeout))
+                if timeout > 0:
+                    return timeout
+            except Exception:
+                logger.warning(
+                    "Invalid script_timeout_seconds=%r for job %r; using env/config/default",
+                    job_timeout, job.get("id"),
+                )
     if _sched._SCRIPT_TIMEOUT != _sched._DEFAULT_SCRIPT_TIMEOUT:
         try:
             timeout = _positive_int(_sched._SCRIPT_TIMEOUT)
@@ -317,6 +335,7 @@ def _script_argv(path: Path) -> tuple[Optional[list[str]], dict[str, str], Optio
 def _run_job_script(
     script_path: str, workdir: Optional[str] = None,
     cancel_event: Optional[_CancelEventLike] = None,
+    job: Optional[dict] = None,
 ) -> tuple[bool, str]:
     """Execute a cron job's script and return ``(success, output)``; on failure *output* is the
     error message for the LLM to report. Env goes through ``build_subprocess_env`` (SECURITY.md
@@ -331,7 +350,7 @@ def _run_job_script(
     path, err = _resolve_script_path(script_path)
     if path is None:
         return False, err
-    script_timeout = _get_script_timeout()
+    script_timeout = _get_script_timeout(job)
     argv, env_overlay, err = _script_argv(path)
     if argv is None:
         return False, err
@@ -433,7 +452,7 @@ def _run_job_script_with_claim_heartbeat(
     claim = job.get("run_claim")
     owner = str(claim.get("by") or "") if isinstance(claim, dict) else ""
     if not (isinstance(schedule, dict) and schedule.get("kind") == "once" and owner):
-        return _run_job_script(script_path, workdir=workdir, cancel_event=cancel_event)
+        return _run_job_script(script_path, workdir=workdir, cancel_event=cancel_event, job=job)
 
     job_id = str(job.get("id") or "")
     stop = threading.Event()
@@ -451,10 +470,10 @@ def _run_job_script_with_claim_heartbeat(
             "Job '%s': could not start script run_claim heartbeat", job_id, exc_info=True),
     )
     if heartbeat_thread is None:
-        return _run_job_script(script_path, workdir=workdir, cancel_event=cancel_event)
+        return _run_job_script(script_path, workdir=workdir, cancel_event=cancel_event, job=job)
 
     try:
-        return _run_job_script(script_path, workdir=workdir, cancel_event=cancel_event)
+        return _run_job_script(script_path, workdir=workdir, cancel_event=cancel_event, job=job)
     finally:
         stop.set()
         # Bounded join: the heartbeat may be blocked on another process's jobs-file lock.
