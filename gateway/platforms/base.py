@@ -1336,6 +1336,11 @@ SUPPORTED_DOCUMENT_TYPES = {
     ".txt": "text/plain",
     ".csv": "text/csv",
     ".log": "text/plain",
+    # Apple/iOS crash reports are plain-text-ish diagnostics commonly uploaded
+    # from Xcode/TestFlight/Console. Cache them as documents so agents can
+    # inspect crash signatures with read_file/terminal instead of dropping them.
+    ".ips": "text/plain",
+    ".crash": "text/plain",
     ".json": "application/json",
     ".xml": "application/xml",
     ".yaml": "application/yaml",
