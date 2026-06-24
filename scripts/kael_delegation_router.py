@@ -20,7 +20,7 @@ from typing import Any, Iterable, Sequence
 CONCURRENCY = {
     "gpt55_max_concurrent_children": 10,
     "native_codex_max_concurrent_children": 5,
-    "gpt54_orchestrator_max_concurrent_children": 2,
+    "gpt55_orchestrator_max_concurrent_children": 2,
     "max_spawn_depth": 4,
 }
 
@@ -37,10 +37,10 @@ FAILURE_RECOVERY = {
 
 PARENT = {
     "lane": "parent",
-    "model": "gpt-5.4",
+    "model": "gpt-5.5",
     "provider": "openai-codex",
     "role": "parent",
-    "max_context_tokens": 1_000_000,
+    "max_context_tokens": 272_000,
     "retains": [
         "STATE.md writes",
         "final synthesis",
@@ -84,18 +84,32 @@ CODEX_NATIVE = {
     "anti_pattern": "never use raw codex exec / raw Node subprocesses",
 }
 
-GPT54_ORCHESTRATOR = {
-    "lane": "gpt54_orchestrator_cli",
-    "model": "gpt-5.4",
+GPT55_ORCHESTRATOR = {
+    "lane": "gpt55_orchestrator_cli",
+    "model": "gpt-5.5",
     "provider": "openai-codex",
     "role": "orchestrator",
-    "max_context_tokens": 1_000_000,
+    "max_context_tokens": 272_000,
     "timeout_seconds": 600,
     "command": (
-        "hermes chat --provider openai-codex --model gpt-5.4 "
+        "hermes chat --provider openai-codex --model gpt-5.5 "
         "-s delegation-routing-v2 -Q -q '<self-contained orchestrator prompt>'"
     ),
     "spawn_pattern": "terminal(command='hermes chat ...')",
+}
+
+CLAUDE_DESIGN_VERIFIER = {
+    "lane": "claude_design_verifier_cli",
+    "model": "opus",
+    "provider": "claude-code-cli",
+    "role": "read_only_design_verifier",
+    "max_context_tokens": 220_000,
+    "timeout_seconds": 900,
+    "command": (
+        "python3 /home/ubuntu/business/scripts/claude_design_review.py "
+        "--prompt-file <prompt.md>"
+    ),
+    "spawn_pattern": "terminal(command='python3 .../claude_design_review.py ...')",
 }
 
 _ALLOWED_TASK_TYPES = frozenset({"code", "research", "inspection"})
@@ -126,6 +140,8 @@ class TaskProfile:
     broad_domains: int = 0
     write_allowed: bool = False
     json_mode: bool = False
+    design_verification: bool = False
+    pre_ship_review: bool = False
     subtask_token_samples: tuple[int, ...] = field(default_factory=tuple)
     subtask_file_samples: tuple[int, ...] = field(default_factory=tuple)
 
@@ -289,24 +305,44 @@ def make_codex(profile: TaskProfile, reasons: list[str]) -> RoutingDecision:
     )
 
 
-def make_gpt54_orchestrator(reasons: list[str]) -> RoutingDecision:
+def make_gpt55_orchestrator(reasons: list[str]) -> RoutingDecision:
     """Build a native Hermes CLI orchestrator-child decision."""
     return apply_global_limits(
         RoutingDecision(
-            lane=GPT54_ORCHESTRATOR["lane"],
+            lane=GPT55_ORCHESTRATOR["lane"],
             reasons=reasons,
-            model=GPT54_ORCHESTRATOR["model"],
-            provider=GPT54_ORCHESTRATOR["provider"],
-            role=GPT54_ORCHESTRATOR["role"],
-            command=GPT54_ORCHESTRATOR["command"],
-            spawn_pattern=GPT54_ORCHESTRATOR["spawn_pattern"],
-            timeout_seconds=GPT54_ORCHESTRATOR["timeout_seconds"],
+            model=GPT55_ORCHESTRATOR["model"],
+            provider=GPT55_ORCHESTRATOR["provider"],
+            role=GPT55_ORCHESTRATOR["role"],
+            command=GPT55_ORCHESTRATOR["command"],
+            spawn_pattern=GPT55_ORCHESTRATOR["spawn_pattern"],
+            timeout_seconds=GPT55_ORCHESTRATOR["timeout_seconds"],
             failure_recovery={
                 "delegate_task_failure": FAILURE_RECOVERY["delegate_task_failure"],
                 "bad_output": FAILURE_RECOVERY["bad_child_output"],
             },
         ),
-        max_concurrent_children=CONCURRENCY["gpt54_orchestrator_max_concurrent_children"],
+        max_concurrent_children=CONCURRENCY["gpt55_orchestrator_max_concurrent_children"],
+    )
+
+
+def make_claude_design_verifier(reasons: list[str]) -> RoutingDecision:
+    """Build an explicit Claude Opus design/review verifier decision."""
+    return apply_global_limits(
+        RoutingDecision(
+            lane=CLAUDE_DESIGN_VERIFIER["lane"],
+            reasons=reasons,
+            model=CLAUDE_DESIGN_VERIFIER["model"],
+            provider=CLAUDE_DESIGN_VERIFIER["provider"],
+            role=CLAUDE_DESIGN_VERIFIER["role"],
+            command=CLAUDE_DESIGN_VERIFIER["command"],
+            spawn_pattern=CLAUDE_DESIGN_VERIFIER["spawn_pattern"],
+            timeout_seconds=CLAUDE_DESIGN_VERIFIER["timeout_seconds"],
+            failure_recovery={
+                "bad_output": FAILURE_RECOVERY["bad_child_output"],
+            },
+        ),
+        max_concurrent_children=1,
     )
 
 
@@ -364,16 +400,22 @@ def route_task(profile: TaskProfile) -> RoutingDecision:
 
     Precedence is intentional:
     1. Parent-only safety / irreversibility
-    2. Tiny local work
-    3. Broad-domain orchestrator topology
-    4. Parallel topology
-    5. Large-corpus native Codex lane
-    6. Bounded gpt-5.5 specialist
-    7. Parent fallback
+    2. Explicit Claude design / pre-ship verification
+    3. Tiny local work
+    4. Broad-domain orchestrator topology
+    5. Parallel topology
+    6. Large-corpus native Codex lane
+    7. Bounded gpt-5.5 specialist
+    8. Parent fallback
     """
     if profile.shared_state_write or profile.irreversible_action:
         return make_parent([
             "A: shared-state or irreversible action stays in parent",
+        ])
+
+    if profile.design_verification or profile.pre_ship_review:
+        return make_claude_design_verifier([
+            "G: explicit design / pre-ship verification routes to Claude Opus reviewer",
         ])
 
     if profile.single_tool_call:
@@ -387,7 +429,7 @@ def route_task(profile: TaskProfile) -> RoutingDecision:
         ])
 
     if profile.broad_domains >= 2:
-        return make_gpt54_orchestrator([
+        return make_gpt55_orchestrator([
             "F: multiple broad domains need local synthesis",
         ])
 
@@ -504,6 +546,12 @@ def example_profiles() -> list[TaskProfile]:
             estimated_tokens=180_000,
             broad_domains=3,
         ),
+        TaskProfile(
+            description="Critique a landing page design before launch",
+            task_type="inspection",
+            estimated_tokens=20_000,
+            design_verification=True,
+        ),
     ]
 
 
@@ -536,14 +584,21 @@ def validation_cases() -> list[ValidationCase]:
             profile=example_profiles()[3],
             expected_lane="parent",
             expected_max_concurrent_children=1,
-            expected_model="gpt-5.4",
+            expected_model="gpt-5.5",
         ),
         ValidationCase(
             name="multi_domain_orchestrator",
             profile=example_profiles()[4],
-            expected_lane="gpt54_orchestrator_cli",
+            expected_lane="gpt55_orchestrator_cli",
             expected_max_concurrent_children=2,
-            expected_model="gpt-5.4",
+            expected_model="gpt-5.5",
+        ),
+        ValidationCase(
+            name="claude_design_verifier",
+            profile=example_profiles()[5],
+            expected_lane="claude_design_verifier_cli",
+            expected_max_concurrent_children=1,
+            expected_model="opus",
         ),
     ]
 
