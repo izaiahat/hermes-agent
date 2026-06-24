@@ -30,7 +30,7 @@ def test_shared_state_routes_to_parent() -> None:
         )
     )
     assert decision.lane == "parent"
-    assert decision.model == "gpt-5.4"
+    assert decision.model == "gpt-5.5"
     assert decision.max_concurrent_children == 1
 
 
@@ -189,7 +189,7 @@ def test_shared_state_plus_parallel_still_routes_to_parent() -> None:
     assert decision.lane == "parent"
 
 
-def test_multi_domain_routes_to_gpt54_orchestrator() -> None:
+def test_multi_domain_routes_to_gpt55_orchestrator() -> None:
     decision = route_task(
         TaskProfile(
             description="Compare config, git workflow, and doctrine docs, then decide final policy",
@@ -198,10 +198,26 @@ def test_multi_domain_routes_to_gpt54_orchestrator() -> None:
             broad_domains=3,
         )
     )
-    assert decision.lane == "gpt54_orchestrator_cli"
-    assert decision.model == "gpt-5.4"
+    assert decision.lane == "gpt55_orchestrator_cli"
+    assert decision.model == "gpt-5.5"
     assert decision.role == "orchestrator"
     assert decision.max_concurrent_children == 2
+
+
+def test_design_verification_routes_to_claude_opus_verifier() -> None:
+    decision = route_task(
+        TaskProfile(
+            description="Critique a landing page design before launch",
+            task_type="inspection",
+            estimated_tokens=20_000,
+            design_verification=True,
+        )
+    )
+    assert decision.lane == "claude_design_verifier_cli"
+    assert decision.model == "opus"
+    assert decision.provider == "claude-code-cli"
+    assert decision.role == "read_only_design_verifier"
+    assert decision.max_concurrent_children == 1
 
 
 def test_fallback_path_routes_to_parent() -> None:
@@ -247,7 +263,7 @@ def test_examples_render_clean_json() -> None:
     )
     payload = json.loads(proc.stdout)
     assert isinstance(payload, list)
-    assert len(payload) == 5
+    assert len(payload) == 6
     assert payload[0]["decision"]["lane"] == "gpt55_specialist"
 
 
@@ -260,7 +276,7 @@ def test_validate_flag_passes_and_returns_clean_json() -> None:
     )
     payload = json.loads(proc.stdout)
     assert payload["ok"] is True
-    assert payload["case_count"] == 5
+    assert payload["case_count"] == 6
 
 
 def test_integration_status_documents_doctrine_artifact_state() -> None:
@@ -272,11 +288,11 @@ def test_integration_status_documents_doctrine_artifact_state() -> None:
 
 def test_render_examples_matches_validation_examples() -> None:
     rendered = render_examples()
-    assert len(rendered) == 5
+    assert len(rendered) == 6
     assert rendered[1]["decision"]["lane"] == "codex_native_subagent"
 
 
 def test_run_validation_function_passes() -> None:
     result = run_validation()
     assert result["ok"] is True
-    assert len(result["results"]) == 5
+    assert len(result["results"]) == 6
