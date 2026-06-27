@@ -13,8 +13,10 @@ beforeAll(() => {
 const getGlobalModelInfo = vi.fn()
 const getGlobalModelOptions = vi.fn()
 const getAuxiliaryModels = vi.fn()
+const getMoaModels = vi.fn()
 const setModelAssignment = vi.fn()
 const getRecommendedDefaultModel = vi.fn()
+const saveMoaModels = vi.fn()
 const setEnvVar = vi.fn()
 const getHermesConfigRecord = vi.fn()
 const saveHermesConfig = vi.fn()
@@ -24,6 +26,8 @@ vi.mock('@/hermes', () => ({
   getGlobalModelInfo: () => getGlobalModelInfo(),
   getGlobalModelOptions: () => getGlobalModelOptions(),
   getAuxiliaryModels: () => getAuxiliaryModels(),
+  getMoaModels: () => getMoaModels(),
+  saveMoaModels: (body: unknown) => saveMoaModels(body),
   setModelAssignment: (body: unknown) => setModelAssignment(body),
   getRecommendedDefaultModel: (slug: string) => getRecommendedDefaultModel(slug),
   setEnvVar: (key: string, value: string) => setEnvVar(key, value),
@@ -61,7 +65,9 @@ beforeEach(() => {
     main: { provider: 'nous', model: 'hermes-4' },
     tasks: [{ task: 'vision', provider: 'auto', model: '', base_url: '' }]
   })
+  getMoaModels.mockResolvedValue({ presets: [], selected: '' })
   setModelAssignment.mockResolvedValue({ provider: 'nous', model: 'hermes-4', gateway_tools: [] })
+  saveMoaModels.mockResolvedValue({ ok: true })
   getRecommendedDefaultModel.mockResolvedValue({ provider: 'deepseek', model: 'deepseek-chat', free_tier: null })
   setEnvVar.mockResolvedValue({ ok: true })
   getHermesConfigRecord.mockResolvedValue({ agent: { reasoning_effort: 'medium', service_tier: 'normal' } })

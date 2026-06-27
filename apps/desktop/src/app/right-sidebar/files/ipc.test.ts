@@ -78,7 +78,7 @@ describe('readProjectDir', () => {
     const result = await readProjectDir('C:\\repo\\src', 'C:\\repo')
 
     expect(result.entries.map(entry => entry.name)).toEqual(['keep.ts'])
-    expect(gitRoot).toHaveBeenCalledWith('C:\\repo')
+    expect(gitRoot).toHaveBeenCalledWith('C:/repo')
     expect(readFileDataUrl).toHaveBeenCalledWith('C:/repo/.gitignore')
   })
 
