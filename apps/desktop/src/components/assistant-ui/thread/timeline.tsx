@@ -18,6 +18,16 @@ const HOVER_CLOSE_MS = 140
 const ROW_CLASS =
   'row-hover relative flex w-full min-w-0 max-w-full select-none overflow-hidden rounded-md px-2 py-1 text-left outline-hidden'
 
+function cssEscape(value: string): string {
+  const escape = globalThis.CSS?.escape
+
+  if (escape) {
+    return escape(value)
+  }
+
+  return value.replace(/[^a-zA-Z0-9_-]/g, char => `\\${char}`)
+}
+
 // Surface (border-color/bg/shadow/blur) comes from the shared
 // `[data-slot='thread-timeline-popover']` rule in styles.css, so it's 1:1 with
 // the dropdown/select/dialog menus. We only own layout + the border/radius here.
@@ -103,7 +113,7 @@ function jumpScroll(viewport: HTMLElement, top: number, duration = 170): void {
 
 function scrollToPrompt(id: string) {
   const viewport = document.querySelector<HTMLElement>(VIEWPORT)
-  const node = viewport?.querySelector<HTMLElement>(`[data-message-id="${CSS.escape(id)}"]`)
+  const node = viewport?.querySelector<HTMLElement>(`[data-message-id="${cssEscape(id)}"]`)
 
   if (!viewport || !node) {
     return
@@ -190,7 +200,7 @@ export const ThreadTimeline: FC = () => {
       const top = viewport.getBoundingClientRect().top
 
       const offsets = entries.map(entry => {
-        const node = viewport.querySelector<HTMLElement>(`[data-message-id="${CSS.escape(entry.id)}"]`)
+        const node = viewport.querySelector<HTMLElement>(`[data-message-id="${cssEscape(entry.id)}"]`)
 
         return node ? node.getBoundingClientRect().top - top : null
       })
