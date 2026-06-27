@@ -6,6 +6,8 @@ import sys
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from gateway import status
 
 
@@ -613,6 +615,7 @@ class TestGetProcessStartTime:
     so the guard isn't a Linux-only no-op.
     """
 
+    @pytest.mark.live_system_guard_bypass
     def test_live_process_is_stable_int(self):
         import subprocess
         import time
@@ -630,6 +633,7 @@ class TestGetProcessStartTime:
     def test_dead_pid_returns_none(self):
         assert status._get_process_start_time(999999999) is None
 
+    @pytest.mark.live_system_guard_bypass
     def test_psutil_fallback_when_no_proc(self, monkeypatch):
         """When /proc is missing (macOS/Windows), psutil supplies a stable int."""
         import subprocess
