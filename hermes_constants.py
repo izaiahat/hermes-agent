@@ -942,9 +942,77 @@ def apply_subprocess_home_env(env: dict[str, str]) -> None:
 VALID_REASONING_EFFORTS = (
     "minimal", "low", "medium", "high", "xhigh", "max", "ultra",
 )
+REASONING_EFFORT_ORDER = ("none",) + VALID_REASONING_EFFORTS
+
+# Provider-specific request validators are stricter than Hermes' global
+# vocabulary.  Keep this narrow: absent/unknown providers retain the global set
+# so custom endpoints are not blocked by guesses, while known OAuth backends get
+# clamped before they can persist a remotely-fatal config value.
+PROVIDER_REASONING_EFFORTS: dict[str, tuple[str, ...]] = {
+    "openai-codex": ("none", "minimal", "low", "medium", "high", "xhigh"),
+    "xai-oauth": ("none", "minimal", "low", "medium", "high", "xhigh"),
+    "github-copilot": ("none", "minimal", "low", "medium", "high", "xhigh"),
+    "copilot": ("none", "minimal", "low", "medium", "high", "xhigh"),
+    "kimi-coding": ("none", "low", "medium", "high"),
+    "kimi-coding-cn": ("none", "low", "medium", "high"),
+    "tokenhub": ("none", "low", "medium", "high"),
+}
 
 
-def parse_reasoning_effort(effort) -> dict | None:
+def reasoning_efforts_for_provider(
+    provider: str | None,
+    model: str | None = None,
+) -> tuple[str, ...]:
+    """Return the supported reasoning efforts for a provider/model pair.
+
+    Unknown providers return the global Hermes vocabulary (including ``max``)
+    to preserve custom-provider compatibility. GPT-5.6 Codex models also use
+    the full vocabulary: their ``ultra`` tier is normalized to the Responses
+    API wire value ``max`` by the Codex transport.
+    """
+    key = str(provider or "").strip().lower()
+    model_key = str(model or "").strip().lower()
+    if key == "openai-codex" and "gpt-5.6" in model_key:
+        return REASONING_EFFORT_ORDER
+    return PROVIDER_REASONING_EFFORTS.get(key, REASONING_EFFORT_ORDER)
+
+
+def clamp_reasoning_effort_for_provider(
+    effort: str | None,
+    provider: str | None,
+    model: str | None = None,
+) -> tuple[str | None, bool, tuple[str, ...]]:
+    """Clamp *effort* to the highest level supported by *provider*.
+
+    Returns ``(resolved_effort, was_clamped, supported_efforts)``. ``none`` is
+    preserved as the explicit off value; unknown/empty efforts return ``None``.
+    """
+    if effort is None:
+        return None, False, reasoning_efforts_for_provider(provider, model)
+    raw = str(effort).strip().lower()
+    if not raw:
+        return None, False, reasoning_efforts_for_provider(provider, model)
+    if raw in {"false", "disabled"}:
+        raw = "none"
+    supported = reasoning_efforts_for_provider(provider, model)
+    if raw not in REASONING_EFFORT_ORDER:
+        return None, False, supported
+    if raw in supported:
+        return raw, False, supported
+    # Pick the highest supported effort that is not above the requested level.
+    requested_idx = REASONING_EFFORT_ORDER.index(raw)
+    for candidate in reversed(REASONING_EFFORT_ORDER[: requested_idx + 1]):
+        if candidate in supported:
+            return candidate, True, supported
+    return supported[-1] if supported else None, True, supported
+
+
+def parse_reasoning_effort(
+    effort,
+    *,
+    provider: str | None = None,
+    model: str | None = None,
+) -> dict | None:
     """Parse a reasoning effort level into a config dict.
 
     Valid levels: "none", "minimal", "low", "medium", "high", "xhigh", "max",
@@ -966,6 +1034,16 @@ def parse_reasoning_effort(effort) -> dict | None:
     effort = effort.strip().lower()
     if effort in {"none", "false", "disabled"}:
         return {"enabled": False}
+    if provider:
+        effort, _clamped, _supported = clamp_reasoning_effort_for_provider(
+            effort,
+            provider,
+            model,
+        )
+        if effort == "none":
+            return {"enabled": False}
+        if not effort:
+            return None
     if effort in VALID_REASONING_EFFORTS:
         return {"enabled": True, "effort": effort}
     return None

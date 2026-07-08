@@ -309,6 +309,23 @@ class ResponsesApiTransport(ProviderTransport):
             # line 1 column 1"). Clamp Hermes' wider set to the supported one.
             _effort_clamp.update({"xhigh": "high", "ultra": "max"})
         reasoning_effort = _effort_clamp.get(reasoning_effort, reasoning_effort)
+        provider_name = params.get("provider") or (
+            "openai-codex" if is_codex_backend else ""
+        )
+        try:
+            from hermes_constants import clamp_reasoning_effort_for_provider
+
+            clamped_effort, _was_clamped, _supported = clamp_reasoning_effort_for_provider(
+                reasoning_effort,
+                provider_name,
+                model,
+            )
+            if clamped_effort and clamped_effort != "none":
+                reasoning_effort = clamped_effort
+            elif clamped_effort == "none":
+                reasoning_enabled = False
+        except Exception:
+            pass
 
         response_tools = _responses_tools(tools)
 

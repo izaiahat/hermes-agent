@@ -120,6 +120,50 @@ class TestConfigYamlRouting:
         env_content = _read_env(_isolated_hermes_home)
         assert "vercel_runtime: python3.13" in config
         assert "TERMINAL_VERCEL_RUNTIME=python3.13" in env_content
+    def test_reasoning_effort_clamps_to_active_codex_provider(self, _isolated_hermes_home, capsys):
+        (_isolated_hermes_home / "config.yaml").write_text(
+            "model:\n  provider: openai-codex\n"
+        )
+
+        set_config_value("agent.reasoning_effort", "max")
+
+        import yaml
+        reloaded = yaml.safe_load(_read_config(_isolated_hermes_home))
+        assert reloaded["agent"]["reasoning_effort"] == "xhigh"
+        assert "does not support" in capsys.readouterr().err
+
+    def test_delegation_reasoning_effort_clamps_to_delegation_provider(self, _isolated_hermes_home):
+        (_isolated_hermes_home / "config.yaml").write_text(
+            "model:\n  provider: anthropic\ndelegation:\n  provider: openai-codex\n"
+        )
+
+        set_config_value("delegation.reasoning_effort", "max")
+
+        import yaml
+        reloaded = yaml.safe_load(_read_config(_isolated_hermes_home))
+        assert reloaded["delegation"]["reasoning_effort"] == "xhigh"
+
+    def test_reasoning_effort_max_allowed_for_unknown_provider(self, _isolated_hermes_home):
+        (_isolated_hermes_home / "config.yaml").write_text(
+            "model:\n  provider: custom-provider\n"
+        )
+
+        set_config_value("agent.reasoning_effort", "max")
+
+        import yaml
+        reloaded = yaml.safe_load(_read_config(_isolated_hermes_home))
+        assert reloaded["agent"]["reasoning_effort"] == "max"
+
+    def test_reasoning_effort_ultra_allowed_for_gpt56_codex(self, _isolated_hermes_home):
+        (_isolated_hermes_home / "config.yaml").write_text(
+            "model:\n  provider: openai-codex\n  default: gpt-5.6-sol\n"
+        )
+
+        set_config_value("agent.reasoning_effort", "ultra")
+
+        import yaml
+        reloaded = yaml.safe_load(_read_config(_isolated_hermes_home))
+        assert reloaded["agent"]["reasoning_effort"] == "ultra"
 
 
 # ---------------------------------------------------------------------------
