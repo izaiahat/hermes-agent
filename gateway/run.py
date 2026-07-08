@@ -384,6 +384,11 @@ _GATEWAY_AUTH_ERROR_RE = re.compile(
 _GATEWAY_RATE_LIMIT_RE = re.compile(
     r"(rate\s+limit|rate-limited|\b429\b|quota|usage\s+limit)", re.IGNORECASE)
 
+# Requires the literal reasoning.effort token so it cannot shadow generic
+# auth/policy/rate-limit errors that merely say "invalid value". Retrying an
+# unchanged config value can never succeed, so the reply names the fix.
+_GATEWAY_CONFIG_INVALID_REQUEST_RE = re.compile(r"reasoning\.effort", re.IGNORECASE)
+
 # Connection-failure markers: the first 8 also anchor the provider-failure envelope shape below.
 _CONNECTION_ERROR_MARKERS = (
     r"(?:\w+\.)?(?:api\s*)?connection\s*(?:error|timeout)", r"(?:\w+\.)?connect\s*(?:error|timeout)",
@@ -579,6 +584,9 @@ def _format_exec_approval_fallback(
 
 # Ordered: auth beats policy beats rate-limit beats connection; first match wins.
 _PROVIDER_ERROR_REPLIES = (
+    (_GATEWAY_CONFIG_INVALID_REQUEST_RE,
+     "⚠️ The provider rejected a configuration value (`reasoning.effort`). Fix it in config.yaml "
+     "or run `hermes config set agent.reasoning_effort xhigh` — retrying unchanged will not help."),
     (_GATEWAY_AUTH_ERROR_RE, "⚠️ Provider authentication failed. Check the configured credentials; "
                              "raw provider details are in the gateway logs."),
     (_GATEWAY_PROVIDER_POLICY_RE, "⚠️ The model provider rejected the request. I kept the raw provider "
