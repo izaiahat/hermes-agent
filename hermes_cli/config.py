@@ -8035,6 +8035,58 @@ def set_config_value(key: str, value: str):
     elif value.replace('.', '', 1).isdigit():
         value = float(value)
 
+    _key_norm_for_reasoning = key.strip().lower()
+    if _key_norm_for_reasoning in {
+        "reasoning_effort",
+        "agent.reasoning_effort",
+        "delegation.reasoning_effort",
+    }:
+        try:
+            from hermes_constants import clamp_reasoning_effort_for_provider
+
+            # Validate against the active provider that will consume this
+            # config.  Delegation has its own provider override but falls back
+            # to the main model provider, matching runtime resolution.
+            active_cfg = load_config()
+            model_cfg = active_cfg.get("model", {}) if isinstance(active_cfg, dict) else {}
+            delegation_cfg = active_cfg.get("delegation", {}) if isinstance(active_cfg, dict) else {}
+            if _key_norm_for_reasoning.startswith("delegation."):
+                provider = (
+                    delegation_cfg.get("provider")
+                    or model_cfg.get("provider")
+                    or ""
+                )
+            else:
+                provider = model_cfg.get("provider") or ""
+
+            clamped, was_clamped, supported = clamp_reasoning_effort_for_provider(
+                str(value), provider
+            )
+            if clamped is None:
+                supported_list = ", ".join(supported)
+                print(
+                    f"Cannot set '{key}' to {value!r}: unknown reasoning effort. "
+                    f"Supported for provider '{provider or 'unknown'}': {supported_list}",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+            if was_clamped:
+                print(
+                    f"⚠️  Provider '{provider}' does not support reasoning_effort={value!r}; "
+                    f"saving {clamped!r} instead. Supported: {', '.join(supported)}",
+                    file=sys.stderr,
+                )
+                value = clamped
+        except SystemExit:
+            raise
+        except Exception as _reasoning_validate_exc:
+            logger.debug(
+                "reasoning_effort provider-aware validation skipped for %s=%r: %s",
+                key,
+                value,
+                _reasoning_validate_exc,
+            )
+
     _set_nested(user_config, key, value)
     # Normalize the api_base → base_url alias at set-time too (issue #8919),
     # so a fresh `hermes config set model.api_base ...` lands on the canonical

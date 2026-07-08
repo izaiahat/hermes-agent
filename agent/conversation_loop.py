@@ -108,6 +108,41 @@ def _image_error_max_dimension(error: Exception) -> Optional[int]:
     return None
 
 
+def _api_error_field(error: Exception, field: str) -> Optional[str]:
+    """Best-effort extraction of structured provider error fields."""
+    body = getattr(error, "body", None)
+    if isinstance(body, dict):
+        err = body.get("error") if isinstance(body.get("error"), dict) else body
+        value = err.get(field) if isinstance(err, dict) else None
+        if value is not None:
+            return str(value)
+    value = getattr(error, field, None)
+    if value is not None:
+        return str(value)
+    return None
+
+
+def _is_reasoning_effort_invalid_request(error: Exception) -> bool:
+    """True when the provider rejected ``reasoning.effort`` specifically."""
+    status = getattr(error, "status_code", None)
+    try:
+        if status is not None and int(status) != 400:
+            return False
+    except (TypeError, ValueError):
+        pass
+    param = (_api_error_field(error, "param") or "").strip().lower()
+    if param == "reasoning.effort":
+        return True
+    text_parts = [str(error)]
+    body = getattr(error, "body", None)
+    if body is not None:
+        text_parts.append(str(body))
+    text = "\n".join(text_parts).lower()
+    return "reasoning.effort" in text and (
+        "invalid_request_error" in text or "invalid value" in text
+    )
+
+
 def _env_int(name: str, default: int) -> int:
     try:
         return int(os.getenv(name, str(default)))
@@ -2597,6 +2632,48 @@ def run_conversation(
 
                 status_code = getattr(api_error, "status_code", None)
                 error_context = agent._extract_api_error_context(api_error)
+
+                # Provider rejected an otherwise locally-valid reasoning effort
+                # (notably openai-codex max → only xhigh). Clamp in-memory and
+                # retry once so one bad config write does not brick every turn.
+                if (
+                    _is_reasoning_effort_invalid_request(api_error)
+                    and not _retry.reasoning_effort_clamp_retry_attempted
+                ):
+                    _retry.reasoning_effort_clamp_retry_attempted = True
+                    try:
+                        from hermes_constants import clamp_reasoning_effort_for_provider
+
+                        current_effort = "medium"
+                        if isinstance(getattr(agent, "reasoning_config", None), dict):
+                            current_effort = (
+                                agent.reasoning_config.get("effort") or "medium"
+                            )
+                        clamped, was_clamped, supported = clamp_reasoning_effort_for_provider(
+                            current_effort,
+                            getattr(agent, "provider", "") or "",
+                        )
+                        if clamped and clamped != "none":
+                            agent.reasoning_config = {"enabled": True, "effort": clamped}
+                            agent._vprint(
+                                f"{agent.log_prefix}⚠️  Provider rejected reasoning.effort={current_effort!r}; "
+                                f"clamped to {clamped!r} and retrying once...",
+                                force=True,
+                            )
+                            logger.warning(
+                                "%sProvider rejected reasoning.effort=%r; clamped to %r for provider=%s supported=%s and retrying once",
+                                agent.log_prefix,
+                                current_effort,
+                                clamped,
+                                getattr(agent, "provider", "") or "unknown",
+                                ",".join(supported),
+                            )
+                            continue
+                    except Exception as _reasoning_clamp_exc:
+                        logger.debug(
+                            "reasoning.effort clamp recovery failed: %s",
+                            _reasoning_clamp_exc,
+                        )
 
                 # ── Classify the error for structured recovery decisions ──
                 _compressor = getattr(agent, "context_compressor", None)

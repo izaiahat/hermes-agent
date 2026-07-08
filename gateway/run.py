@@ -146,6 +146,11 @@ _GATEWAY_RATE_LIMIT_RE = re.compile(
     re.IGNORECASE,
 )
 
+_GATEWAY_CONFIG_INVALID_REQUEST_RE = re.compile(
+    r"(reasoning\.effort|invalid_request_error|invalid\s+value)",
+    re.IGNORECASE,
+)
+
 _GATEWAY_SECRET_PATTERNS = (
     re.compile(r"\bsk-[A-Za-z0-9][A-Za-z0-9_\-]{12,}\b"),
     re.compile(r"\bgh[pousr]_[A-Za-z0-9_]{20,}\b"),
@@ -355,6 +360,15 @@ def _redact_approval_command(cmd: "str | None") -> str:
 
 def _gateway_provider_error_reply(text: str) -> str:
     """Map raw provider/API errors to a short user-safe Telegram reply."""
+    if (
+        "reasoning.effort" in str(text or "").lower()
+        and _GATEWAY_CONFIG_INVALID_REQUEST_RE.search(text)
+    ):
+        return (
+            "⚠️ Provider rejected a configuration value (`reasoning.effort`). "
+            "Fix config.yaml or run `hermes config set agent.reasoning_effort xhigh`; "
+            "retrying unchanged won't help."
+        )
     if _GATEWAY_AUTH_ERROR_RE.search(text):
         return (
             "⚠️ Provider authentication failed. Check the configured credentials; "
