@@ -231,7 +231,7 @@ Primary references:
 - `~/.hermes/skills/delegation-routing-v2/SKILL.md`
 - `/home/ubuntu/business/reports/delegation-system-hardcoded-2026-04-25.md`
 
-When work in this repo involves deciding whether to keep execution in the parent, spawn a `gpt-5.5` specialist, use Codex CLI for long-context work, or launch a `gpt-5.4` orchestrator child, follow that router rather than ad-hoc judgment.
+When work in this repo involves deciding whether to keep execution in the parent, spawn a `gpt-5.6-sol` specialist, use Codex CLI for long-context work, or launch a `gpt-5.6-sol` orchestrator child, follow that router rather than ad-hoc judgment.
 
 ## Project Structure
 

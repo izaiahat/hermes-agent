@@ -30,7 +30,7 @@ def test_shared_state_routes_to_parent() -> None:
         )
     )
     assert decision.lane == "parent"
-    assert decision.model == "gpt-5.5"
+    assert decision.model == "gpt-5.6-sol"
     assert decision.max_concurrent_children == 1
 
 
@@ -69,7 +69,7 @@ def test_bounded_code_review_routes_to_gpt55() -> None:
         )
     )
     assert decision.lane == "gpt55_specialist"
-    assert decision.model == "gpt-5.5"
+    assert decision.model == "gpt-5.6-sol"
     assert decision.toolsets == ["file", "terminal"]
     assert decision.max_concurrent_children == 10
 
@@ -109,7 +109,7 @@ def test_exactly_five_files_routes_to_native_codex_subagent() -> None:
         )
     )
     assert decision.lane == "codex_native_subagent"
-    assert decision.model == "gpt-5.5"
+    assert decision.model == "gpt-5.6-sol"
     assert decision.provider == "openai-codex"
     assert decision.toolsets == ["file"]
     assert decision.max_concurrent_children == 5
@@ -157,7 +157,7 @@ def test_parallel_mixed_subtask_sizes_routes_to_native_codex_children() -> None:
     )
     assert decision.lane == "parallel_fanout"
     assert decision.child_lane == "codex_native_subagent"
-    assert decision.child_model == "gpt-5.5"
+    assert decision.child_model == "gpt-5.6-sol"
     assert decision.child_toolsets == ["file"]
     assert decision.max_concurrent_children == 5
 
@@ -199,7 +199,7 @@ def test_multi_domain_routes_to_gpt55_orchestrator() -> None:
         )
     )
     assert decision.lane == "gpt55_orchestrator_cli"
-    assert decision.model == "gpt-5.5"
+    assert decision.model == "gpt-5.6-sol"
     assert decision.role == "orchestrator"
     assert decision.max_concurrent_children == 2
 

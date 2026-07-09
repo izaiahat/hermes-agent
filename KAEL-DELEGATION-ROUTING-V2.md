@@ -3,10 +3,10 @@
 This fork carries a hardcoded Kael routing helper at `scripts/kael_delegation_router.py`.
 
 It is not generic theory. It encodes the live lane split Kael is supposed to use in this environment:
-- parent on `gpt-5.4`
-- bounded specialist leaves on `gpt-5.5`
+- parent on `gpt-5.6-sol`
+- bounded specialist leaves on `gpt-5.6-sol`
 - long-context clean-room probes via Codex CLI
-- multi-domain local synthesis via `gpt-5.4` orchestrator CLI children
+- multi-domain local synthesis via `gpt-5.6-sol` orchestrator CLI children
 
 ## Live doctrine pointers
 - Live skill: `~/.hermes/skills/delegation-routing-v2/SKILL.md`
@@ -19,14 +19,14 @@ It is not generic theory. It encodes the live lane split Kael is supposed to use
 
 ### 1. Parent
 - lane: `parent`
-- model: `gpt-5.4`
+- model: `gpt-5.6-sol`
 - provider: `openai-codex`
 - keeps: `STATE.md` writes, final synthesis, ship/no-ship judgments, irreversible actions
 - rule: never delegate work that fits in 1-2 tool calls
 
-### 2. gpt-5.5 specialist leaf
+### 2. gpt-5.6-sol specialist leaf
 - lane: `gpt55_specialist`
-- model: `gpt-5.5`
+- model: `gpt-5.6-sol`
 - provider: `openai-codex`
 - role: `leaf`
 - best for: bounded reasoning, code review, structured JSON/markdown output, classification, summarization, inspection
@@ -46,14 +46,14 @@ It is not generic theory. It encodes the live lane split Kael is supposed to use
   - json → `codex exec --skip-git-repo-check --sandbox read-only --ephemeral --json '<prompt>'`
 - failure policy: retry with alternate sandbox mode if appropriate
 
-### 4. gpt-5.4 orchestrator CLI child
+### 4. gpt-5.6-sol orchestrator CLI child
 - lane: `gpt54_orchestrator_cli`
-- model: `gpt-5.4`
+- model: `gpt-5.6-sol`
 - provider: `openai-codex`
 - role: `orchestrator`
 - best for: 2+ broad domains that each need local synthesis before parent judgment
 - command:
-  - `hermes chat --provider openai-codex --model gpt-5.4 -s delegation-routing-v2 -Q -q '<self-contained orchestrator prompt>'`
+  - `hermes chat --provider openai-codex --model gpt-5.6-sol -s delegation-routing-v2 -Q -q '<self-contained orchestrator prompt>'`
 
 ## Hardcoded routing rules
 Apply in this order:
@@ -72,11 +72,11 @@ Why `F` and `E` are checked before `D`: once decomposition is explicit, Kael sho
 - `max_concurrent_children=10`
 - `max_spawn_depth=3`
 - research bursts: spawn all immediately and supervise in parallel
-- code review across many independent files: 1 `gpt-5.5` leaf per file when each file is bounded
-- architecture decisions spanning multiple domains: 1 `gpt-5.4` orchestrator CLI child per domain, with leaves beneath it
+- code review across many independent files: 1 `gpt-5.6-sol` leaf per file when each file is bounded
+- architecture decisions spanning multiple domains: 1 `gpt-5.6-sol` orchestrator CLI child per domain, with leaves beneath it
 
 ## Failure recovery
-- `gpt-5.5` timeout → retry once, then mark partial and continue
+- `gpt-5.6-sol` timeout → retry once, then mark partial and continue
 - Codex CLI failure → inspect sandbox mode and retry with alternate sandbox when appropriate
 - native `delegate_task` failure → fall back to `terminal + hermes chat`
 - bad child output → do not trust silently; add a follow-up lane and annotate the gap
@@ -89,10 +89,10 @@ cd ~/.hermes/hermes-agent
 ./scripts/kael_delegation_router.py --examples
 ```
 
-### One-shot gpt-5.5 leaf
+### One-shot gpt-5.6-sol leaf
 ```bash
 # from a live Kael session
-# delegate_task(goal="Reply exactly CHILD_OK", model={provider:"openai-codex", model:"gpt-5.5"}, toolsets=[])
+# delegate_task(goal="Reply exactly CHILD_OK", model={provider:"openai-codex", model:"gpt-5.6-sol"}, toolsets=[])
 ```
 
 ### Codex CLI long-context lane
@@ -101,10 +101,10 @@ cd ~/.hermes/hermes-agent
 codex exec --skip-git-repo-check --sandbox read-only --ephemeral "Reply exactly CODEX_OK"
 ```
 
-### gpt-5.4 orchestrator CLI lane
+### gpt-5.6-sol orchestrator CLI lane
 ```bash
 cd ~/.hermes/hermes-agent
-hermes chat --provider openai-codex --model gpt-5.4 -s delegation-routing-v2 -Q -q "Reply exactly ORCHESTRATOR_OK"
+hermes chat --provider openai-codex --model gpt-5.6-sol -s delegation-routing-v2 -Q -q "Reply exactly ORCHESTRATOR_OK"
 ```
 
 ## Worked examples
