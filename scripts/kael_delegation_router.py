@@ -28,7 +28,7 @@ FAILURE_RECOVERY = {
     "gpt55_timeout": "retry once with the same prompt, then mark partial and continue",
     "native_codex_failure": (
         "stop new Codex spawns, capture the Cloudflare / rate-limit error, and "
-        "fall back to safe gpt-5.5 leaves unless the operator explicitly requests "
+        "fall back to safe gpt-5.6-sol leaves unless the operator explicitly requests "
         "a Codex retry"
     ),
     "delegate_task_failure": "fall back to terminal+hermes chat shell-out",
@@ -37,7 +37,7 @@ FAILURE_RECOVERY = {
 
 PARENT = {
     "lane": "parent",
-    "model": "gpt-5.5",
+    "model": "gpt-5.6-sol",
     "provider": "openai-codex",
     "role": "parent",
     "max_context_tokens": 272_000,
@@ -52,7 +52,7 @@ PARENT = {
 
 GPT55_SPECIALIST = {
     "lane": "gpt55_specialist",
-    "model": "gpt-5.5",
+    "model": "gpt-5.6-sol",
     "provider": "openai-codex",
     "role": "leaf",
     "max_context_tokens": 272_000,
@@ -67,7 +67,7 @@ GPT55_SPECIALIST = {
 
 CODEX_NATIVE = {
     "lane": "codex_native_subagent",
-    "model": "gpt-5.5",
+    "model": "gpt-5.6-sol",
     "provider": "openai-codex",
     "role": "leaf",
     "api_mode": "codex_responses",
@@ -86,13 +86,13 @@ CODEX_NATIVE = {
 
 GPT55_ORCHESTRATOR = {
     "lane": "gpt55_orchestrator_cli",
-    "model": "gpt-5.5",
+    "model": "gpt-5.6-sol",
     "provider": "openai-codex",
     "role": "orchestrator",
     "max_context_tokens": 272_000,
     "timeout_seconds": 600,
     "command": (
-        "hermes chat --provider openai-codex --model gpt-5.5 "
+        "hermes chat --provider openai-codex --model gpt-5.6-sol "
         "-s delegation-routing-v2 -Q -q '<self-contained orchestrator prompt>'"
     ),
     "spawn_pattern": "terminal(command='hermes chat ...')",
@@ -405,7 +405,7 @@ def route_task(profile: TaskProfile) -> RoutingDecision:
     4. Broad-domain orchestrator topology
     5. Parallel topology
     6. Large-corpus native Codex lane
-    7. Bounded gpt-5.5 specialist
+    7. Bounded gpt-5.6-sol specialist
     8. Parent fallback
     """
     if profile.shared_state_write or profile.irreversible_action:
@@ -500,7 +500,7 @@ def route_task(profile: TaskProfile) -> RoutingDecision:
         return make_gpt55(
             profile.task_type,
             [
-                "C: bounded reasoning / structured output under 200k routes to gpt-5.5 specialist"
+                "C: bounded reasoning / structured output under 200k routes to gpt-5.6-sol specialist"
             ],
         )
 
@@ -563,14 +563,14 @@ def validation_cases() -> list[ValidationCase]:
             profile=example_profiles()[0],
             expected_lane="gpt55_specialist",
             expected_max_concurrent_children=10,
-            expected_model="gpt-5.5",
+            expected_model="gpt-5.6-sol",
         ),
         ValidationCase(
             name="large_corpus_native_codex",
             profile=example_profiles()[1],
             expected_lane="codex_native_subagent",
             expected_max_concurrent_children=5,
-            expected_model="gpt-5.5",
+            expected_model="gpt-5.6-sol",
         ),
         ValidationCase(
             name="parallel_small_file_audits",
@@ -584,14 +584,14 @@ def validation_cases() -> list[ValidationCase]:
             profile=example_profiles()[3],
             expected_lane="parent",
             expected_max_concurrent_children=1,
-            expected_model="gpt-5.5",
+            expected_model="gpt-5.6-sol",
         ),
         ValidationCase(
             name="multi_domain_orchestrator",
             profile=example_profiles()[4],
             expected_lane="gpt55_orchestrator_cli",
             expected_max_concurrent_children=2,
-            expected_model="gpt-5.5",
+            expected_model="gpt-5.6-sol",
         ),
         ValidationCase(
             name="claude_design_verifier",
