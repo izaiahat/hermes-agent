@@ -965,15 +965,18 @@ def reasoning_efforts_for_provider(
 ) -> tuple[str, ...]:
     """Return the supported reasoning efforts for a provider/model pair.
 
-    Unknown providers return the global Hermes vocabulary (including ``max``)
-    to preserve custom-provider compatibility. GPT-5.6 Codex models also use
-    the full vocabulary: their ``ultra`` tier is normalized to the Responses
-    API wire value ``max`` by the Codex transport.
+    OpenAI Codex publishes model-specific ladders. GPT-5.6 Sol and Terra expose
+    ``ultra``; Luna tops out at ``max``; older or unknown Codex models retain
+    the conservative ``xhigh`` ceiling. Unknown providers keep the global
+    Hermes vocabulary to preserve custom-provider compatibility.
     """
     key = str(provider or "").strip().lower()
-    model_key = str(model or "").strip().lower()
-    if key == "openai-codex" and "gpt-5.6" in model_key:
-        return REASONING_EFFORT_ORDER
+    model_key = str(model or "").strip().lower().split("/", 1)[-1]
+    if key == "openai-codex":
+        if model_key in {"gpt-5.6-sol", "gpt-5.6-terra"}:
+            return REASONING_EFFORT_ORDER
+        if model_key == "gpt-5.6-luna":
+            return tuple(level for level in REASONING_EFFORT_ORDER if level != "ultra")
     return PROVIDER_REASONING_EFFORTS.get(key, REASONING_EFFORT_ORDER)
 
 
