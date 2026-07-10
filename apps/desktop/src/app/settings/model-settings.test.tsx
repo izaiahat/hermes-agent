@@ -86,7 +86,12 @@ afterEach(() => {
 
 async function renderModelSettings() {
   const { ModelSettings } = await import('./model-settings')
-  const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+  const client = new QueryClient({
+    defaultOptions: {
+      queries: { retry: false },
+      mutations: { retry: false }
+    }
+  })
 
   return render(
     // The aux-task deep-link highlight reads useSearchParams, so the page
