@@ -11,9 +11,9 @@ class FakeProviderError(Exception):
         self.body = body
 
 
-def test_openai_codex_clamps_max_to_xhigh():
+def test_openai_codex_legacy_model_clamps_max_to_xhigh():
     effort, was_clamped, supported = clamp_reasoning_effort_for_provider(
-        "max", "openai-codex"
+        "max", "openai-codex", "gpt-5.5"
     )
 
     assert effort == "xhigh"
@@ -42,6 +42,16 @@ def test_gpt56_codex_preserves_ultra_and_emits_max_wire_effort():
     assert kwargs["reasoning"]["effort"] == "max"
 
 
+def test_openai_codex_gpt56_luna_clamps_ultra_to_max():
+    effort, was_clamped, supported = clamp_reasoning_effort_for_provider(
+        "ultra", "openai-codex", "gpt-5.6-luna"
+    )
+
+    assert effort == "max"
+    assert was_clamped is True
+    assert "ultra" not in supported
+
+
 def test_codex_responses_transport_never_emits_max_for_codex_backend():
     kwargs = ResponsesApiTransport().build_kwargs(
         "gpt-5.5",
@@ -53,6 +63,16 @@ def test_codex_responses_transport_never_emits_max_for_codex_backend():
     )
 
     assert kwargs["reasoning"]["effort"] == "xhigh"
+
+
+def test_unknown_provider_retains_global_ultra_support():
+    effort, was_clamped, supported = clamp_reasoning_effort_for_provider(
+        "ultra", "custom-provider", "custom-model"
+    )
+
+    assert effort == "ultra"
+    assert was_clamped is False
+    assert "ultra" in supported
 
 
 def test_reasoning_effort_bad_request_detector_reads_structured_param():
