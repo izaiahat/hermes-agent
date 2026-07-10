@@ -1083,6 +1083,12 @@ def create_job(
     if normalized_attach is not None:
         job["attach_to_session"] = normalized_attach
 
+    # Default-profile creation gate for every native Discord delivery and
+    # deliver=local script that posts directly. The guard is a no-op for other
+    # Hermes profiles and for non-channel jobs.
+    from cron.lifecycle_guard import check_cron_discord_output
+    check_cron_discord_output(job)
+
     with _jobs_lock():
         jobs = load_jobs()
         jobs.append(job)
@@ -1240,6 +1246,11 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
                         f"(grace window: {ONESHOT_GRACE_SECONDS}s) and cannot be scheduled."
                     )
                 updated["next_run_at"] = next_run
+
+            # Re-run the same declaration gate on edits/resumes so an update
+            # cannot remove the marker, fixture declaration, or routing class.
+            from cron.lifecycle_guard import check_cron_discord_output
+            check_cron_discord_output(updated)
 
             jobs[i] = updated
             save_jobs(jobs)
