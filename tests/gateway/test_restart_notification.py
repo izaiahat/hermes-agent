@@ -246,6 +246,30 @@ async def test_sethome_preserves_thread_target_for_same_process_restart(tmp_path
 # ── home-channel startup notifications ─────────────────────────────────────
 
 
+def test_restart_cause_summary_uses_latest_pid_lifecycle(tmp_path, monkeypatch):
+    import hermes_constants
+
+    monkeypatch.setattr(hermes_constants, "get_hermes_home", lambda: tmp_path)
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+    events = [
+        {"pid": 4242, "tag": "gateway.start", "ts": "old-start"},
+        {"pid": 4242, "tag": "asyncio.run.returned", "success": True, "ts": "old-exit"},
+        {"pid": 4242, "tag": "gateway.start", "ts": "new-start"},
+    ]
+    (log_dir / "gateway-exit-diag.log").write_text(
+        "".join(f"{json.dumps(event)}\n" for event in events),
+        encoding="utf-8",
+    )
+
+    runner, _adapter = make_restart_runner()
+    summary = runner._restart_cause_summary()
+
+    assert "pid 4242" in summary
+    assert "hard kill likely" in summary
+    assert "old-exit" not in summary
+
+
 @pytest.mark.asyncio
 async def test_send_home_channel_startup_notification_to_configured_home(tmp_path, monkeypatch):
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)

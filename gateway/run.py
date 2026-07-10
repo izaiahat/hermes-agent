@@ -14614,51 +14614,50 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             notify_path.unlink(missing_ok=True)
 
     def _restart_cause_summary(self) -> str:
-        """Best-effort one-liner describing why the previous instance exited.
-
-        Reads the exit-path diagnostics log written by ``hermes_cli.gateway``
-        (``logs/gateway-exit-diag.log``) and summarizes the previous pid's
-        last lifecycle events. A previous instance with a ``gateway.start``
-        but no exit record was almost certainly hard-killed (SIGKILL after
-        stop-timeout, OOM, or host reset). Never raises.
-        """
+        """Summarize the previous gateway lifecycle when diagnostics exist."""
         try:
             import json as _json
+            from collections import deque
 
             from hermes_constants import get_hermes_home
 
             diag = get_hermes_home() / "logs" / "gateway-exit-diag.log"
             if not diag.exists():
-                return "restart cause: unknown (no exit-diag log)"
+                return ""
             events: list[dict] = []
             with diag.open(encoding="utf-8", errors="replace") as f:
-                for line in f.readlines()[-80:]:
-                    try:
-                        events.append(_json.loads(line))
-                    except Exception:
-                        continue
-            prev = [e for e in events if e.get("pid") != os.getpid()]
-            if not prev:
-                return "restart cause: unknown (no prior lifecycle records)"
-            # Events of the most recent previous instance only.
-            prev_pid = prev[-1].get("pid")
-            prev = [e for e in prev if e.get("pid") == prev_pid]
-            exits = [e for e in prev if e.get("tag") != "gateway.start"]
+                lines = deque(f, maxlen=80)
+            for line in lines:
+                try:
+                    events.append(_json.loads(line))
+                except Exception:
+                    continue
+            previous = [event for event in events if event.get("pid") != os.getpid()]
+            if not previous:
+                return ""
+
+            previous_pid = previous[-1].get("pid")
+            lifecycle = [event for event in previous if event.get("pid") == previous_pid]
+            starts = [index for index, event in enumerate(lifecycle) if event.get("tag") == "gateway.start"]
+            if starts:
+                lifecycle = lifecycle[starts[-1] :]
+            exits = [event for event in lifecycle if event.get("tag") != "gateway.start"]
             if not exits:
                 return (
-                    f"restart cause: previous instance (pid {prev_pid}) left no exit "
+                    f"restart cause: previous instance (pid {previous_pid}) left no exit "
                     "record — hard kill likely (stop-timeout SIGKILL/OOM/host reset)"
                 )
+
             last = exits[-1]
             detail = ""
             if last.get("tag") == "asyncio.run.returned":
                 detail = f" success={last.get('success')}"
             return (
-                f"restart cause: prev pid {prev_pid} last event "
+                f"restart cause: prev pid {previous_pid} last event "
                 f"{last.get('tag')}{detail} at {last.get('ts')}"
             )
         except Exception:
-            return "restart cause: unavailable"
+            return ""
 
     async def _send_home_channel_startup_notifications(
         self,
@@ -14673,10 +14672,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """
         delivered: set[tuple[str, str, Optional[str]]] = set()
         skipped = skip_targets or set()
-        message = (
-            "♻️ Gateway online — Hermes is back and ready.\n"
-            f"{self._restart_cause_summary()}"
-        )
+        cause = self._restart_cause_summary()
+        message = "♻️ Gateway online — Hermes is back and ready."
+        if cause:
+            message = f"{message}\n{cause}"
 
         for platform, adapter in self.adapters.items():
             home = self.config.get_home_channel(platform)
