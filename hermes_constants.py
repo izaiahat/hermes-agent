@@ -791,11 +791,19 @@ def apply_subprocess_home_env(env: dict[str, str]) -> None:
         env["HOME"] = home
 
 
-VALID_REASONING_EFFORTS = ("minimal", "low", "medium", "high", "xhigh", "max")
+VALID_REASONING_EFFORTS = (
+    "minimal",
+    "low",
+    "medium",
+    "high",
+    "xhigh",
+    "max",
+    "ultra",
+)
 REASONING_EFFORT_ORDER = ("none",) + VALID_REASONING_EFFORTS
 
 # Provider-specific request validators are stricter than Hermes' global
-# vocabulary.  Keep this narrow: absent/unknown providers retain the global set
+# vocabulary. Keep this narrow: absent/unknown providers retain the global set
 # so custom endpoints are not blocked by guesses, while known OAuth backends get
 # clamped before they can persist a remotely-fatal config value.
 PROVIDER_REASONING_EFFORTS: dict[str, tuple[str, ...]] = {
@@ -809,33 +817,45 @@ PROVIDER_REASONING_EFFORTS: dict[str, tuple[str, ...]] = {
 }
 
 
-def reasoning_efforts_for_provider(provider: str | None) -> tuple[str, ...]:
-    """Return the supported reasoning efforts for a known provider.
+def reasoning_efforts_for_provider(
+    provider: str | None,
+    model: str | None = None,
+) -> tuple[str, ...]:
+    """Return supported reasoning efforts for a provider/model pair.
 
-    Unknown providers return the global Hermes vocabulary (including ``max``)
-    to preserve custom-provider compatibility.
+    OpenAI Codex publishes model-specific ladders. GPT-5.6 Sol and Terra expose
+    ``ultra``; Luna tops out at ``max``; older or unknown Codex models retain the
+    conservative ``xhigh`` ceiling. Unknown providers keep the global Hermes
+    vocabulary to preserve custom-provider compatibility.
     """
     key = str(provider or "").strip().lower()
+    normalized_model = str(model or "").strip().lower().split("/", 1)[-1]
+    if key == "openai-codex":
+        if normalized_model in {"gpt-5.6-sol", "gpt-5.6-terra"}:
+            return REASONING_EFFORT_ORDER
+        if normalized_model == "gpt-5.6-luna":
+            return tuple(level for level in REASONING_EFFORT_ORDER if level != "ultra")
     return PROVIDER_REASONING_EFFORTS.get(key, REASONING_EFFORT_ORDER)
 
 
 def clamp_reasoning_effort_for_provider(
     effort: str | None,
     provider: str | None,
+    model: str | None = None,
 ) -> tuple[str | None, bool, tuple[str, ...]]:
-    """Clamp *effort* to the highest level supported by *provider*.
+    """Clamp *effort* to the highest level supported by *provider* and *model*.
 
     Returns ``(resolved_effort, was_clamped, supported_efforts)``. ``none`` is
     preserved as the explicit off value; unknown/empty efforts return ``None``.
     """
     if effort is None:
-        return None, False, reasoning_efforts_for_provider(provider)
+        return None, False, reasoning_efforts_for_provider(provider, model)
     raw = str(effort).strip().lower()
     if not raw:
-        return None, False, reasoning_efforts_for_provider(provider)
+        return None, False, reasoning_efforts_for_provider(provider, model)
     if raw in {"false", "disabled"}:
         raw = "none"
-    supported = reasoning_efforts_for_provider(provider)
+    supported = reasoning_efforts_for_provider(provider, model)
     if raw not in REASONING_EFFORT_ORDER:
         return None, False, supported
     if raw in supported:
@@ -848,16 +868,21 @@ def clamp_reasoning_effort_for_provider(
     return supported[-1] if supported else None, True, supported
 
 
-def parse_reasoning_effort(effort, *, provider: str | None = None) -> dict | None:
+def parse_reasoning_effort(
+    effort,
+    *,
+    provider: str | None = None,
+    model: str | None = None,
+) -> dict | None:
     """Parse a reasoning effort level into a config dict.
 
-    Valid levels: "none", "minimal", "low", "medium", "high", "xhigh", "max".
-    Returns None when the input is empty or unrecognized (caller uses default).
-    Returns {"enabled": False} for "none" (aliases: "false", "disabled", and
-    YAML boolean False — users write ``reasoning_effort: false``/``off``/``no``
-    in config.yaml and YAML hands us a bool, which must mean disabled, not
-    "fall back to the default and keep thinking").
-    Returns {"enabled": True, "effort": <level>} for valid effort levels.
+    Valid levels: "none", "minimal", "low", "medium", "high", "xhigh", "max",
+    and "ultra". Returns None when the input is empty or unrecognized (caller
+    uses default). Returns {"enabled": False} for "none" (aliases: "false",
+    "disabled", and YAML boolean False — users write ``reasoning_effort:
+    false``/``off``/``no`` in config.yaml and YAML hands us a bool, which must
+    mean disabled, not "fall back to the default and keep thinking"). Returns
+    {"enabled": True, "effort": <level>} for valid effort levels.
     """
     if effort is False:
         return {"enabled": False}
@@ -870,7 +895,9 @@ def parse_reasoning_effort(effort, *, provider: str | None = None) -> dict | Non
     if effort in {"none", "false", "disabled"}:
         return {"enabled": False}
     if provider:
-        effort, _clamped, _supported = clamp_reasoning_effort_for_provider(effort, provider)
+        effort, _clamped, _supported = clamp_reasoning_effort_for_provider(
+            effort, provider, model
+        )
         if effort == "none":
             return {"enabled": False}
         if not effort:

@@ -8056,11 +8056,17 @@ def set_config_value(key: str, value: str):
                     or model_cfg.get("provider")
                     or ""
                 )
+                reasoning_model = (
+                    delegation_cfg.get("model")
+                    or model_cfg.get("default")
+                    or ""
+                )
             else:
                 provider = model_cfg.get("provider") or ""
+                reasoning_model = model_cfg.get("default") or ""
 
             clamped, was_clamped, supported = clamp_reasoning_effort_for_provider(
-                str(value), provider
+                str(value), provider, reasoning_model
             )
             if clamped is None:
                 supported_list = ", ".join(supported)

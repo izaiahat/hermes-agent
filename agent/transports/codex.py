@@ -173,6 +173,7 @@ class ResponsesApiTransport(ProviderTransport):
             clamped_effort, _was_clamped, _supported = clamp_reasoning_effort_for_provider(
                 reasoning_effort,
                 provider_name,
+                model,
             )
             if clamped_effort and clamped_effort != "none":
                 reasoning_effort = clamped_effort

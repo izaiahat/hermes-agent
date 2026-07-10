@@ -2652,6 +2652,7 @@ def run_conversation(
                         clamped, was_clamped, supported = clamp_reasoning_effort_for_provider(
                             current_effort,
                             getattr(agent, "provider", "") or "",
+                            getattr(agent, "model", "") or "",
                         )
                         if clamped and clamped != "none":
                             agent.reasoning_config = {"enabled": True, "effort": clamped}
