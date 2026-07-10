@@ -9,19 +9,28 @@ anchored on concrete command identifiers — so they cannot fire on prose. Defen
 
 from __future__ import annotations
 
+import importlib.util
 import logging
 import os
 import re
 import shlex
 import stat
 from pathlib import Path
-from typing import Callable, Iterator, Optional
+from typing import Any, Callable, Iterator, Optional
 
 logger = logging.getLogger(__name__)
 
 
 class GatewayLifecycleBlocked(ValueError):
     """Raised when a cron job spec contains a gateway-lifecycle command."""
+
+
+class CronDiscordOutputBlocked(ValueError):
+    """Raised when a default-profile channel-output job lacks its declaration."""
+
+
+_DISCORD_OUTPUT_GUARD = Path('/home/ubuntu/business/ops/cron_discord_output_guard.py')
+_DEFAULT_HERMES_HOME = Path('/home/ubuntu/.hermes')
 
 
 # Shell-level command shapes that target the gateway lifecycle; each branch is anchored on a
@@ -1042,4 +1051,32 @@ def check_gateway_lifecycle(prompt: Optional[str], script: Optional[str] = None)
             "SIGTERM-respawn loops under launchd/systemd supervision "
             "(#30719). Run `hermes gateway restart` from a shell outside "
             "the running gateway instead."
+        )
+
+
+
+def check_cron_discord_output(job: dict[str, Any]) -> None:
+    """Run the house-style creation/update gate for the default profile only."""
+    from hermes_constants import get_hermes_home
+
+    if get_hermes_home().resolve() != _DEFAULT_HERMES_HOME.resolve():
+        return
+    if not _DISCORD_OUTPUT_GUARD.is_file():
+        if str(job.get('deliver') or '').startswith('discord'):
+            raise CronDiscordOutputBlocked(
+                'Blocked: Discord-output creation guard is unavailable for the default profile.'
+            )
+        return
+    spec = importlib.util.spec_from_file_location(
+        '_hermes_cron_discord_output_guard', _DISCORD_OUTPUT_GUARD
+    )
+    if spec is None or spec.loader is None:
+        raise CronDiscordOutputBlocked('Blocked: unable to load Discord-output creation guard.')
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    failures = module.validate_creation_job(job)
+    if failures:
+        raise CronDiscordOutputBlocked(
+            'Blocked: channel-output cron failed CRON_DISCORD_HOUSE_STYLE_V1 creation gate: '
+            + '; '.join(failures)
         )

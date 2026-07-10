@@ -1860,6 +1860,12 @@ def create_job(
         if value is not None:
             job[key] = value
 
+    # Default-profile creation gate for every native Discord delivery and
+    # deliver=local script that posts directly. A no-op for other Hermes
+    # profiles and for non-channel jobs.
+    from cron.lifecycle_guard import check_cron_discord_output
+    check_cron_discord_output(job)
+
     with _jobs_lock():
         save_jobs(load_jobs() + [job])
     return job
@@ -2055,6 +2061,12 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
             updated["provider_snapshot"], updated["model_snapshot"] = snapshots
         _fill_missing_next_run(updated)
         _reject_terminal_activation(job, updated, job_id)
+
+        # Re-run the same declaration gate on edits/resumes so an update cannot
+        # remove the marker, fixture declaration, or routing class.
+        from cron.lifecycle_guard import check_cron_discord_output
+        check_cron_discord_output(updated)
+
         jobs[i] = updated
         save_jobs(jobs)
         return _normalize_job_record(updated)
