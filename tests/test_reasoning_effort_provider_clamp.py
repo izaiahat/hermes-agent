@@ -21,14 +21,14 @@ def test_openai_codex_legacy_model_clamps_max_to_xhigh():
     assert "max" not in supported
 
 
-def test_gpt56_codex_preserves_ultra_and_emits_max_wire_effort():
+def test_gpt56_codex_clamps_ultra_to_xhigh():
     effort, was_clamped, supported = clamp_reasoning_effort_for_provider(
         "ultra", "openai-codex", "gpt-5.6-sol"
     )
 
-    assert effort == "ultra"
-    assert was_clamped is False
-    assert "max" in supported
+    assert effort == "xhigh"
+    assert was_clamped is True
+    assert "ultra" not in supported
 
     kwargs = ResponsesApiTransport().build_kwargs(
         "gpt-5.6-sol",
@@ -39,15 +39,15 @@ def test_gpt56_codex_preserves_ultra_and_emits_max_wire_effort():
         is_codex_backend=True,
     )
 
-    assert kwargs["reasoning"]["effort"] == "max"
+    assert kwargs["reasoning"]["effort"] == "xhigh"
 
 
-def test_openai_codex_gpt56_luna_clamps_ultra_to_max():
+def test_openai_codex_gpt56_luna_clamps_ultra_to_xhigh():
     effort, was_clamped, supported = clamp_reasoning_effort_for_provider(
         "ultra", "openai-codex", "gpt-5.6-luna"
     )
 
-    assert effort == "max"
+    assert effort == "xhigh"
     assert was_clamped is True
     assert "ultra" not in supported
 
