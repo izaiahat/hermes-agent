@@ -154,7 +154,7 @@ class TestConfigYamlRouting:
         reloaded = yaml.safe_load(_read_config(_isolated_hermes_home))
         assert reloaded["agent"]["reasoning_effort"] == "max"
 
-    def test_reasoning_effort_ultra_allowed_for_gpt56_codex(self, _isolated_hermes_home):
+    def test_reasoning_effort_ultra_clamped_for_gpt56_codex(self, _isolated_hermes_home):
         (_isolated_hermes_home / "config.yaml").write_text(
             "model:\n  provider: openai-codex\n  default: gpt-5.6-sol\n"
         )
@@ -163,7 +163,7 @@ class TestConfigYamlRouting:
 
         import yaml
         reloaded = yaml.safe_load(_read_config(_isolated_hermes_home))
-        assert reloaded["agent"]["reasoning_effort"] == "ultra"
+        assert reloaded["agent"]["reasoning_effort"] == "xhigh"
 
 
 # ---------------------------------------------------------------------------
