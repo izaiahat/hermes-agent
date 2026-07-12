@@ -17,7 +17,7 @@ import uuid
 from pathlib import Path
 from datetime import datetime, timedelta
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -2310,6 +2310,7 @@ class SessionStore:
         messages: List[Dict[str, Any]],
         *,
         active_only: bool = False,
+        expected_active_revision: Optional[Tuple[int, int]] = None,
     ) -> bool:
         """Replace the entire transcript for a session with new messages.
 
@@ -2326,12 +2327,13 @@ class SessionStore:
         if not self._db:
             return True
         try:
-            self._db.replace_messages(
-                session_id,
-                messages,
-                active_only=active_only,
-            )
-            return True
+            kwargs: Dict[str, Any] = {"active_only": active_only}
+            if expected_active_revision is not None:
+                kwargs["expected_active_revision"] = expected_active_revision
+            result = self._db.replace_messages(session_id, messages, **kwargs)
+            # Older/fake DB adapters returned None on success. Only an explicit
+            # False is a CAS refusal.
+            return result is not False
         except Exception as e:
             logger.debug("Failed to rewrite transcript in DB: %s", e)
             return False
@@ -2350,6 +2352,19 @@ class SessionStore:
         except Exception as e:
             logger.debug("Could not load messages from DB: %s", e)
             return []
+
+    def load_transcript_snapshot(
+        self,
+        session_id: str,
+    ) -> Tuple[List[Dict[str, Any]], Optional[Tuple[int, int]]]:
+        """Load a stable active transcript plus its CAS revision."""
+        if not self._db:
+            return [], None
+        try:
+            return self._db.get_messages_as_conversation_snapshot(session_id)
+        except Exception as e:
+            logger.debug("Could not load stable transcript snapshot: %s", e)
+            return [], None
 
     def rewind_session(self, session_id: str, n: int = 1) -> Optional[Dict[str, Any]]:
         """Back up ``n`` user turns via soft-delete, keeping rows for audit.

@@ -1502,6 +1502,22 @@ def init_agent(
     _compression_cfg = _agent_cfg.get("compression", {})
     if not isinstance(_compression_cfg, dict):
         _compression_cfg = {}
+    agent._tool_output_retention_enabled = is_truthy_value(
+        _compression_cfg.get("tool_output_retention_enabled"),
+        default=True,
+    )
+    agent._tool_output_retention_turns = int(
+        _compression_cfg.get("tool_output_retention_turns", 10)
+    )
+    agent._tool_output_retention_min_chars = int(
+        _compression_cfg.get("tool_output_retention_min_chars", 200)
+    )
+    agent._tool_output_retention_max_inline_chars = int(
+        _compression_cfg.get("tool_output_retention_max_inline_chars", 200_000)
+    )
+    agent._tool_output_retention_min_inline_results = int(
+        _compression_cfg.get("tool_output_retention_min_inline_results", 5)
+    )
     compression_threshold = float(_compression_cfg.get("threshold", 0.50))
     # Per-model/route compaction-threshold override. Codex gpt-5.4 / gpt-5.5
     # raise to 85% (the Codex backend caps both families at 272K, so the

@@ -58,6 +58,7 @@ class _FakeAgent:
         self.disabled_toolsets = None
         self._skip_mcp_refresh = False
         self.compression_enabled = False
+        self._tool_output_retention_enabled = True
         self.context_compressor = types.SimpleNamespace(
             protect_first_n=2, protect_last_n=2
         )
@@ -173,6 +174,10 @@ def _build(agent, **overrides):
 def test_tool_output_retention_rewrites_active_rows_and_revalidates_tokens():
     agent = _FakeAgent()
     agent._session_db = MagicMock()
+    agent._session_db.get_messages_as_conversation_snapshot.return_value = (
+        [{"role": "tool", "content": "x" * 1000}],
+        (1, 42),
+    )
     agent.context_compressor.last_prompt_tokens = 99_000
     original = [{"role": "tool", "content": "x" * 1000}]
     retained = [{"role": "tool", "content": "[Old tool output archived at /tmp/x]"}]
@@ -187,13 +192,20 @@ def test_tool_output_retention_rewrites_active_rows_and_revalidates_tokens():
     assert original == retained
     assert agent.context_compressor.last_prompt_tokens == 0
     agent._session_db.replace_messages.assert_called_once_with(
-        "sess-1", retained, active_only=True
+        "sess-1",
+        retained,
+        active_only=True,
+        expected_active_revision=(1, 42),
     )
 
 
 def test_tool_output_retention_fails_closed_when_db_rewrite_fails():
     agent = _FakeAgent()
     agent._session_db = MagicMock()
+    agent._session_db.get_messages_as_conversation_snapshot.return_value = (
+        [{"role": "tool", "content": "x" * 1000}],
+        (1, 42),
+    )
     agent._session_db.replace_messages.side_effect = RuntimeError("locked")
     agent.context_compressor.last_prompt_tokens = 99_000
     original = [{"role": "tool", "content": "x" * 1000}]
@@ -209,6 +221,20 @@ def test_tool_output_retention_fails_closed_when_db_rewrite_fails():
     assert count == 0
     assert original == before
     assert agent.context_compressor.last_prompt_tokens == 99_000
+
+
+def test_tool_output_retention_can_be_disabled():
+    agent = _FakeAgent()
+    agent._tool_output_retention_enabled = False
+    agent._session_db = MagicMock()
+    original = [{"role": "tool", "content": "x" * 1000}]
+
+    with patch("agent.context_compressor.spill_old_tool_outputs") as spill:
+        assert apply_tool_output_retention(agent, original) == 0
+
+    spill.assert_not_called()
+    agent._session_db.replace_messages.assert_not_called()
+    assert original == [{"role": "tool", "content": "x" * 1000}]
 
 
 def test_returns_turn_context_with_user_message_appended():

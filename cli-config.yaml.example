@@ -426,6 +426,19 @@ compression:
   # compression of older turns.
   protect_last_n: 20
 
+  # Proactively move substantial tool-result payloads out of live context before
+  # lossy summarization. Files are content-addressed under
+  # ~/.hermes/session-spills/<session>/ with mode 0600; transcript rows retain a
+  # summary + absolute pointer. Rewrites are compare-and-swap guarded and abort
+  # if another process changed the active transcript. Spill files remain durable
+  # while transcript pointers may reference them; delete them only together with
+  # the corresponding session/history.
+  tool_output_retention_enabled: true
+  tool_output_retention_turns: 10
+  tool_output_retention_min_chars: 200
+  tool_output_retention_max_inline_chars: 200000
+  tool_output_retention_min_inline_results: 5
+
   # Codex app-server (codex CLI runtime) thread-compaction mode. The codex
   # agent owns the real thread context on this runtime, so Hermes' summarizer
   # cannot shrink it — compaction goes through the app server instead.

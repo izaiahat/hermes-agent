@@ -3594,12 +3594,52 @@ class SessionDB:
             now_ts = max(now_ts + 1e-6, message_timestamp + 1e-6)
         return inserted, tool_calls_total
 
+    def get_active_message_revision(self, session_id: str) -> Tuple[int, int]:
+        """Return a cheap CAS revision for the live transcript.
+
+        ``(active_row_count, max_active_row_id)`` changes on append, rewind, or
+        replacement. Tool-output retention uses it to prove that the transcript
+        it loaded is still current before performing a destructive rewrite.
+        """
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT COUNT(*) AS n, COALESCE(MAX(id), 0) AS max_id "
+                "FROM messages WHERE session_id = ? AND active = 1",
+                (session_id,),
+            ).fetchone()
+        return int(row["n"]), int(row["max_id"])
+
+    def get_messages_as_conversation_snapshot(
+        self,
+        session_id: str,
+        *,
+        max_attempts: int = 3,
+    ) -> Tuple[List[Dict[str, Any]], Tuple[int, int]]:
+        """Load a stable active transcript plus its compare-and-swap revision.
+
+        The revision-before/load/revision-after loop avoids holding a read
+        transaction across the relatively expensive replay conversion while
+        still detecting cross-process appends or rewrites. A continuously busy
+        session fails closed instead of returning a stale snapshot.
+        """
+        attempts = max(1, int(max_attempts))
+        for _ in range(attempts):
+            before = self.get_active_message_revision(session_id)
+            messages = self.get_messages_as_conversation(session_id)
+            after = self.get_active_message_revision(session_id)
+            if before == after:
+                return messages, after
+        raise RuntimeError(
+            f"active transcript changed while loading session {session_id}"
+        )
+
     def replace_messages(
         self,
         session_id: str,
         messages: List[Dict[str, Any]],
         active_only: bool = False,
-    ) -> None:
+        expected_active_revision: Optional[Tuple[int, int]] = None,
+    ) -> bool:
         """Atomically replace the stored messages for a session.
 
         Used by transcript-rewrite flows such as /retry, /undo, and /compress.
@@ -3619,11 +3659,25 @@ class SessionDB:
         full-history rewrite doesn't wipe the rows the agent deliberately
         archived. ``message_count``/``tool_call_count`` then track the live set,
         matching :meth:`archive_and_compact`.
+
+        ``expected_active_revision`` enables compare-and-swap safety for
+        retention rewrites. If another process appended, rewound, or replaced
+        the active transcript after the caller loaded it, this method returns
+        ``False`` without deleting any row. Otherwise it returns ``True``.
         """
 
         active_clause = " AND active = 1" if active_only else ""
 
         def _do(conn):
+            if expected_active_revision is not None:
+                row = conn.execute(
+                    "SELECT COUNT(*) AS n, COALESCE(MAX(id), 0) AS max_id "
+                    "FROM messages WHERE session_id = ? AND active = 1",
+                    (session_id,),
+                ).fetchone()
+                current_revision = (int(row["n"]), int(row["max_id"]))
+                if current_revision != tuple(expected_active_revision):
+                    return False
             conn.execute(
                 f"DELETE FROM messages WHERE session_id = ?{active_clause}",
                 (session_id,),
@@ -3639,8 +3693,9 @@ class SessionDB:
                 "UPDATE sessions SET message_count = ?, tool_call_count = ? WHERE id = ?",
                 (total_messages, total_tool_calls, session_id),
             )
+            return True
 
-        self._execute_write(_do)
+        return self._execute_write(_do)
 
     def has_archived_messages(self, session_id: str) -> bool:
         """Return True if the session has any soft-archived (``active = 0``) rows.

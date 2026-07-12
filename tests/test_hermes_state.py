@@ -956,6 +956,51 @@ class TestMessageStorage:
         assert msgs[0]["content"] == content
         assert msgs[1]["content"] == "I see a screenshot."
 
+    def test_replace_messages_cas_refuses_concurrent_append(self, db):
+        db.create_session(session_id="s_cas", source="cli")
+        db.append_message("s_cas", role="user", content="first")
+        snapshot, revision = db.get_messages_as_conversation_snapshot("s_cas")
+
+        db.append_message("s_cas", role="assistant", content="concurrent")
+        replacement = [dict(snapshot[0], content="rewritten")]
+
+        assert db.replace_messages(
+            "s_cas",
+            replacement,
+            active_only=True,
+            expected_active_revision=revision,
+        ) is False
+        assert [m["content"] for m in db.get_messages_as_conversation("s_cas")] == [
+            "first",
+            "concurrent",
+        ]
+
+    def test_replace_messages_cas_succeeds_for_stable_snapshot(self, db):
+        db.create_session(session_id="s_cas_ok", source="cli")
+        db.append_message("s_cas_ok", role="user", content="first")
+        snapshot, revision = db.get_messages_as_conversation_snapshot("s_cas_ok")
+        replacement = [dict(snapshot[0], content="rewritten")]
+
+        assert db.replace_messages(
+            "s_cas_ok",
+            replacement,
+            active_only=True,
+            expected_active_revision=revision,
+        ) is True
+        assert [m["content"] for m in db.get_messages_as_conversation("s_cas_ok")] == [
+            "rewritten"
+        ]
+
+    def test_get_messages_snapshot_revision_changes_on_append(self, db):
+        db.create_session(session_id="s_revision", source="cli")
+        db.append_message("s_revision", role="user", content="first")
+        snapshot, revision = db.get_messages_as_conversation_snapshot("s_revision")
+        assert [m["content"] for m in snapshot] == ["first"]
+        assert revision[0] == 1
+
+        db.append_message("s_revision", role="assistant", content="second")
+        assert db.get_active_message_revision("s_revision") != revision
+
     def test_get_messages_as_conversation(self, db):
         db.create_session(session_id="s1", source="cli")
         db.append_message("s1", role="user", content="Hello")

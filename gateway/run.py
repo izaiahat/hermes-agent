@@ -10822,8 +10822,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             except Exception as e:
                 logger.warning("[Gateway] Failed to auto-load skill(s) %s: %s", _skill_names, e)
 
-        # Load conversation history from transcript
-        history = self.session_store.load_transcript(session_entry.session_id)
+        # Load a stable conversation-history snapshot. Retention rewrites use
+        # the paired revision as a compare-and-swap guard so a concurrent append
+        # can never be deleted by whole-transcript replacement.
+        history, _history_revision = self.session_store.load_transcript_snapshot(
+            session_entry.session_id
+        )
+        if _history_revision is None:
+            history = self.session_store.load_transcript(session_entry.session_id)
 
         # Proactive tool-output retention (L2): archive substantial tool results
         # older than the most recent N user turns before checking whether the
@@ -10831,7 +10837,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # rows preserves soft-archived pre-compaction history. Reset the stored
         # prompt-token sample so the hygiene gate below re-estimates the smaller
         # transcript instead of compressing from a stale pre-prune count.
-        if history:
+        _retention_cfg = _load_gateway_config().get("compression", {})
+        if not isinstance(_retention_cfg, dict):
+            _retention_cfg = {}
+        _retention_enabled = str(
+            _retention_cfg.get("tool_output_retention_enabled", True)
+        ).lower() in {"true", "1", "yes"}
+        if history and _retention_enabled:
             try:
                 from agent.context_compressor import (
                     DEFAULT_TOOL_OUTPUT_RETENTION_MAX_INLINE_CHARS,
@@ -10841,9 +10853,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     spill_old_tool_outputs,
                 )
 
-                _retention_cfg = _load_gateway_config().get("compression", {})
-                if not isinstance(_retention_cfg, dict):
-                    _retention_cfg = {}
                 _retention_turns = int(
                     _retention_cfg.get(
                         "tool_output_retention_turns",
@@ -10879,11 +10888,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     )
                 )
                 if _archived_outputs:
-                    _retention_written = self.session_store.rewrite_transcript(
-                        session_entry.session_id,
-                        _retained_history,
-                        active_only=True,
-                    )
+                    _retention_written = False
+                    if _history_revision is not None:
+                        _retention_written = self.session_store.rewrite_transcript(
+                            session_entry.session_id,
+                            _retained_history,
+                            active_only=True,
+                            expected_active_revision=_history_revision,
+                        )
                     if _retention_written:
                         history = _retained_history
                         session_entry.last_prompt_tokens = 0
@@ -10899,9 +10911,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             session_entry.session_id,
                         )
                     else:
-                        logger.warning(
-                            "Tool-output retention rewrite failed for session %s; "
-                            "leaving live transcript unchanged",
+                        for _archive_path in _archive_paths:
+                            try:
+                                Path(_archive_path).unlink(missing_ok=True)
+                            except OSError:
+                                logger.debug(
+                                    "Could not remove uncommitted tool-output spill %s",
+                                    _archive_path,
+                                )
+                        logger.info(
+                            "Tool-output retention skipped for %s because the "
+                            "active transcript changed concurrently",
                             session_entry.session_id,
                         )
             except (TypeError, ValueError) as exc:
@@ -15293,11 +15313,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             user_name=str(evt.get("user_name") or "").strip() or None,
         )
 
-    async def _inject_watch_notification(self, synth_text: str, evt: dict) -> None:
-        """Inject a watch-pattern notification as a synthetic message event.
+    async def _inject_watch_notification(
+        self,
+        synth_text: str,
+        evt: dict,
+        *,
+        persist_turn: bool = False,
+    ) -> None:
+        """Inject a routed synthetic message event.
 
-        Routing must come from the queued watch event itself, not from whatever
+        Routing must come from the queued event itself, not from whatever
         foreground message happened to be active when the queue was drained.
+        Operational watch/process noise is non-persistent by default. Durable
+        async-delegation results opt in with ``persist_turn=True`` so the parent
+        conversation retains the worker result and continuation.
         """
         source = self._build_process_event_source(evt)
         if not source:
@@ -15322,15 +15351,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 internal=True,
                 message_id=str(evt.get("message_id") or "").strip() or None,
                 metadata={
-                    "non_persistent_turn": True,
+                    "non_persistent_turn": not persist_turn,
                     "synthetic_event_kind": str(evt.get("type") or "watch"),
                 },
             )
             logger.info(
-                "Watch pattern notification — injecting for %s chat=%s thread=%s",
+                "Synthetic process notification — injecting for %s chat=%s thread=%s persist=%s",
                 platform_name,
                 source.chat_id,
                 source.thread_id,
+                persist_turn,
             )
             await adapter.handle_message(synth_event)
         except Exception as e:
@@ -15397,7 +15427,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     if not synth_text:
                         continue
                     try:
-                        await self._inject_watch_notification(synth_text, evt)
+                        await self._inject_watch_notification(
+                            synth_text,
+                            evt,
+                            persist_turn=True,
+                        )
                     except Exception as e:
                         logger.error("Async delegation injection error: %s", e)
             except Exception as e:

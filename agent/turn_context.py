@@ -26,6 +26,7 @@ import logging
 import threading
 import uuid
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from agent.conversation_compression import conversation_history_after_compression
@@ -97,6 +98,9 @@ def apply_tool_output_retention(agent: Any, messages: List[Dict[str, Any]]) -> i
     can be cleared early; this pass covers CLI/API/direct-agent callers and is
     idempotent when the gateway already replaced those results with pointers.
     """
+    if not bool(getattr(agent, "_tool_output_retention_enabled", True)):
+        return 0
+
     from agent.context_compressor import (
         DEFAULT_TOOL_OUTPUT_RETENTION_MAX_INLINE_CHARS,
         DEFAULT_TOOL_OUTPUT_RETENTION_MIN_CHARS,
@@ -126,7 +130,55 @@ def apply_tool_output_retention(agent: Any, messages: List[Dict[str, Any]]) -> i
         DEFAULT_TOOL_OUTPUT_RETENTION_MIN_INLINE_RESULTS,
     )))
     session_id = str(getattr(agent, "session_id", None) or "session")
-    retained, archived_count, _paths = spill_old_tool_outputs(
+    session_db = getattr(agent, "_session_db", None)
+    durable_session_id = getattr(agent, "session_id", None)
+    expected_revision = None
+
+    if session_db is not None and durable_session_id:
+        try:
+            db_messages, expected_revision = (
+                session_db.get_messages_as_conversation_snapshot(durable_session_id)
+            )
+        except Exception:
+            logger.info(
+                "Tool-output retention skipped: could not load a stable DB "
+                "snapshot for session=%s",
+                session_id,
+            )
+            return 0
+
+        compare_keys = (
+            "role",
+            "content",
+            "tool_call_id",
+            "tool_calls",
+            "tool_name",
+            "message_id",
+            "observed",
+            "finish_reason",
+            "reasoning",
+            "reasoning_content",
+            "reasoning_details",
+            "codex_reasoning_items",
+            "codex_message_items",
+        )
+        live_projection = [
+            tuple(message.get(key) for key in compare_keys)
+            for message in messages
+        ]
+        db_projection = [
+            tuple(message.get(key) for key in compare_keys)
+            for message in db_messages
+        ]
+        if live_projection != db_projection:
+            logger.info(
+                "Tool-output retention skipped: live and durable transcripts "
+                "differ for session=%s",
+                session_id,
+            )
+            return 0
+
+    retained, archived_count, paths = spill_old_tool_outputs(
         messages,
         session_id=session_id,
         keep_recent_turns=keep_turns,
@@ -137,16 +189,25 @@ def apply_tool_output_retention(agent: Any, messages: List[Dict[str, Any]]) -> i
     if not archived_count:
         return 0
 
-    session_db = getattr(agent, "_session_db", None)
-    durable_session_id = getattr(agent, "session_id", None)
     if session_db is not None and durable_session_id:
         try:
-            session_db.replace_messages(
+            written = session_db.replace_messages(
                 durable_session_id,
                 retained,
                 active_only=True,
+                expected_active_revision=expected_revision,
             )
+            if written is False:
+                raise RuntimeError("active transcript revision changed")
         except Exception:
+            for path in paths:
+                try:
+                    Path(path).unlink(missing_ok=True)
+                except OSError:
+                    logger.debug(
+                        "Could not remove uncommitted tool-output spill %s",
+                        path,
+                    )
             logger.warning(
                 "Tool-output retention DB rewrite failed for session=%s; "
                 "keeping live history unchanged",

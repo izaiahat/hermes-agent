@@ -663,6 +663,28 @@ class TestSessionStoreRewriteTranscript:
             "retained active summary",
         ]
 
+    def test_rewrite_transcript_cas_refuses_stale_snapshot(self, store):
+        session_id = "test_session_cas"
+        store._db.create_session(session_id=session_id, source="test")
+        store.append_to_transcript(
+            session_id, {"role": "user", "content": "first"}
+        )
+        snapshot, revision = store.load_transcript_snapshot(session_id)
+        store.append_to_transcript(
+            session_id, {"role": "assistant", "content": "concurrent"}
+        )
+
+        assert store.rewrite_transcript(
+            session_id,
+            [dict(snapshot[0], content="rewritten")],
+            active_only=True,
+            expected_active_revision=revision,
+        ) is False
+        assert [message["content"] for message in store.load_transcript(session_id)] == [
+            "first",
+            "concurrent",
+        ]
+
 
 class TestLoadTranscriptDBOnly:
     """After spec 002, load_transcript reads only from state.db."""
