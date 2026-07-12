@@ -184,6 +184,8 @@ async def test_inject_watch_notification_routes_from_session_store_origin(monkey
     adapter.handle_message.assert_awaited_once()
     synth_event = adapter.handle_message.await_args.args[0]
     assert synth_event.internal is True
+    assert synth_event.metadata["non_persistent_turn"] is True
+    assert synth_event.metadata["synthetic_event_kind"] == "watch"
     assert synth_event.source.platform == Platform.TELEGRAM
     assert synth_event.source.chat_id == "-100"
     assert synth_event.source.chat_type == "group"
@@ -213,12 +215,15 @@ async def test_inject_watch_notification_carries_message_id_reply_anchor(monkeyp
         "session_id": "proc_watch",
         "session_key": "agent:main:telegram:dm:123:24296",
         "message_id": "777",
+        "type": "completion",
     }
 
     await runner._inject_watch_notification("[SYSTEM: Background process matched]", evt)
 
     adapter.handle_message.assert_awaited_once()
     synth_event = adapter.handle_message.await_args.args[0]
+    assert synth_event.metadata["non_persistent_turn"] is True
+    assert synth_event.metadata["synthetic_event_kind"] == "process_completion"
     assert synth_event.message_id == "777"
     assert synth_event.source.thread_id == "24296"
 

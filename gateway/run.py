@@ -4764,8 +4764,12 @@ class TurnRunner:
         )
         agent = None
         reused_cached_agent = False
-        _cache_lock = getattr(self._runner, "_agent_cache_lock", None)
-        _cache = getattr(self._runner, "_agent_cache", None)
+        _cache_lock = (
+            getattr(self._runner, "_agent_cache_lock", None)
+            if ctx.persist_turn
+            else None
+        )
+        _cache = getattr(self._runner, "_agent_cache", None) if ctx.persist_turn else None
 
         # Peek at the cached entry's snapshot session_id (if any) so we can
         # check, OUTSIDE the cache lock, whether THAT session_id is a DEAD
@@ -4993,7 +4997,11 @@ class TurnRunner:
                 chat_type=ctx.source.chat_type,
                 thread_id=ctx.source.thread_id,
                 gateway_session_key=ctx.session_key,
-                session_db=getattr(self._runner._session_db, "_db", self._runner._session_db),
+                session_db=(
+                    getattr(self._runner._session_db, "_db", self._runner._session_db)
+                    if ctx.persist_turn
+                    else None
+                ),
                 # Reload from disk — do not reuse the startup snapshot (#60955).
                 fallback_model=self._runner._refresh_fallback_model(),
                 skip_context_files=skip_context_files,
@@ -5001,6 +5009,12 @@ class TurnRunner:
                 # a single small file, not part of the expensive walk.
                 load_soul_identity=True,
             )
+            if not ctx.persist_turn:
+                # Completion/watch turns can read live history and use tools,
+                # but must not create, rotate, or write a durable session or
+                # contaminate the cached interactive agent.
+                setattr(agent, "_persist_disabled", True)
+                setattr(agent, "_end_session_on_close", False)
             if _cache_lock and _cache is not None:
                 with _cache_lock:
                     # Record the session_id the snapshot was taken for
@@ -17126,6 +17140,87 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         # Load conversation history from transcript
         history = await self.async_session_store.load_transcript(session_entry.session_id)
+
+        # Archive substantial old tool results before deciding whether lossy
+        # conversation compression is required. Rewriting only active rows
+        # preserves soft-archived compaction history and native checkpoints.
+        if history:
+            try:
+                from agent.context_compressor import (
+                    DEFAULT_TOOL_OUTPUT_RETENTION_MAX_INLINE_CHARS,
+                    DEFAULT_TOOL_OUTPUT_RETENTION_MIN_CHARS,
+                    DEFAULT_TOOL_OUTPUT_RETENTION_MIN_INLINE_RESULTS,
+                    DEFAULT_TOOL_OUTPUT_RETENTION_TURNS,
+                    spill_old_tool_outputs,
+                )
+
+                _retention_cfg = _load_gateway_config().get("compression", {})
+                if not isinstance(_retention_cfg, dict):
+                    _retention_cfg = {}
+                _retention_turns = int(
+                    _retention_cfg.get(
+                        "tool_output_retention_turns",
+                        DEFAULT_TOOL_OUTPUT_RETENTION_TURNS,
+                    )
+                )
+                _retention_min_chars = int(
+                    _retention_cfg.get(
+                        "tool_output_retention_min_chars",
+                        DEFAULT_TOOL_OUTPUT_RETENTION_MIN_CHARS,
+                    )
+                )
+                _retention_max_inline_chars = int(
+                    _retention_cfg.get(
+                        "tool_output_retention_max_inline_chars",
+                        DEFAULT_TOOL_OUTPUT_RETENTION_MAX_INLINE_CHARS,
+                    )
+                )
+                _retention_min_inline_results = int(
+                    _retention_cfg.get(
+                        "tool_output_retention_min_inline_results",
+                        DEFAULT_TOOL_OUTPUT_RETENTION_MIN_INLINE_RESULTS,
+                    )
+                )
+                _retained_history, _archived_outputs, _archive_paths = (
+                    spill_old_tool_outputs(
+                        history,
+                        session_id=session_entry.session_id,
+                        keep_recent_turns=max(0, _retention_turns),
+                        min_chars=max(0, _retention_min_chars),
+                        max_inline_chars=_retention_max_inline_chars,
+                        min_inline_results=max(0, _retention_min_inline_results),
+                    )
+                )
+                if _archived_outputs:
+                    _retention_written = await self.async_session_store.rewrite_transcript(
+                        session_entry.session_id,
+                        _retained_history,
+                        active_only=True,
+                    )
+                    if _retention_written:
+                        history = _retained_history
+                        session_entry.last_prompt_tokens = 0
+                        await self.async_session_store.update_session(
+                            session_entry.session_key,
+                            last_prompt_tokens=0,
+                        )
+                        self._evict_cached_agent(session_key)
+                        logger.info(
+                            "Tool-output retention: archived %d old result(s) for %s; "
+                            "revalidating context pressure before compression",
+                            _archived_outputs,
+                            session_entry.session_id,
+                        )
+                    else:
+                        logger.warning(
+                            "Tool-output retention rewrite failed for session %s; "
+                            "leaving live transcript unchanged",
+                            session_entry.session_id,
+                        )
+            except (TypeError, ValueError) as exc:
+                logger.warning("Invalid tool-output retention configuration: %s", exc)
+            except Exception as exc:
+                logger.warning("Tool-output retention pass failed: %s", exc)
         
         # -----------------------------------------------------------------
         # Session hygiene: auto-compress pathologically large transcripts
@@ -18077,6 +18172,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # session_entry.session_id while the old run is still unwinding.
             _run_start_session_id = session_entry.session_id
             _turn_started_monotonic = time.monotonic()
+            _persist_turn = not bool(
+                event.internal
+                and (event.metadata or {}).get("non_persistent_turn")
+            )
             agent_result = await self._run_agent(
                 message=message_text,
                 context_prompt=context_prompt,
@@ -18091,6 +18190,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
                 message_type=event.message_type,
+                persist_turn=_persist_turn,
             )
             _turn_seconds = time.monotonic() - _turn_started_monotonic
 
@@ -18206,7 +18306,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # in conversation_compression.py; propagate to SessionEntry + _save().
             # If the agent's session_id changed during compression, update
             # session_entry so transcript writes below go to the right session.
-            if agent_result.get("session_id") and agent_result["session_id"] != session_entry.session_id:
+            if (
+                _persist_turn
+                and agent_result.get("session_id")
+                and agent_result["session_id"] != session_entry.session_id
+            ):
                 if session_entry.session_id == _run_start_session_id:
                     session_entry.session_id = agent_result["session_id"]
                     # The held turn lease follows the rotation: the transcript
@@ -18440,7 +18544,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "session intact; the next message retries normally.",
                     session_entry.session_id if session_entry else "?",
                 )
-            elif agent_result.get("compression_exhausted") and session_entry and session_key:
+            elif (
+                _persist_turn
+                and agent_result.get("compression_exhausted")
+                and session_entry
+                and session_key
+            ):
                 logger.info(
                     "Auto-resetting session %s after compression exhaustion.",
                     session_entry.session_id,
@@ -18482,7 +18591,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # If this is a fresh session (no history), write the full tool
             # definitions as the first entry so the transcript is self-describing
             # -- the same list of dicts sent as tools=[...] in the API request.
-            if is_context_overflow_failure:
+            if not _persist_turn:
+                pass  # Synthetic completion/watch turn is API-only context.
+            elif is_context_overflow_failure:
                 pass  # Skip all transcript writes — don't grow a broken session
             elif not history:
                 tool_defs = agent_result.get("tools", [])
@@ -18513,7 +18624,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # Use the filtered history length (history_offset) that was actually
             # passed to the agent, not len(history) which includes session_meta
             # entries that were stripped before the agent saw them.
-            if is_context_overflow_failure:
+            if not _persist_turn:
+                pass  # Agent persistence is disabled for this synthetic turn.
+            elif is_context_overflow_failure:
                 pass  # handled above — skip all transcript writes
             elif agent_failed_early or hidden_reasoning_incomplete:
                 # Transient failure (429/timeout/5xx): persist only the user
@@ -18619,10 +18732,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # Token counts and model are now persisted by the agent directly.
             # Keep only last_prompt_tokens here for context-window tracking and
             # compression decisions.
-            await self.async_session_store.update_session(
-                session_entry.session_key,
-                last_prompt_tokens=agent_result.get("last_prompt_tokens", 0),
-            )
+            if _persist_turn:
+                await self.async_session_store.update_session(
+                    session_entry.session_key,
+                    last_prompt_tokens=agent_result.get("last_prompt_tokens", 0),
+                )
 
             # Re-baseline the cached agent's message_count snapshot now that
             # ALL of this turn's transcript writes are done — the agent's
@@ -18642,9 +18756,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # above), matching this function's documented contract.  Refreshing
             # here makes the guard fire only on a DIFFERENT process's writes.
             # Fail-safe inside the helper.
-            await self._refresh_agent_cache_message_count(
-                session_key, session_entry.session_id
-            )
+            if _persist_turn:
+                await self._refresh_agent_cache_message_count(
+                    session_key, session_entry.session_id
+                )
 
             # Intentional silence is a delivery decision, not a transcript
             # mutation.  The agent's [SILENT]/NO_REPLY assistant turn above is
@@ -18737,7 +18852,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # agent already reached its early turn-start persistence, the latest
             # transcript user row will match and we skip the duplicate.
             try:
-                if 'message_text' in locals() and message_text is not None and session_entry is not None:
+                if (
+                    'message_text' in locals()
+                    and message_text is not None
+                    and session_entry is not None
+                    and locals().get('_persist_turn', True)
+                ):
                     _already_persisted = False
                     try:
                         _recent_transcript = await self.async_session_store.load_transcript(session_entry.session_id)
@@ -22672,6 +22792,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             parent_session_id = str(evt.get("parent_session_id") or "").strip()
             if parent_session_id:
                 metadata["gateway_session_id"] = parent_session_id
+            _event_kind = str(evt.get("type") or "watch")
+            metadata.update({
+                "non_persistent_turn": True,
+                "synthetic_event_kind": (
+                    "process_completion" if _event_kind == "completion" else _event_kind
+                ),
+            })
             synth_event = MessageEvent(
                 text=synth_text,
                 message_type=MessageType.TEXT,
@@ -24710,6 +24837,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         session_key: str = None,
         run_generation: Optional[int] = None,
         event_message_id: Optional[str] = None,
+        persist_turn: bool = True,
     ) -> Dict[str, Any]:
         """Forward the message to a remote Hermes API server instead of
         running a local AIAgent.
@@ -24788,7 +24916,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         headers: Dict[str, str] = {"Content-Type": "application/json"}
         if proxy_key:
             headers["Authorization"] = f"Bearer {proxy_key}"
-        if session_id:
+        if session_id and persist_turn:
             headers["X-Hermes-Session-Id"] = session_id
 
         body = {
@@ -25001,6 +25129,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         persist_user_message: Optional[Any] = None,
         persist_user_timestamp: Optional[float] = None,
         message_type: Optional[str] = None,
+        persist_turn: bool = True,
     ) -> Dict[str, Any]:
         """Profile-scoping wrapper around the agent run.
 
@@ -25020,6 +25149,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
                 message_type=message_type,
+                persist_turn=persist_turn,
             )
 
         profile_home = self._resolve_profile_home_for_source(source)
@@ -25032,6 +25162,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
                 message_type=message_type,
+                persist_turn=persist_turn,
             )
 
     def _profile_name_for_source(self, source: SessionSource) -> Optional[str]:
@@ -25154,6 +25285,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         persist_user_message: Optional[Any] = None,
         persist_user_timestamp: Optional[float] = None,
         message_type: Optional[str] = None,
+        persist_turn: bool = True,
     ) -> Dict[str, Any]:
         """
         Run the agent with the given message and context.
@@ -25178,6 +25310,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 session_key=session_key,
                 run_generation=run_generation,
                 event_message_id=event_message_id,
+                persist_turn=persist_turn,
             )
 
         from run_agent import AIAgent
@@ -25438,6 +25571,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             moa_config=moa_config,
             persist_user_message=persist_user_message,
             persist_user_timestamp=persist_user_timestamp,
+            persist_turn=persist_turn,
         )
         turn_runner = TurnRunner(self, turn_ctx)
         # Callback invoked by agent on tool lifecycle events — extracted to
@@ -26559,6 +26693,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # new message).
 
                 updated_history = result.get("messages", history)
+                # A non-persistent synthetic turn must never become durable
+                # history merely because a real user message queued while it
+                # was running. The queued real turn starts from the original
+                # persisted history.
+                followup_history = history if not persist_turn else updated_history
                 next_source = source
                 next_message = pending
                 next_message_id = None
@@ -26592,7 +26731,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     next_message = await self._prepare_profile_scoped_inbound_message_text(
                         event=pending_event,
                         source=next_source,
-                        history=updated_history,
+                        history=followup_history,
                         session_key=next_session_key,
                     )
                     if next_message is None:
@@ -26641,12 +26780,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # follow-up.  Use the same (session_key, session_id) the
                 # recursive call runs under so the snapshot matches exactly
                 # what the follow-up's guard will consult.  Fail-safe in helper.
-                await self._refresh_agent_cache_message_count(session_key, session_id)
+                if persist_turn:
+                    await self._refresh_agent_cache_message_count(
+                        session_key, session_id
+                    )
 
                 followup_result = await self._run_agent(
                     message=next_message,
                     context_prompt=context_prompt,
-                    history=updated_history,
+                    history=followup_history,
                     source=next_source,
                     session_id=session_id,
                     session_key=next_session_key,
@@ -26655,7 +26797,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     event_message_id=next_message_id,
                     channel_prompt=next_channel_prompt,
                     message_type=next_message_type,
+                    persist_turn=not bool(
+                        pending_event is not None
+                        and pending_event.internal
+                        and (pending_event.metadata or {}).get("non_persistent_turn")
+                    ),
                 )
+                if not persist_turn:
+                    return followup_result
                 return _preserve_queued_followup_history_offset(result, followup_result)
         finally:
             # Stop progress sender, interrupt monitor, and notification task
@@ -26726,6 +26875,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         await task
                     except asyncio.CancelledError:
                         pass
+
+            if not persist_turn and agent_holder[0] is not None:
+                await self._cleanup_agent_resources_off_loop(
+                    agent_holder[0],
+                    context="non-persistent internal gateway turn",
+                )
 
         # If streaming already delivered the response, mark it so the
         # caller's send() is skipped (avoiding duplicate messages).
