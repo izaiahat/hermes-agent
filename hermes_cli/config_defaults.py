@@ -625,6 +625,14 @@ DEFAULT_CONFIG = {
                                       # (e.g. 6) for tool-schema-heavy sessions where 3
                                       # rounds cannot clear the request estimate.
                                       # Validated >= 1, hard-capped at 10.
+        "tool_output_retention_enabled": True,  # archive substantial old tool
+                                      # payloads before lossy compaction; CAS-guarded
+                                      # rewrites preserve concurrent appends and
+                                      # soft-archived/native checkpoint history.
+        "tool_output_retention_turns": 10,
+        "tool_output_retention_min_chars": 200,
+        "tool_output_retention_max_inline_chars": 200000,
+        "tool_output_retention_min_inline_results": 5,
         "proactive_prune_tokens": 0,  # opt-in trigger (tokens) for the deterministic,
                                       # no-LLM tool-result prune, run independently of
                                       # `threshold` above. On large-window models

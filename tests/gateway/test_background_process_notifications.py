@@ -195,6 +195,30 @@ async def test_inject_watch_notification_routes_from_session_store_origin(monkey
 
 
 @pytest.mark.asyncio
+async def test_async_delegation_notification_is_persistent(monkeypatch, tmp_path):
+    runner = _build_runner(monkeypatch, tmp_path, "all")
+    adapter = runner.adapters[Platform.TELEGRAM]
+    evt = {
+        "type": "async_delegation",
+        "session_id": "deleg_123",
+        "platform": "telegram",
+        "chat_type": "dm",
+        "chat_id": "123",
+    }
+
+    await runner._inject_watch_notification(
+        "[ASYNC DELEGATION COMPLETE]",
+        evt,
+        persist_turn=True,
+    )
+
+    synth_event = getattr(adapter.handle_message, "await_args").args[0]
+    assert synth_event.internal is True
+    assert synth_event.metadata["non_persistent_turn"] is False
+    assert synth_event.metadata["synthetic_event_kind"] == "async_delegation"
+
+
+@pytest.mark.asyncio
 async def test_inject_watch_notification_carries_message_id_reply_anchor(monkeypatch, tmp_path):
     from gateway.session import SessionSource
 

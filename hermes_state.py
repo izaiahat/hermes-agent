@@ -7998,13 +7998,53 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             now_ts = max(now_ts + 1e-6, message_timestamp + 1e-6)
         return inserted, tool_calls_total
 
+    def get_active_message_revision(self, session_id: str) -> Tuple[int, int]:
+        """Return a cheap CAS revision for the live transcript.
+
+        ``(active_row_count, max_active_row_id)`` changes on append, rewind, or
+        replacement. Tool-output retention uses it to prove that the transcript
+        it loaded is still current before performing a destructive rewrite.
+        """
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT COUNT(*) AS n, COALESCE(MAX(id), 0) AS max_id "
+                "FROM messages WHERE session_id = ? AND active = 1",
+                (session_id,),
+            ).fetchone()
+        return int(row["n"]), int(row["max_id"])
+
+    def get_messages_as_conversation_snapshot(
+        self,
+        session_id: str,
+        *,
+        max_attempts: int = 3,
+    ) -> Tuple[List[Dict[str, Any]], Tuple[int, int]]:
+        """Load a stable active transcript plus its compare-and-swap revision.
+
+        The revision-before/load/revision-after loop avoids holding a read
+        transaction across the relatively expensive replay conversion while
+        still detecting cross-process appends or rewrites. A continuously busy
+        session fails closed instead of returning a stale snapshot.
+        """
+        attempts = max(1, int(max_attempts))
+        for _ in range(attempts):
+            before = self.get_active_message_revision(session_id)
+            messages = self.get_messages_as_conversation(session_id)
+            after = self.get_active_message_revision(session_id)
+            if before == after:
+                return messages, after
+        raise RuntimeError(
+            f"active transcript changed while loading session {session_id}"
+        )
+
     def replace_messages(
         self,
         session_id: str,
         messages: List[Dict[str, Any]],
         active_only: bool = False,
         archive_dropped: bool = False,
-    ) -> None:
+        expected_active_revision: Optional[Tuple[int, int]] = None,
+    ) -> bool:
         """Atomically replace the stored messages for a session.
 
         Used by transcript-rewrite flows such as /retry, /undo, and /compress.
@@ -8038,6 +8078,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         fresh active rows exactly as in the destructive path, so the live view
         is identical either way; only the durability of the dropped turns
         differs.
+
+        ``expected_active_revision`` enables compare-and-swap safety for
+        retention rewrites. If another process appended, rewound, or replaced
+        the active transcript after the caller loaded it, this method returns
+        ``False`` without deleting any row. Otherwise it returns ``True``.
         """
 
         active_clause = " AND active = 1" if active_only else ""
@@ -8053,6 +8098,15 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 and session["end_reason"] == "compression"
             ):
                 raise CompressionSessionClosedError(session_id)
+            if expected_active_revision is not None:
+                row = conn.execute(
+                    "SELECT COUNT(*) AS n, COALESCE(MAX(id), 0) AS max_id "
+                    "FROM messages WHERE session_id = ? AND active = 1",
+                    (session_id,),
+                ).fetchone()
+                current_revision = (int(row["n"]), int(row["max_id"]))
+                if current_revision != tuple(expected_active_revision):
+                    return False
             if archive_dropped:
                 # Content-preserving UPDATE: the rows keep their FTS entries
                 # (the messages_fts triggers fire on INSERT / DELETE / UPDATE
@@ -8080,8 +8134,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 "UPDATE sessions SET message_count = ?, tool_call_count = ? WHERE id = ?",
                 (total_messages, total_tool_calls, session_id),
             )
+            return True
 
-        self._execute_write(_do)
+        return self._execute_write(_do)
 
     def has_archived_messages(self, session_id: str) -> bool:
         """Return True if the session has any soft-archived (``active = 0``) rows.
