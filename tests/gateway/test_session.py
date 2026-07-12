@@ -634,6 +634,35 @@ class TestSessionStoreRewriteTranscript:
         reloaded = store.load_transcript(session_id)
         assert reloaded == []
 
+    def test_active_only_rewrite_preserves_archived_rows(self, store):
+        session_id = "test_session_active_only"
+        store._db.create_session(session_id=session_id, source="test")
+        store.append_to_transcript(
+            session_id, {"role": "tool", "content": "original tool output"}
+        )
+        store._db.archive_and_compact(
+            session_id,
+            [{"role": "assistant", "content": "compacted summary"}],
+        )
+
+        assert store.rewrite_transcript(
+            session_id,
+            [{"role": "assistant", "content": "retained active summary"}],
+            active_only=True,
+        )
+
+        active = store._db.get_messages_as_conversation(session_id)
+        all_rows = store._db.get_messages_as_conversation(
+            session_id, include_inactive=True
+        )
+        assert [message["content"] for message in active] == [
+            "retained active summary"
+        ]
+        assert [message["content"] for message in all_rows] == [
+            "original tool output",
+            "retained active summary",
+        ]
+
 
 class TestLoadTranscriptDBOnly:
     """After spec 002, load_transcript reads only from state.db."""

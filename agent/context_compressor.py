@@ -19,9 +19,11 @@ Improvements over v2:
 import hashlib
 import json
 import logging
+import os
 import sqlite3
 import re
 import time
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from agent.auxiliary_client import call_llm, _is_connection_error, aux_interrupt_protection
@@ -199,6 +201,14 @@ _SUMMARY_TOKENS_CEILING = 12_000
 # Placeholder used when pruning old tool results
 _PRUNED_TOOL_PLACEHOLDER = "[Old tool output cleared to save context space]"
 
+# Gateway retention defaults. These are independent from the compression tail
+# budget: old tool payloads should leave live context before they can force a
+# lossy conversation compaction.
+DEFAULT_TOOL_OUTPUT_RETENTION_TURNS = 10
+DEFAULT_TOOL_OUTPUT_RETENTION_MIN_CHARS = 200
+DEFAULT_TOOL_OUTPUT_RETENTION_MAX_INLINE_CHARS = 200_000
+DEFAULT_TOOL_OUTPUT_RETENTION_MIN_INLINE_RESULTS = 5
+
 # Chars per token rough estimate
 _CHARS_PER_TOKEN = 4
 # Flat token cost per attached image part.  Real cost varies by provider and
@@ -212,6 +222,148 @@ _IMAGE_TOKEN_ESTIMATE = 1600
 # for tail-cut decisions.
 _IMAGE_CHAR_EQUIVALENT = _IMAGE_TOKEN_ESTIMATE * _CHARS_PER_TOKEN
 _SUMMARY_FAILURE_COOLDOWN_SECONDS = 600
+
+
+def spill_old_tool_outputs(
+    messages: List[Dict[str, Any]],
+    *,
+    session_id: str,
+    spill_root: Optional[Path] = None,
+    keep_recent_turns: int = DEFAULT_TOOL_OUTPUT_RETENTION_TURNS,
+    min_chars: int = DEFAULT_TOOL_OUTPUT_RETENTION_MIN_CHARS,
+    max_inline_chars: int = DEFAULT_TOOL_OUTPUT_RETENTION_MAX_INLINE_CHARS,
+    min_inline_results: int = DEFAULT_TOOL_OUTPUT_RETENTION_MIN_INLINE_RESULTS,
+) -> tuple[List[Dict[str, Any]], int, List[str]]:
+    """Archive substantial old tool outputs and replace them with pointers.
+
+    A turn is anchored by a user-role message. Tool outputs older than
+    ``keep_recent_turns`` are archived. Recent turns are also bounded by
+    ``max_inline_chars`` so one tool-heavy operator turn cannot force another
+    lossy compaction; the newest ``min_inline_results`` substantial outputs are
+    always retained. Archived strings are written under
+    ``~/.hermes/session-spills/<session>/`` with mode 0600 and replaced by an
+    absolute path plus a one-line summary. The caller owns persistence of the
+    returned transcript.
+
+    The pass is deterministic and idempotent: pointer rows are ignored and a
+    content-addressed archive file is reused for duplicate payloads. Small
+    results remain inline because archiving them would cost more than it saves.
+    """
+    if not messages or keep_recent_turns < 0:
+        return messages, 0, []
+
+    user_indices = [
+        index for index, message in enumerate(messages)
+        if isinstance(message, dict) and message.get("role") == "user"
+    ]
+    prune_boundary = (
+        len(messages)
+        if keep_recent_turns == 0
+        else user_indices[-keep_recent_turns]
+        if len(user_indices) > keep_recent_turns
+        else 0
+    )
+
+    call_id_to_tool: Dict[str, tuple[str, str]] = {}
+    for message in messages:
+        if not isinstance(message, dict) or message.get("role") != "assistant":
+            continue
+        for tool_call in message.get("tool_calls") or []:
+            if not isinstance(tool_call, dict):
+                continue
+            function = tool_call.get("function") or {}
+            call_id_to_tool[str(tool_call.get("id") or "")] = (
+                str(function.get("name") or "unknown"),
+                str(function.get("arguments") or ""),
+            )
+
+    if spill_root is None:
+        try:
+            from hermes_constants import get_hermes_home
+
+            spill_root = Path(get_hermes_home()) / "session-spills"
+        except Exception:
+            spill_root = Path.home() / ".hermes" / "session-spills"
+
+    safe_session = re.sub(r"[^A-Za-z0-9_.-]+", "_", session_id or "unknown")[:120]
+    session_dir = Path(spill_root).expanduser() / safe_session
+    result = [message.copy() if isinstance(message, dict) else message for message in messages]
+    archived_paths: List[str] = []
+    archived_count = 0
+
+    # A single operator turn can emit hundreds of tool rows. Preserve the newest
+    # few substantial results, then keep additional recent results only while
+    # they fit in the inline character budget.
+    force_archive: set[int] = set()
+    if max_inline_chars >= 0:
+        inline_chars = 0
+        inline_results = 0
+        for index in range(len(result) - 1, -1, -1):
+            message = result[index]
+            if not isinstance(message, dict) or message.get("role") != "tool":
+                continue
+            content = message.get("content")
+            if (
+                not isinstance(content, str)
+                or len(content) <= max(0, min_chars)
+                or content.startswith("[Old tool output archived at ")
+            ):
+                continue
+            if inline_results < max(0, min_inline_results):
+                inline_results += 1
+                inline_chars += len(content)
+                continue
+            if inline_chars + len(content) > max_inline_chars:
+                force_archive.add(index)
+            else:
+                inline_results += 1
+                inline_chars += len(content)
+
+    archive_candidates = set(range(prune_boundary)) | force_archive
+    if not archive_candidates:
+        return messages, 0, []
+    for index in sorted(archive_candidates):
+        message = result[index]
+        if not isinstance(message, dict) or message.get("role") != "tool":
+            continue
+        content = message.get("content")
+        if not isinstance(content, str) or len(content) <= max(0, min_chars):
+            continue
+        if content.startswith("[Old tool output archived at "):
+            continue
+
+        call_id = str(message.get("tool_call_id") or "")
+        tool_name, tool_args = call_id_to_tool.get(call_id, ("unknown", ""))
+        digest = hashlib.sha256(content.encode("utf-8", errors="replace")).hexdigest()[:16]
+        safe_tool = re.sub(r"[^A-Za-z0-9_.-]+", "_", tool_name)[:48] or "unknown"
+        archive_path = session_dir / f"{index:05d}-{safe_tool}-{digest}.txt"
+
+        try:
+            session_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+            try:
+                os.chmod(session_dir, 0o700)
+            except OSError:
+                pass
+            if not archive_path.exists():
+                archive_path.write_text(content, encoding="utf-8")
+            try:
+                os.chmod(archive_path, 0o600)
+            except OSError:
+                pass
+        except OSError as exc:
+            logger.warning("Tool-output archive write failed for %s: %s", archive_path, exc)
+            continue
+
+        summary = _summarize_tool_result(tool_name, tool_args, content)
+        pointer = str(archive_path.resolve())
+        result[index] = {
+            **message,
+            "content": f"[Old tool output archived at {pointer}] {summary}",
+        }
+        archived_paths.append(pointer)
+        archived_count += 1
+
+    return result, archived_count, archived_paths
 
 # Hard ceiling for the deterministic summary-failure handoff.  The fallback is
 # only meant to preserve continuity anchors from the dropped window, not to

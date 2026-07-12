@@ -145,6 +145,19 @@ class FakeAgent:
         }
 
 
+class PersistenceCaptureAgent(FakeAgent):
+    instances = []
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.kwargs = kwargs
+        self.closed = False
+        self.__class__.instances.append(self)
+
+    def close(self):
+        self.closed = True
+
+
 class ThinkingAgent:
     """Agent that emits _thinking scratch text (no tool calls).
 
@@ -268,6 +281,55 @@ def _make_runner(adapter):
         stt_enabled=False,
     )
     return runner
+
+
+@pytest.mark.asyncio
+async def test_non_persistent_internal_turn_uses_isolated_uncached_agent(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("HERMES_TOOL_PROGRESS_MODE", "off")
+    fake_dotenv = types.ModuleType("dotenv")
+    fake_dotenv.load_dotenv = lambda *args, **kwargs: None
+    monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
+
+    PersistenceCaptureAgent.instances.clear()
+    fake_run_agent = types.ModuleType("run_agent")
+    fake_run_agent.AIAgent = PersistenceCaptureAgent
+    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+
+    adapter = ProgressCaptureAdapter()
+    runner = _make_runner(adapter)
+    runner._session_db = SimpleNamespace(_db=object())
+    gateway_run = importlib.import_module("gateway.run")
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(
+        gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "fake"}
+    )
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="12345",
+        chat_type="dm",
+    )
+    session_key = "agent:main:telegram:dm:12345"
+
+    result = await runner._run_agent(
+        message="[SYSTEM: Background process completed]",
+        context_prompt="",
+        history=[{"role": "user", "content": "start work"}],
+        source=source,
+        session_id="sess-internal",
+        session_key=session_key,
+        persist_turn=False,
+    )
+
+    assert result["final_response"] == "done"
+    assert len(PersistenceCaptureAgent.instances) == 1
+    agent = PersistenceCaptureAgent.instances[0]
+    assert agent.kwargs["session_db"] is None
+    assert agent._persist_disabled is True
+    assert agent._end_session_on_close is False
+    assert agent.closed is True
+    assert session_key not in getattr(runner, "_agent_cache", {})
 
 
 @pytest.mark.asyncio

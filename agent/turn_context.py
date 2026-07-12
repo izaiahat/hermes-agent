@@ -89,6 +89,85 @@ def _should_run_preflight_estimate(
     return estimate_messages_tokens_rough(messages) >= threshold_tokens
 
 
+def apply_tool_output_retention(agent: Any, messages: List[Dict[str, Any]]) -> int:
+    """Spill old tool results before deciding whether to compact the turn.
+
+    This is the interface-neutral L2 retention rail. Gateway sessions also run
+    the pass before constructing an agent so stale persisted prompt-token counts
+    can be cleared early; this pass covers CLI/API/direct-agent callers and is
+    idempotent when the gateway already replaced those results with pointers.
+    """
+    from agent.context_compressor import (
+        DEFAULT_TOOL_OUTPUT_RETENTION_MAX_INLINE_CHARS,
+        DEFAULT_TOOL_OUTPUT_RETENTION_MIN_CHARS,
+        DEFAULT_TOOL_OUTPUT_RETENTION_MIN_INLINE_RESULTS,
+        DEFAULT_TOOL_OUTPUT_RETENTION_TURNS,
+        spill_old_tool_outputs,
+    )
+
+    keep_turns = max(0, int(getattr(
+        agent,
+        "_tool_output_retention_turns",
+        DEFAULT_TOOL_OUTPUT_RETENTION_TURNS,
+    )))
+    min_chars = max(0, int(getattr(
+        agent,
+        "_tool_output_retention_min_chars",
+        DEFAULT_TOOL_OUTPUT_RETENTION_MIN_CHARS,
+    )))
+    max_inline_chars = int(getattr(
+        agent,
+        "_tool_output_retention_max_inline_chars",
+        DEFAULT_TOOL_OUTPUT_RETENTION_MAX_INLINE_CHARS,
+    ))
+    min_inline_results = max(0, int(getattr(
+        agent,
+        "_tool_output_retention_min_inline_results",
+        DEFAULT_TOOL_OUTPUT_RETENTION_MIN_INLINE_RESULTS,
+    )))
+    session_id = str(getattr(agent, "session_id", None) or "session")
+    retained, archived_count, _paths = spill_old_tool_outputs(
+        messages,
+        session_id=session_id,
+        keep_recent_turns=keep_turns,
+        min_chars=min_chars,
+        max_inline_chars=max_inline_chars,
+        min_inline_results=min_inline_results,
+    )
+    if not archived_count:
+        return 0
+
+    session_db = getattr(agent, "_session_db", None)
+    durable_session_id = getattr(agent, "session_id", None)
+    if session_db is not None and durable_session_id:
+        try:
+            session_db.replace_messages(
+                durable_session_id,
+                retained,
+                active_only=True,
+            )
+        except Exception:
+            logger.warning(
+                "Tool-output retention DB rewrite failed for session=%s; "
+                "keeping live history unchanged",
+                session_id,
+                exc_info=True,
+            )
+            return 0
+
+    messages[:] = retained
+    compressor = getattr(agent, "context_compressor", None)
+    if compressor is not None:
+        compressor.last_prompt_tokens = 0
+    logger.info(
+        "Tool-output retention archived %d old result(s) for session=%s; "
+        "revalidating request pressure before compression",
+        archived_count,
+        session_id or "none",
+    )
+    return archived_count
+
+
 @dataclass
 class TurnContext:
     """Values produced by the turn prologue and consumed by the turn loop."""
@@ -346,6 +425,17 @@ def build_turn_context(
             agent.session_id or "none",
             exc_info=True,
         )
+
+    # Replace old substantial tool results with file pointers before the
+    # preflight estimate. If pruning brings the request under threshold, the
+    # compressor is never invoked; otherwise the estimate runs on the retained
+    # transcript.
+    try:
+        apply_tool_output_retention(agent, messages)
+    except (TypeError, ValueError) as exc:
+        logger.warning("Invalid tool-output retention configuration: %s", exc)
+    except Exception:
+        logger.warning("Tool-output retention pass failed", exc_info=True)
 
     # ── Preflight context compression ──
     # Gate the (expensive) full token estimate behind a cheap pre-check.

@@ -2304,7 +2304,13 @@ class SessionStore:
             logger.debug("has_platform_message_id lookup failed", exc_info=True)
             return False
 
-    def rewrite_transcript(self, session_id: str, messages: List[Dict[str, Any]]) -> bool:
+    def rewrite_transcript(
+        self,
+        session_id: str,
+        messages: List[Dict[str, Any]],
+        *,
+        active_only: bool = False,
+    ) -> bool:
         """Replace the entire transcript for a session with new messages.
 
         Used by /retry, /undo, and /compress to persist modified conversation
@@ -2320,7 +2326,11 @@ class SessionStore:
         if not self._db:
             return True
         try:
-            self._db.replace_messages(session_id, messages)
+            self._db.replace_messages(
+                session_id,
+                messages,
+                active_only=active_only,
+            )
             return True
         except Exception as e:
             logger.debug("Failed to rewrite transcript in DB: %s", e)

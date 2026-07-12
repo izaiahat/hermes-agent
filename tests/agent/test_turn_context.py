@@ -9,12 +9,17 @@ confirm the prologue produces the right ``TurnContext`` and applies the
 from __future__ import annotations
 
 import types
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 from agent.context_compressor import ContextCompressor
-from agent.turn_context import TurnContext, build_turn_context
+from agent.turn_context import (
+    TurnContext,
+    apply_tool_output_retention,
+    build_turn_context,
+)
 from hermes_state import SessionDB
 
 
@@ -73,6 +78,7 @@ class _FakeAgent:
         self._invalid_tool_retries = -1
         self._vision_supported = None
         self._persist_calls = 0
+        self._session_db: Any = None
         # Records _cached_system_prompt at the moment _ensure_db_session()
         # is called (regression guard for #45499 turn-setup ordering).
         self._ensure_db_prompt_at_call = "<unset>"
@@ -162,6 +168,47 @@ def _build(agent, **overrides):
     )
     kwargs.update(overrides)
     return build_turn_context(**kwargs)
+
+
+def test_tool_output_retention_rewrites_active_rows_and_revalidates_tokens():
+    agent = _FakeAgent()
+    agent._session_db = MagicMock()
+    agent.context_compressor.last_prompt_tokens = 99_000
+    original = [{"role": "tool", "content": "x" * 1000}]
+    retained = [{"role": "tool", "content": "[Old tool output archived at /tmp/x]"}]
+
+    with patch(
+        "agent.context_compressor.spill_old_tool_outputs",
+        return_value=(retained, 1, ["/tmp/x"]),
+    ):
+        count = apply_tool_output_retention(agent, original)
+
+    assert count == 1
+    assert original == retained
+    assert agent.context_compressor.last_prompt_tokens == 0
+    agent._session_db.replace_messages.assert_called_once_with(
+        "sess-1", retained, active_only=True
+    )
+
+
+def test_tool_output_retention_fails_closed_when_db_rewrite_fails():
+    agent = _FakeAgent()
+    agent._session_db = MagicMock()
+    agent._session_db.replace_messages.side_effect = RuntimeError("locked")
+    agent.context_compressor.last_prompt_tokens = 99_000
+    original = [{"role": "tool", "content": "x" * 1000}]
+    before = list(original)
+    retained = [{"role": "tool", "content": "[Old tool output archived at /tmp/x]"}]
+
+    with patch(
+        "agent.context_compressor.spill_old_tool_outputs",
+        return_value=(retained, 1, ["/tmp/x"]),
+    ):
+        count = apply_tool_output_retention(agent, original)
+
+    assert count == 0
+    assert original == before
+    assert agent.context_compressor.last_prompt_tokens == 99_000
 
 
 def test_returns_turn_context_with_user_message_appended():

@@ -9,6 +9,7 @@ from agent.context_compressor import (
     HISTORICAL_TASK_HEADING,
     SUMMARY_PREFIX,
     COMPRESSED_SUMMARY_METADATA_KEY,
+    spill_old_tool_outputs,
 )
 from hermes_state import SessionDB
 
@@ -44,6 +45,130 @@ class TestShouldCompress:
         assert compressor.should_compress(prompt_tokens=90000) is True
         assert compressor.should_compress(prompt_tokens=50000) is False
 
+
+
+class TestToolOutputRetention:
+    def test_archives_outputs_older_than_recent_turn_window(self, tmp_path):
+        messages = []
+        payloads = {}
+        for turn in range(12):
+            call_id = f"call-{turn}"
+            payload = f"turn={turn}\n" + (str(turn) * 500)
+            payloads[turn] = payload
+            messages.extend([
+                {"role": "user", "content": f"request {turn}"},
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [{
+                        "id": call_id,
+                        "function": {
+                            "name": "read_file",
+                            "arguments": f'{{"path":"file-{turn}.txt"}}',
+                        },
+                    }],
+                },
+                {"role": "tool", "tool_call_id": call_id, "content": payload},
+                {"role": "assistant", "content": f"done {turn}"},
+            ])
+
+        retained, count, paths = spill_old_tool_outputs(
+            messages,
+            session_id="session/test",
+            spill_root=tmp_path,
+            keep_recent_turns=10,
+            min_chars=200,
+        )
+
+        assert count == 2
+        assert len(paths) == 2
+        assert retained[2]["content"].startswith("[Old tool output archived at ")
+        assert retained[6]["content"].startswith("[Old tool output archived at ")
+        assert retained[10]["content"] == payloads[2]
+        for turn, path in enumerate(paths):
+            archived = __import__("pathlib").Path(path)
+            assert archived.read_text(encoding="utf-8") == payloads[turn]
+            assert archived.stat().st_mode & 0o777 == 0o600
+
+        retained_again, second_count, second_paths = spill_old_tool_outputs(
+            retained,
+            session_id="session/test",
+            spill_root=tmp_path,
+            keep_recent_turns=10,
+            min_chars=200,
+        )
+        assert second_count == 0
+        assert second_paths == []
+        assert retained_again == retained
+
+    def test_keeps_all_outputs_when_turn_count_is_within_window(self, tmp_path):
+        payload = "x" * 1000
+        messages = [
+            item
+            for turn in range(10)
+            for item in (
+                {"role": "user", "content": f"request {turn}"},
+                {"role": "tool", "tool_call_id": f"c-{turn}", "content": payload},
+            )
+        ]
+
+        retained, count, paths = spill_old_tool_outputs(
+            messages,
+            session_id="short",
+            spill_root=tmp_path,
+            keep_recent_turns=10,
+        )
+
+        assert retained is messages
+        assert count == 0
+        assert paths == []
+
+    def test_default_keeps_tiny_old_outputs_inline(self, tmp_path):
+        messages = []
+        for turn in range(11):
+            messages.extend(
+                [
+                    {"role": "user", "content": f"turn {turn}"},
+                    {"role": "tool", "tool_call_id": f"c{turn}", "content": "ok"},
+                ]
+            )
+
+        retained, count, paths = spill_old_tool_outputs(
+            messages,
+            session_id="small",
+            spill_root=tmp_path,
+            keep_recent_turns=10,
+        )
+
+        assert count == 0
+        assert paths == []
+        assert retained[1]["content"] == "ok"
+        assert retained[-1]["content"] == "ok"
+
+    def test_single_tool_heavy_turn_is_bounded_by_inline_budget(self, tmp_path):
+        payload = "x" * 50_000
+        messages = [{"role": "user", "content": "one long operator turn"}]
+        for index in range(20):
+            messages.append({
+                "role": "tool",
+                "tool_call_id": f"c{index}",
+                "content": f"{index:02d}" + payload,
+            })
+
+        retained, count, paths = spill_old_tool_outputs(
+            messages,
+            session_id="heavy",
+            spill_root=tmp_path,
+            keep_recent_turns=10,
+            max_inline_chars=200_000,
+            min_inline_results=5,
+        )
+
+        assert count == 15
+        assert len(paths) == 15
+        assert retained[1]["content"].startswith("[Old tool output archived at ")
+        assert retained[-5]["content"].startswith("15")
+        assert retained[-1]["content"].startswith("19")
 
 
 class TestUpdateFromResponse:
