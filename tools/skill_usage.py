@@ -61,10 +61,13 @@ def _flock(fd, lock: bool) -> None:
     msvcrt.locking(fd.fileno(), msvcrt.LK_LOCK if lock else msvcrt.LK_UNLCK, 1)
 
 
+class UsagePersistenceError(RuntimeError):
+    """Raised when a required usage-sidecar write cannot be persisted."""
+
+
 @contextmanager
-def _usage_file_lock():
-    """Serialize .usage.json read-modify-write cycles across processes."""
-    lock_path = _usage_file().with_suffix(".json.lock")
+def _exclusive_file_lock(lock_path: Path):
+    """Hold an exclusive cross-process lock for the supplied path."""
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     if fcntl is None and msvcrt is None:
         yield
@@ -78,6 +81,25 @@ def _usage_file_lock():
         finally:
             with suppress(OSError, IOError):
                 _flock(fd, False)
+
+
+@contextmanager
+def _usage_file_lock():
+    """Serialize .usage.json read-modify-write cycles across processes."""
+    with _exclusive_file_lock(_usage_file().with_suffix(".json.lock")):
+        yield
+
+
+@contextmanager
+def _lifecycle_lock():
+    """Serialize archive/restore/repair filesystem and metadata transitions.
+
+    Lifecycle callers always acquire this lock BEFORE ``_usage_file_lock``.
+    Telemetry-only writers acquire the usage lock alone, so the ordering cannot
+    invert and deadlock.
+    """
+    with _exclusive_file_lock(_skills_dir() / ".lifecycle.lock"):
+        yield
 
 
 def _read_lines(path: Path, fail_log: str) -> List[str]:
@@ -354,6 +376,21 @@ def load_usage() -> Dict[str, Dict[str, Any]]:
         logger.debug("Failed to read %s: %s", path, e)
         return {}
     return {str(k): v for k, v in data.items() if isinstance(v, dict)} if isinstance(data, dict) else {}
+
+
+def _save_usage_strict(data: Dict[str, Dict[str, Any]]) -> None:
+    """Atomically persist the usage map, propagating every write failure.
+
+    Lifecycle transitions (archive/restore/repair) must not silently lose a
+    metadata write the way best-effort telemetry may: a dropped write there
+    leaves the record disagreeing with disk, which is the bug repair exists to
+    fix.
+    """
+    path = _usage_file()
+    try:
+        atomic_write_text(path, json.dumps(data, indent=2, sort_keys=True, ensure_ascii=False), tmp_prefix=".usage_")
+    except Exception as exc:
+        raise UsagePersistenceError(f"could not persist {path}: {exc}") from exc
 
 
 def save_usage(data: Dict[str, Dict[str, Any]]) -> bool:
@@ -793,7 +830,7 @@ def repair_orphan_usage_records() -> Dict[str, List[str]]:
     marked_archived: List[str] = []
     marked_active: List[str] = []
 
-    with _usage_file_lock():
+    with _lifecycle_lock(), _usage_file_lock():
         data = load_usage()
         for name, rec in list(data.items()):
             if not _is_curator_managed_record(rec) or not is_agent_created(name):
@@ -821,7 +858,9 @@ def repair_orphan_usage_records() -> Dict[str, List[str]]:
             data.pop(name, None)
 
         if removed or marked_archived or marked_active:
-            save_usage(data)
+            # A lifecycle write that silently fails would leave the record
+            # disagreeing with disk - the exact bug repair exists to fix.
+            _save_usage_strict(data)
 
     return {
         "marked_active": sorted(marked_active),
