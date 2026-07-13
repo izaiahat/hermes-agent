@@ -167,9 +167,15 @@ describe('ToolsetConfigPanel', () => {
     const { ToolsetConfigPanel } = await import('./toolset-config-panel')
     render(<ToolsetConfigPanel onConfiguredChange={vi.fn()} toolset="tts" />)
 
+    // Let the initial provider-selection effect settle before clicking. Without
+    // this gate, its Edge TTS update can race and overwrite the test's click.
+    const edge = await screen.findByRole('button', { name: /Microsoft Edge TTS/ })
+    await waitFor(() => expect(edge.getAttribute('aria-pressed')).toBe('true'))
+
     // Select the keyed provider so its env vars render.
     const elevenlabs = await screen.findByRole('button', { name: /ElevenLabs/ })
     fireEvent.click(elevenlabs)
+    await waitFor(() => expect(elevenlabs.getAttribute('aria-pressed')).toBe('true'))
 
     // Open the credential actions menu (Radix opens on pointerdown), then "Set".
     const trigger = await screen.findByRole('button', { name: /Actions for ELEVENLABS_API_KEY/ })
