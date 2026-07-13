@@ -86,10 +86,13 @@ def _usage_file() -> Path:
     return _skills_dir() / ".usage.json"
 
 
+class UsagePersistenceError(RuntimeError):
+    """Raised when a required usage-sidecar write cannot be persisted."""
+
+
 @contextmanager
-def _usage_file_lock():
-    """Serialize .usage.json read-modify-write cycles across processes."""
-    lock_path = _usage_file().with_suffix(".json.lock")
+def _exclusive_file_lock(lock_path: Path):
+    """Hold an exclusive cross-process lock for the supplied path."""
     lock_path.parent.mkdir(parents=True, exist_ok=True)
 
     if fcntl is None and msvcrt is None:
@@ -120,6 +123,25 @@ def _usage_file_lock():
             except (OSError, IOError):
                 pass
         fd.close()
+
+
+@contextmanager
+def _usage_file_lock():
+    """Serialize .usage.json read-modify-write cycles across processes."""
+    with _exclusive_file_lock(_usage_file().with_suffix(".json.lock")):
+        yield
+
+
+@contextmanager
+def _lifecycle_lock():
+    """Serialize archive/restore/repair filesystem and metadata transitions.
+
+    Lifecycle callers always acquire this lock before ``_usage_file_lock``.
+    Telemetry-only writers acquire the usage lock alone, so the ordering cannot
+    invert and deadlock.
+    """
+    with _exclusive_file_lock(_skills_dir() / ".lifecycle.lock"):
+        yield
 
 
 def _archive_dir() -> Path:
@@ -517,28 +539,33 @@ def load_usage() -> Dict[str, Dict[str, Any]]:
     return clean
 
 
+def _save_usage_strict(data: Dict[str, Dict[str, Any]]) -> None:
+    """Atomically persist the usage map, propagating every write failure."""
+    path = _usage_file()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(
+        dir=str(path.parent), prefix=".usage_", suffix=".tmp"
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, sort_keys=True, ensure_ascii=False)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, path)
+    except BaseException:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+
+
 def save_usage(data: Dict[str, Dict[str, Any]]) -> None:
     """Write the usage map atomically. Best-effort — errors are logged, not raised."""
-    path = _usage_file()
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        fd, tmp_path = tempfile.mkstemp(
-            dir=str(path.parent), prefix=".usage_", suffix=".tmp"
-        )
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
-                json.dump(data, f, indent=2, sort_keys=True, ensure_ascii=False)
-                f.flush()
-                os.fsync(f.fileno())
-            os.replace(tmp_path, path)
-        except BaseException:
-            try:
-                os.unlink(tmp_path)
-            except OSError:
-                pass
-            raise
+        _save_usage_strict(data)
     except Exception as e:
-        logger.debug("Failed to write %s: %s", path, e, exc_info=True)
+        logger.debug("Failed to write %s: %s", _usage_file(), e, exc_info=True)
 
 
 def get_record(skill_name: str) -> Dict[str, Any]:
@@ -694,6 +721,12 @@ def forget(skill_name: str) -> None:
 # ---------------------------------------------------------------------------
 
 def archive_skill(skill_name: str) -> Tuple[bool, str]:
+    """Archive one skill as a serialized filesystem + metadata transition."""
+    with _lifecycle_lock():
+        return _archive_skill_locked(skill_name)
+
+
+def _archive_skill_locked(skill_name: str) -> Tuple[bool, str]:
     """Move a curator-eligible skill directory to ~/.hermes/skills/.archive/.
 
     Returns (ok, message). Never archives hub-installed skills. Bundled
@@ -787,6 +820,12 @@ def _find_archived_skill_candidates(skill_name: str) -> List[Path]:
 
 
 def restore_skill(skill_name: str) -> Tuple[bool, str]:
+    """Restore one skill as a serialized filesystem + metadata transition."""
+    with _lifecycle_lock():
+        return _restore_skill_locked(skill_name)
+
+
+def _restore_skill_locked(skill_name: str) -> Tuple[bool, str]:
     """Move an archived skill back to ~/.hermes/skills/. Restores to the flat
     top-level layout; original category nesting is NOT reconstructed.
 
@@ -890,7 +929,7 @@ def repair_orphan_usage_records() -> Dict[str, List[str]]:
     marked_archived: List[str] = []
     marked_active: List[str] = []
 
-    with _usage_file_lock():
+    with _lifecycle_lock(), _usage_file_lock():
         data = load_usage()
         for name, rec in list(data.items()):
             if not _is_curator_managed_record(rec) or not is_agent_created(name):
@@ -918,7 +957,12 @@ def repair_orphan_usage_records() -> Dict[str, List[str]]:
             data.pop(name, None)
 
         if removed or marked_archived or marked_active:
-            save_usage(data)
+            try:
+                _save_usage_strict(data)
+            except Exception as e:
+                raise UsagePersistenceError(
+                    f"failed to persist repaired usage records: {e}"
+                ) from e
 
     return {
         "marked_active": sorted(marked_active),
