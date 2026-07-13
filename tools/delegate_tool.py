@@ -1276,6 +1276,27 @@ def _build_child_agent(
     except Exception as exc:
         logger.debug("Could not load delegation reasoning_effort: %s", exc)
 
+    # Resolve speed tier: an explicit delegation override wins; otherwise a
+    # same-provider child inherits the parent's tier. Previously native
+    # delegate_task children silently dropped a parent's Fast/priority setting.
+    delegation_service_tier = delegation_cfg.get("service_tier")
+    if delegation_service_tier is not None:
+        normalized_tier = str(delegation_service_tier).strip().lower()
+        child_service_tier = (
+            None
+            if normalized_tier in {"", "none", "off", "normal", "default", "standard"}
+            else normalized_tier
+        )
+    elif effective_provider == _parent_provider:
+        parent_service_tier = getattr(parent_agent, "service_tier", None)
+        child_service_tier = (
+            parent_service_tier
+            if isinstance(parent_service_tier, str) and parent_service_tier.strip()
+            else None
+        )
+    else:
+        child_service_tier = None
+
     # Inherit the parent's fallback provider chain so subagents can recover
     # from rate-limits and credential exhaustion exactly like the top-level
     # agent does.  _fallback_chain is a list accepted by AIAgent's
@@ -1314,6 +1335,7 @@ def _build_child_agent(
         max_iterations=max_iterations,
         max_tokens=getattr(parent_agent, "max_tokens", None),
         reasoning_config=child_reasoning,
+        service_tier=child_service_tier or "",
         prefill_messages=getattr(parent_agent, "prefill_messages", None),
         fallback_model=parent_fallback,
         enabled_toolsets=child_toolsets,

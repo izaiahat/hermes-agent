@@ -823,11 +823,16 @@ def reasoning_efforts_for_provider(
 ) -> tuple[str, ...]:
     """Return supported reasoning efforts for a provider/model pair.
 
-    The live OpenAI Codex OAuth API currently advertises a conservative
-    ``xhigh`` ceiling, including for GPT-5.6 Sol/Terra/Luna. Unknown providers
-    keep the global Hermes vocabulary to preserve custom-provider compatibility.
+    GPT-5.6 Sol accepts ``max`` on the live OpenAI Codex OAuth generation
+    endpoint. The same endpoint still rejects ``ultra`` despite advertising it
+    in the model catalog. Other Codex models retain the conservative ``xhigh``
+    ceiling until they have their own successful generation proof. Unknown
+    providers keep the global Hermes vocabulary for custom-provider compatibility.
     """
     key = str(provider or "").strip().lower()
+    normalized_model = str(model or "").strip().lower().split("/", 1)[-1]
+    if key == "openai-codex" and normalized_model == "gpt-5.6-sol":
+        return tuple(level for level in REASONING_EFFORT_ORDER if level != "ultra")
     return PROVIDER_REASONING_EFFORTS.get(key, REASONING_EFFORT_ORDER)
 
 

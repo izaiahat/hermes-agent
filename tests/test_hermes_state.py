@@ -2830,6 +2830,72 @@ class TestSchemaInit:
         version = cursor.fetchone()[0]
         assert version == SCHEMA_VERSION
 
+    def test_fts_tables_use_messages_as_external_content(self, db):
+        """FTS indexes must not duplicate message text in shadow tables."""
+        definitions = dict(
+            db._conn.execute(
+                "SELECT name, sql FROM sqlite_master "
+                "WHERE name IN ('messages_fts', 'messages_fts_trigram')"
+            ).fetchall()
+        )
+        assert "content='messages'" in definitions["messages_fts"]
+        assert "content='messages'" in definitions["messages_fts_trigram"]
+        shadow_tables = {
+            row[0]
+            for row in db._conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+        }
+        assert "messages_fts_content" not in shadow_tables
+        assert "messages_fts_trigram_content" not in shadow_tables
+
+    def test_v21_migrates_inline_fts_without_losing_search(self, tmp_path):
+        db_path = tmp_path / "legacy-inline.db"
+        db = SessionDB(db_path=db_path)
+        try:
+            db.create_session(session_id="s1", source="cli")
+            db.append_message(
+                "s1",
+                role="tool",
+                content="migration searchable payload",
+                tool_name="migration_tool",
+            )
+            # Production databases may already be at v20 while retaining the
+            # legacy inline-content FTS schema, so the migration must be newer.
+            db._conn.execute("UPDATE schema_version SET version = 20")
+            db._drop_fts_triggers(db._conn.cursor())
+            db._conn.execute("DROP TABLE messages_fts")
+            db._conn.execute("DROP TABLE messages_fts_trigram")
+            db._conn.executescript(
+                """
+                CREATE VIRTUAL TABLE messages_fts USING fts5(content);
+                CREATE VIRTUAL TABLE messages_fts_trigram USING fts5(
+                    content, tokenize='trigram'
+                );
+                """
+            )
+            db._conn.commit()
+        finally:
+            db.close()
+
+        migrated = SessionDB(db_path=db_path)
+        try:
+            assert migrated._conn.execute(
+                "SELECT version FROM schema_version"
+            ).fetchone()[0] == SCHEMA_VERSION
+            assert len(migrated.search_messages("migration searchable")) == 1
+            assert len(migrated.search_messages("migration_tool")) == 1
+            tables = {
+                row[0]
+                for row in migrated._conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                ).fetchall()
+            }
+            assert "messages_fts_content" not in tables
+            assert "messages_fts_trigram_content" not in tables
+        finally:
+            migrated.close()
+
     def test_title_column_exists(self, db):
         """Verify the title column was created in the sessions table."""
         cursor = db._conn.execute("PRAGMA table_info(sessions)")
