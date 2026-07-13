@@ -388,7 +388,12 @@ def _cmd_repair_usage(args) -> int:
     """Synchronize curator-managed usage records with active/archive dirs."""
     from tools import skill_usage
 
-    summary = skill_usage.repair_orphan_usage_records()
+    try:
+        summary = skill_usage.repair_orphan_usage_records()
+    except skill_usage.UsagePersistenceError as e:
+        print(f"curator: failed to repair usage records: {e}")
+        return 1
+
     changed = sum(len(v) for v in summary.values())
     if changed == 0:
         print("curator: usage records already match filesystem")

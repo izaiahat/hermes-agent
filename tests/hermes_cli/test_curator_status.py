@@ -198,6 +198,22 @@ def test_repair_usage_command_prints_summary(monkeypatch, capsys):
     assert "removed: missing-skill" in out
 
 
+def test_repair_usage_command_fails_when_persistence_fails(monkeypatch, capsys):
+    from hermes_cli import curator as curator_cli
+    import tools.skill_usage as skill_usage
+
+    def _fail():
+        raise skill_usage.UsagePersistenceError("simulated write failure")
+
+    monkeypatch.setattr(skill_usage, "repair_orphan_usage_records", _fail)
+
+    assert curator_cli._cmd_repair_usage(Namespace()) == 1
+    out = capsys.readouterr().out
+    assert "failed to repair usage records" in out
+    assert "simulated write failure" in out
+    assert "curator: repaired usage records" not in out
+
+
 def test_repair_usage_command_prints_noop(monkeypatch, capsys):
     from hermes_cli import curator as curator_cli
     import tools.skill_usage as skill_usage
