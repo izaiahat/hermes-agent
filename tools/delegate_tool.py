@@ -1572,6 +1572,7 @@ def _build_child_agent(
     except Exception as exc:
         logger.debug("Could not load delegation reasoning_effort: %s", exc)
 
+
     # Inherit the parent's fallback provider chain so subagents can recover
     # from rate-limits and credential exhaustion exactly like the top-level
     # agent does.  _fallback_chain is a list accepted by AIAgent's
@@ -1630,6 +1631,7 @@ def _build_child_agent(
             max_iterations=max_iterations,
 
             reasoning_config=child_reasoning,
+
             prefill_messages=getattr(parent_agent, "prefill_messages", None),
             fallback_model=parent_fallback,
             enabled_toolsets=child_toolsets,

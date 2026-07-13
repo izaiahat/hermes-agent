@@ -1325,6 +1325,23 @@ class TestDelegationReasoningEffort(unittest.TestCase):
         call_kwargs = MockAgent.call_args[1]
         self.assertEqual(call_kwargs["reasoning_config"], {"enabled": True, "effort": "low"})
 
+    @patch("tools.delegate_tool._load_config")
+    @patch("run_agent.AIAgent")
+    def test_child_does_not_inherit_parent_priority_service_tier(self, MockAgent, mock_cfg):
+        """Delegated/background children stay on the standard non-fast tier."""
+        mock_cfg.return_value = {"max_iterations": 50, "reasoning_effort": ""}
+        MockAgent.return_value = MagicMock()
+        parent = _make_mock_parent()
+        parent.service_tier = "priority"
+
+        _build_child_agent(
+            task_index=0, goal="test", context=None, toolsets=None,
+            model=None, max_iterations=50, parent_agent=parent,
+            task_count=1,
+        )
+
+        self.assertNotIn("service_tier", MockAgent.call_args[1])
+
 # =========================================================================
 # Dispatch helper, progress events, concurrency
 # =========================================================================

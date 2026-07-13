@@ -21,25 +21,24 @@ def test_openai_codex_legacy_model_clamps_max_to_xhigh():
     assert "max" not in supported
 
 
-def test_gpt56_codex_clamps_ultra_to_xhigh():
+def test_openai_codex_gpt56_sol_accepts_max():
+    effort, was_clamped, supported = clamp_reasoning_effort_for_provider(
+        "max", "openai-codex", "gpt-5.6-sol"
+    )
+
+    assert effort == "max"
+    assert was_clamped is False
+    assert "max" in supported
+
+
+def test_openai_codex_gpt56_sol_clamps_ultra_to_max():
     effort, was_clamped, supported = clamp_reasoning_effort_for_provider(
         "ultra", "openai-codex", "gpt-5.6-sol"
     )
 
-    assert effort == "xhigh"
+    assert effort == "max"
     assert was_clamped is True
     assert "ultra" not in supported
-
-    kwargs = ResponsesApiTransport().build_kwargs(
-        "gpt-5.6-sol",
-        [{"role": "user", "content": "hi"}],
-        tools=None,
-        reasoning_config={"enabled": True, "effort": "ultra"},
-        provider="openai-codex",
-        is_codex_backend=True,
-    )
-
-    assert kwargs["reasoning"]["effort"] == "xhigh"
 
 
 def test_openai_codex_gpt56_luna_clamps_ultra_to_xhigh():
@@ -52,7 +51,7 @@ def test_openai_codex_gpt56_luna_clamps_ultra_to_xhigh():
     assert "ultra" not in supported
 
 
-def test_codex_responses_transport_never_emits_max_for_codex_backend():
+def test_codex_responses_transport_clamps_max_for_legacy_codex_model():
     kwargs = ResponsesApiTransport().build_kwargs(
         "gpt-5.5",
         [{"role": "user", "content": "hi"}],
@@ -63,6 +62,19 @@ def test_codex_responses_transport_never_emits_max_for_codex_backend():
     )
 
     assert kwargs["reasoning"]["effort"] == "xhigh"
+
+
+def test_codex_responses_transport_clamps_ultra_to_max_for_gpt56_sol():
+    kwargs = ResponsesApiTransport().build_kwargs(
+        "gpt-5.6-sol",
+        [{"role": "user", "content": "hi"}],
+        tools=None,
+        reasoning_config={"enabled": True, "effort": "ultra"},
+        provider="openai-codex",
+        is_codex_backend=True,
+    )
+
+    assert kwargs["reasoning"]["effort"] == "max"
 
 
 def test_unknown_provider_retains_global_ultra_support():
