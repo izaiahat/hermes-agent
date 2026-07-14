@@ -43,7 +43,9 @@ def test_build_skills_system_prompt_prefers_specific_skills_and_normalizes_files
     monkeypatch.setattr(prompt_builder, "get_skills_dir", lambda: local_skills)
     monkeypatch.setattr(prompt_builder, "get_all_skills_dirs", lambda: [local_skills])
     monkeypatch.setattr(prompt_builder, "iter_skill_index_files", skill_utils.iter_skill_index_files)
-    monkeypatch.setattr(prompt_builder, "get_disabled_skill_names", lambda: set())
+    monkeypatch.setattr(
+        prompt_builder, "get_disabled_skill_names", lambda _platform=None: set()
+    )
     prompt_builder._SKILLS_PROMPT_CACHE.clear()
 
     result = prompt_builder.build_skills_system_prompt(available_toolsets={"terminal", "file"})
