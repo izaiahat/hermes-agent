@@ -96,8 +96,9 @@ def test_run_conversation_dict_returns_include_final_response():
 
 
 @pytest.fixture()
-def agent():
+def agent(monkeypatch):
     """Minimal AIAgent with mocked OpenAI client and tool loading."""
+    monkeypatch.delenv("HERMES_API_TIMEOUT", raising=False)
     with (
         patch(
             "run_agent.get_tool_definitions", return_value=_make_tool_defs("web_search")

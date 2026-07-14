@@ -42,7 +42,11 @@ def _items(word: str):
 @pytest.fixture(autouse=True)
 def _reset_fuzzy_cache(monkeypatch):
     # Each test walks a fresh tmp dir; clear the cached listing so prior
-    # roots can't leak through the TTL window.
+    # roots or the developer's configured terminal cwd can't leak through the
+    # TTL window.
+    monkeypatch.setattr(server, "_profile_configured_cwd", lambda *_args: None)
+    monkeypatch.setattr(server, "_launch_configured_cwd", lambda: None)
+    monkeypatch.delenv("TERMINAL_CWD", raising=False)
     server._fuzzy_cache.clear()
     yield
     server._fuzzy_cache.clear()

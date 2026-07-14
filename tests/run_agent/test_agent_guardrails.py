@@ -8,10 +8,20 @@ Covers three static methods on AIAgent (inspired by PR #1321 — @alireza78a):
 
 import types
 
-from run_agent import AIAgent
-from tools.delegate_tool import _get_max_concurrent_children
+import pytest
 
-MAX_CONCURRENT_CHILDREN = _get_max_concurrent_children()
+from run_agent import AIAgent
+from tools.delegate_tool import _DEFAULT_MAX_CONCURRENT_CHILDREN
+
+MAX_CONCURRENT_CHILDREN = _DEFAULT_MAX_CONCURRENT_CHILDREN
+
+
+@pytest.fixture(autouse=True)
+def _stable_delegate_limit(monkeypatch):
+    monkeypatch.setattr(
+        "tools.delegate_tool._get_max_concurrent_children",
+        lambda: MAX_CONCURRENT_CHILDREN,
+    )
 
 
 # ---------------------------------------------------------------------------
