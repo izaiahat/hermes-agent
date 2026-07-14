@@ -1782,6 +1782,9 @@ def test_persist_preserves_concurrent_disk_only_entry(tmp_path, monkeypatch):
     # exact-id assertions below (passes on CI where no such file exists).
     monkeypatch.setattr("agent.anthropic_adapter.read_hermes_oauth_credentials", lambda: None)
     monkeypatch.setattr("agent.anthropic_adapter.read_claude_code_credentials", lambda: None)
+    monkeypatch.setattr(
+        "hermes_cli.auth.is_provider_explicitly_configured", lambda _provider: False
+    )
     _write_auth_store(
         tmp_path,
         {

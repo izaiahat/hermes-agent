@@ -17141,9 +17141,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Load a stable conversation-history snapshot. Retention rewrites use
         # the paired revision as a compare-and-swap guard so a concurrent append
         # can never be deleted by whole-transcript replacement.
-        history, _history_revision = await self.async_session_store.load_transcript_snapshot(
-            session_entry.session_id
-        )
+        try:
+            _snapshot = await self.async_session_store.load_transcript_snapshot(
+                session_entry.session_id
+            )
+            if not isinstance(_snapshot, tuple) or len(_snapshot) != 2:
+                raise TypeError("invalid transcript snapshot")
+            history, _history_revision = _snapshot
+        except (AttributeError, TypeError, ValueError):
+            # Backward-compatible path for lightweight/legacy SessionStore
+            # implementations. The real store always returns (history,
+            # revision); without a revision retention remains fail-closed.
+            history, _history_revision = [], None
         if _history_revision is None:
             history = await self.async_session_store.load_transcript(
                 session_entry.session_id

@@ -58,8 +58,9 @@ def test_is_destructive_command_treats_cp_as_mutating():
 
 
 @pytest.fixture()
-def agent():
+def agent(monkeypatch):
     """Minimal AIAgent with mocked OpenAI client and tool loading."""
+    monkeypatch.delenv("HERMES_API_TIMEOUT", raising=False)
     with (
         patch(
             "run_agent.get_tool_definitions", return_value=_make_tool_defs("web_search")
@@ -5761,7 +5762,7 @@ class TestAnthropicInterruptHandler:
     """_interruptible_api_call must handle Anthropic mode when interrupted."""
 
 
-    def test_interruptible_anthropic_interrupt_never_closes_shared_client(self):
+    def test_interruptible_anthropic_interrupt_never_closes_shared_client(self, monkeypatch):
         """#67142: a non-streaming Anthropic interrupt must abort the
         request-local client from the poll thread, never close/rebuild the
         shared _anthropic_client (which raced a live SSL BIO and corrupted an
@@ -5776,6 +5777,10 @@ class TestAnthropicInterruptHandler:
         from run_agent import AIAgent
         from agent.chat_completion_helpers import interruptible_api_call
 
+        monkeypatch.setattr(
+            "agent.anthropic_adapter.build_anthropic_client",
+            lambda *_args, **_kwargs: MagicMock(),
+        )
         agent = AIAgent(
             api_key="test-key",
             base_url="https://api.anthropic.com",
