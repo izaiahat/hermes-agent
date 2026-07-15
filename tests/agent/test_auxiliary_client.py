@@ -3809,7 +3809,7 @@ class TestCodexAdapterReasoningTranslation:
     """
 
     @staticmethod
-    def _build_adapter():
+    def _build_adapter(base_url="https://api.openai.com/v1"):
         """Build a _CodexCompletionsAdapter with a mocked responses.create()."""
         from agent.auxiliary_client import _CodexCompletionsAdapter
         from types import SimpleNamespace
@@ -3848,9 +3848,29 @@ class TestCodexAdapterReasoningTranslation:
             return _FakeCreateStream()
 
         real_client = MagicMock()
+        real_client.base_url = base_url
         real_client.responses.create = _create
         adapter = _CodexCompletionsAdapter(real_client, "gpt-5.3-codex")
         return adapter, captured_kwargs
+
+    def test_subscription_auxiliary_call_uses_global_gate(self):
+        adapter, _ = self._build_adapter("https://chatgpt.com/backend-api/codex")
+        gate = MagicMock()
+        with (
+            patch("agent.codex_throttle.codex_request_gate", return_value=gate) as gate_fn,
+            patch("agent.codex_throttle.note_success") as note_success,
+        ):
+            adapter.create(messages=[{"role": "user", "content": "hi"}])
+        gate_fn.assert_called_once_with()
+        gate.__enter__.assert_called_once()
+        gate.__exit__.assert_called_once()
+        note_success.assert_called_once_with()
+
+    def test_direct_openai_auxiliary_call_does_not_use_subscription_gate(self):
+        adapter, _ = self._build_adapter("https://api.openai.com/v1")
+        with patch("agent.codex_throttle.codex_request_gate") as gate_fn:
+            adapter.create(messages=[{"role": "user", "content": "hi"}])
+        gate_fn.assert_not_called()
 
     def test_reasoning_effort_medium_translated_to_top_level(self):
         adapter, captured = self._build_adapter()

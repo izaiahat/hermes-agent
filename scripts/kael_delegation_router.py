@@ -18,7 +18,7 @@ from dataclasses import asdict, dataclass, field
 from typing import Any, Iterable, Sequence
 
 CONCURRENCY = {
-    "gpt55_max_concurrent_children": 10,
+    "gpt55_max_concurrent_children": 5,
     "native_codex_max_concurrent_children": 5,
     "gpt55_orchestrator_max_concurrent_children": 2,
     "max_spawn_depth": 4,
@@ -31,7 +31,10 @@ FAILURE_RECOVERY = {
         "fall back to safe gpt-5.6-sol leaves unless the operator explicitly requests "
         "a Codex retry"
     ),
-    "delegate_task_failure": "fall back to terminal+hermes chat shell-out",
+    "delegate_task_failure": (
+        "wait for the active batch to finish, then retry through native "
+        "delegate_task with a smaller flat batch"
+    ),
     "bad_child_output": "do not trust silently; add a follow-up lane and annotate the gap",
 }
 
@@ -56,7 +59,7 @@ GPT55_SPECIALIST = {
     "provider": "openai-codex",
     "role": "leaf",
     "max_context_tokens": 272_000,
-    "timeout_seconds": 600,
+    "timeout_seconds": 2400,
     "default_toolsets": {
         "code": ["file", "terminal"],
         "research": ["file", "web"],
@@ -72,7 +75,7 @@ CODEX_NATIVE = {
     "role": "leaf",
     "api_mode": "codex_responses",
     "max_context_tokens": 272_000,
-    "timeout_seconds": 600,
+    "timeout_seconds": 2400,
     "default_toolsets": {
         "read": ["file"],
         "write": ["file", "terminal"],
@@ -90,7 +93,7 @@ GPT55_ORCHESTRATOR = {
     "provider": "openai-codex",
     "role": "orchestrator",
     "max_context_tokens": 272_000,
-    "timeout_seconds": 600,
+    "timeout_seconds": 2400,
     "command": (
         "hermes chat --provider openai-codex --model gpt-5.6-sol "
         "-s delegation-routing-v2 -Q -q '<self-contained orchestrator prompt>'"
@@ -322,7 +325,9 @@ def make_gpt55_orchestrator(reasons: list[str]) -> RoutingDecision:
                 "bad_output": FAILURE_RECOVERY["bad_child_output"],
             },
         ),
-        max_concurrent_children=CONCURRENCY["gpt55_orchestrator_max_concurrent_children"],
+        max_concurrent_children=CONCURRENCY[
+            "gpt55_orchestrator_max_concurrent_children"
+        ],
     )
 
 
@@ -562,7 +567,7 @@ def validation_cases() -> list[ValidationCase]:
             name="bounded_json_code_review",
             profile=example_profiles()[0],
             expected_lane="gpt55_specialist",
-            expected_max_concurrent_children=10,
+            expected_max_concurrent_children=5,
             expected_model="gpt-5.6-sol",
         ),
         ValidationCase(
@@ -577,7 +582,7 @@ def validation_cases() -> list[ValidationCase]:
             profile=example_profiles()[2],
             expected_lane="parallel_fanout",
             expected_child_lane="gpt55_specialist",
-            expected_max_concurrent_children=10,
+            expected_max_concurrent_children=5,
         ),
         ValidationCase(
             name="shared_truth_parent",
@@ -618,7 +623,10 @@ def run_validation() -> dict[str, Any]:
                 "max_concurrent_children="
                 f"{decision.max_concurrent_children} expected={case.expected_max_concurrent_children}"
             )
-        if case.expected_child_lane is not None and decision.child_lane != case.expected_child_lane:
+        if (
+            case.expected_child_lane is not None
+            and decision.child_lane != case.expected_child_lane
+        ):
             mismatches.append(
                 f"child_lane={decision.child_lane} expected={case.expected_child_lane}"
             )
@@ -626,14 +634,12 @@ def run_validation() -> dict[str, Any]:
             mismatches.append(f"model={decision.model} expected={case.expected_model}")
         passed = not mismatches
         ok = ok and passed
-        results.append(
-            {
-                "name": case.name,
-                "passed": passed,
-                "mismatches": mismatches,
-                "decision": asdict(decision),
-            }
-        )
+        results.append({
+            "name": case.name,
+            "passed": passed,
+            "mismatches": mismatches,
+            "decision": asdict(decision),
+        })
     return {
         "ok": ok,
         "case_count": len(cases),

@@ -113,6 +113,43 @@ class TestRunConversationCodexPath:
         assert result["codex_thread_id"] == "thread-stub-1"
         assert result["codex_turn_id"] == "turn-stub-1"
 
+    def test_app_server_admission_retries_once_without_retiring_session(self):
+        agent = _make_codex_agent()
+        rejected = {
+            "final_response": "",
+            "completed": False,
+            "messages": [],
+            "error": "capacity busy",
+            "error_type": "CodexGateAdmissionError",
+            "admission_reason": "timeout",
+            "retryable": True,
+            "retry_after_seconds": 0.25,
+            "agent_persisted": True,
+        }
+        success = {
+            "final_response": "retry worked",
+            "completed": True,
+            "messages": [],
+            "error": None,
+            "retryable": False,
+            "agent_persisted": True,
+        }
+        with (
+            patch.object(
+                agent,
+                "_run_codex_app_server_turn",
+                side_effect=[rejected, success],
+            ) as run_turn,
+            patch("agent.conversation_loop.time.sleep") as sleep,
+            patch.object(agent, "_spawn_background_review", return_value=None),
+        ):
+            result = agent.run_conversation("hello")
+        assert run_turn.call_count == 2
+        sleep.assert_called_once_with(0.25)
+        assert result["completed"] is True
+        assert result["admission_retry_attempted"] is True
+        assert "admission_retries_exhausted" not in result
+
     def test_codex_app_server_token_usage_updates_session_accounting(self, monkeypatch):
         def fake_run_turn(self, user_input: str, **kwargs):
             return TurnResult(

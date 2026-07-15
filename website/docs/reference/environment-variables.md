@@ -757,7 +757,16 @@ Advanced per-platform knobs for throttling the outbound message batcher. Most us
 | `HERMES_OAUTH_FILE` | Override the path used for OAuth credential storage (default: `~/.hermes/auth.json`). |
 | `HERMES_AGENT_HELP_GUIDANCE` | Append additional guidance text to the system prompt for custom deployments. |
 | `HERMES_AGENT_LOGO` | Override the ASCII banner logo at CLI startup. |
-| `DELEGATION_MAX_CONCURRENT_CHILDREN` | Max parallel subagents per `delegate_task` batch (default: `3`, floor of 1, no ceiling). Also configurable via `delegation.max_concurrent_children` in `config.yaml` — the config value takes priority. |
+| `DELEGATION_MAX_CONCURRENT_CHILDREN` | Per-call batch width (default and hard ceiling: `5`; floor `1`). Also configurable via `delegation.max_concurrent_children`; config wins. |
+| `DELEGATION_MAX_BACKGROUND_BATCHES` | Detached top-level batches per process (default and hard ceiling: `1`). Also configurable via `delegation.max_background_batches`; config wins. |
+| `DELEGATION_MAX_TOTAL_DESCENDANTS` | Active direct+nested descendants per process/tree (default and hard ceiling: `5`; floor `1`). Also configurable via `delegation.max_total_descendants`; config wins. |
+| `HERMES_CODEX_THROTTLE_ENV_FILE` | Optional override for the root-scoped Codex policy path, intended for isolated tests/recovery. Normal processes load `<Hermes root>/codex-throttle.env`. The file's `HERMES_CODEX_*` values are authoritative over inherited process environment. |
+| `HERMES_CODEX_MAX_CONCURRENCY` | Box-wide subscription-backed Codex request ceiling (default and hard ceiling: `5`). |
+| `HERMES_CODEX_MIN_CONCURRENCY` | Adaptive floor, clamped to `1..5`. |
+| `HERMES_CODEX_CONCURRENCY_START` | Initial adaptive permit, clamped to `1..5`. |
+| `HERMES_CODEX_ADAPTIVE_CONCURRENCY` | Enable AIMD permit adjustment (`1`/`0`; default: `1`). |
+| `HERMES_CODEX_GATE_ACQUIRE_TIMEOUT_SECONDS` | Monotonic admission timeout, including cooldown wait. `0` rejects immediately; timeout never proceeds ungated. |
+| `HERMES_CODEX_GATE_DISABLED` | Explicit operator-only emergency bypass. Missing `fcntl` or an unavailable gate directory fails closed instead of implicitly disabling admission. |
 
 ## Interface
 

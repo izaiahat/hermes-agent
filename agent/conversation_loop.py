@@ -686,13 +686,25 @@ def run_conversation(
     # See agent/transports/codex_app_server_session.py for the adapter
     # and references/codex-app-server-runtime.md for the rationale.
     if agent.api_mode == "codex_app_server":
-        return agent._run_codex_app_server_turn(
-            user_message=user_message,
-            original_user_message=original_user_message,
-            messages=messages,
-            effective_task_id=effective_task_id,
-            should_review_memory=_should_review_memory,
-        )
+        app_server_kwargs = {
+            "user_message": user_message,
+            "original_user_message": original_user_message,
+            "messages": messages,
+            "effective_task_id": effective_task_id,
+            "should_review_memory": _should_review_memory,
+        }
+        result = agent._run_codex_app_server_turn(**app_server_kwargs)
+        if result.get("retryable") and not agent._interrupt_requested:
+            retry_after = min(
+                5.0, max(0.0, float(result.get("retry_after_seconds") or 0.0))
+            )
+            if retry_after:
+                time.sleep(retry_after)
+            result = agent._run_codex_app_server_turn(**app_server_kwargs)
+            result["admission_retry_attempted"] = True
+            if result.get("retryable"):
+                result["admission_retries_exhausted"] = True
+        return result
 
     while (api_call_count < agent.max_iterations and agent.iteration_budget.remaining > 0) or agent._budget_grace_call:
         # Reset per-turn checkpoint dedup so each iteration can take one snapshot

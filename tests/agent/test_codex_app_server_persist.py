@@ -26,7 +26,7 @@ duplicate the user turn (#860 / #42039). This test locks in:
 import tempfile
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 from agent.codex_runtime import run_codex_app_server_turn
 from hermes_state import SessionDB
@@ -74,6 +74,49 @@ def test_codex_success_flushes_and_reports_persisted():
     assert result["completed"] is True
     # With the agent as sole persister, the gateway must SKIP its DB write.
     assert result["agent_persisted"] is True
+
+
+def test_codex_app_server_turn_holds_global_gate():
+    agent = _make_agent(session_db=None)
+    gate = MagicMock()
+    with patch("agent.codex_throttle.codex_request_gate", return_value=gate) as gate_fn:
+        result = run_codex_app_server_turn(
+            agent,
+            user_message="hello",
+            original_user_message="hello",
+            messages=[{"role": "user", "content": "hello"}],
+            effective_task_id="task-gated",
+        )
+    assert result["completed"] is True
+    gate_fn.assert_called_once_with()
+    gate.__enter__.assert_called_once()
+    gate.__exit__.assert_called_once()
+
+
+def test_admission_rejection_does_not_retire_healthy_app_server_session():
+    from agent.codex_throttle import CodexGateAdmissionError
+
+    agent = _make_agent(session_db=None)
+    original_session = agent._codex_session
+    gate = MagicMock()
+    gate.__enter__.side_effect = CodexGateAdmissionError("timeout", "capacity busy")
+    with patch("agent.codex_throttle.codex_request_gate", return_value=gate):
+        result = run_codex_app_server_turn(
+            agent,
+            user_message="hello",
+            original_user_message="hello",
+            messages=[{"role": "user", "content": "hello"}],
+            effective_task_id="task-rejected",
+        )
+    assert result["completed"] is False
+    assert result["api_calls"] == 0
+    assert result["retryable"] is True
+    assert result["error_type"] == "CodexGateAdmissionError"
+    assert result["admission_reason"] == "timeout"
+    assert 0.1 <= result["retry_after_seconds"] <= 5.0
+    assert agent._codex_session is original_session
+    original_session.run_turn.assert_not_called()
+    original_session.close.assert_not_called()
 
 
 def test_codex_turn_persists_each_message_exactly_once():

@@ -7,7 +7,9 @@ import sys
 from pathlib import Path
 
 
-SCRIPT_PATH = Path(__file__).resolve().parents[1] / "scripts" / "kael_delegation_router.py"
+SCRIPT_PATH = (
+    Path(__file__).resolve().parents[1] / "scripts" / "kael_delegation_router.py"
+)
 SPEC = importlib.util.spec_from_file_location("kael_delegation_router", SCRIPT_PATH)
 assert SPEC and SPEC.loader
 MODULE = importlib.util.module_from_spec(SPEC)
@@ -71,7 +73,7 @@ def test_bounded_code_review_routes_to_gpt55() -> None:
     assert decision.lane == "gpt55_specialist"
     assert decision.model == "gpt-5.6-sol"
     assert decision.toolsets == ["file", "terminal"]
-    assert decision.max_concurrent_children == 10
+    assert decision.max_concurrent_children == 5
 
 
 def test_exactly_200k_structured_still_routes_to_gpt55() -> None:
@@ -84,7 +86,7 @@ def test_exactly_200k_structured_still_routes_to_gpt55() -> None:
         )
     )
     assert decision.lane == "gpt55_specialist"
-    assert decision.max_concurrent_children == 10
+    assert decision.max_concurrent_children == 5
 
 
 def test_exactly_300k_without_other_triggers_falls_back_to_parent() -> None:
@@ -141,7 +143,7 @@ def test_parallel_small_subtasks_route_to_gpt55_children() -> None:
     assert decision.lane == "parallel_fanout"
     assert decision.child_lane == "gpt55_specialist"
     assert decision.child_toolsets == ["file"]
-    assert decision.max_concurrent_children == 10
+    assert decision.max_concurrent_children == 5
 
 
 def test_parallel_mixed_subtask_sizes_routes_to_native_codex_children() -> None:

@@ -386,8 +386,35 @@ def run_codex_app_server_turn(
     # standard run_conversation() flow (line ~11823) before the early
     # return reaches us. Do NOT append again — that would duplicate.
 
+    from agent.codex_throttle import (
+        CodexGateAdmissionError,
+        codex_request_gate,
+        note_rate_limited_from_error,
+        note_success,
+        recommended_retry_delay,
+    )
+
+    turn = None
     try:
-        turn = agent._codex_session.run_turn(user_input=user_message)
+        with codex_request_gate():
+            turn = agent._codex_session.run_turn(user_input=user_message)
+    except CodexGateAdmissionError as exc:
+        # Local capacity rejection is retryable and says nothing about the
+        # health of the persistent app-server session.
+        return {
+            "final_response": "",
+            "completed": False,
+            "api_calls": 0,
+            "tool_iterations": 0,
+            "model": getattr(agent, "model", "codex-app-server"),
+            "messages": messages,
+            "error": str(exc),
+            "error_type": type(exc).__name__,
+            "admission_reason": exc.reason,
+            "retryable": True,
+            "retry_after_seconds": min(5.0, max(0.1, recommended_retry_delay())),
+            "agent_persisted": True,
+        }
     except Exception as exc:
         logger.exception("codex app-server turn failed")
         # Crash → unconditionally drop the session so the next turn
@@ -409,6 +436,11 @@ def run_codex_app_server_turn(
             "error": str(exc),
         }
 
+    assert turn is not None
+    if getattr(turn, "error", None):
+        note_rate_limited_from_error(turn.error)
+    else:
+        note_success()
     # If the turn signalled the underlying client is wedged (deadline
     # blown, post-tool watchdog tripped, OAuth refresh died, subprocess
     # exited), retire the session so the next turn respawns codex

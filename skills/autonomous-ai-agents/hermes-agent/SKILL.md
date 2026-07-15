@@ -708,7 +708,13 @@ Spawn a subagent with an isolated context + terminal session.
 
 - **Single:** `delegate_task(goal, context)`.
 - **Batch:** `delegate_task(tasks=[{goal, ...}, ...])` runs children in
-  parallel, capped by `delegation.max_concurrent_children` (default 3).
+  parallel, capped per call by `delegation.max_concurrent_children` (default and
+  hard ceiling 5).
+- **Background admission:** model-initiated top-level calls detach by default.
+  `delegation.max_background_batches` (default and hard ceiling 1) caps detached
+  batch units per process, while `delegation.max_total_descendants` (default and
+  hard ceiling 5) caps active direct+nested descendants per process/tree.
+  Capacity rejection is fail-closed; the rejected batch is not run inline.
 - **Background:** `delegate_task(background=true)` returns a handle
   immediately and keeps the parent loop going; the child's result
   re-enters the conversation as a new turn when it finishes.

@@ -20,7 +20,7 @@ delegate_task(
 
 ## Parallel Batch
 
-Up to 3 concurrent subagents by default (configurable, no hard ceiling):
+Up to 5 concurrent subagents (default and hard ceiling):
 
 ```python
 delegate_task(tasks=[
@@ -121,11 +121,13 @@ delegate_task(
 
 When you provide a `tasks` array, subagents run in **parallel** using a thread pool:
 
-- **Maximum concurrency:** 3 tasks by default (configurable via `delegation.max_concurrent_children` or the `DELEGATION_MAX_CONCURRENT_CHILDREN` env var; floor of 1, no hard ceiling). Batches larger than the limit return a tool error rather than being silently truncated.
-- **Thread pool:** Uses `ThreadPoolExecutor` with the configured concurrency limit as max workers
+- **Batch width:** 5 tasks (default and hard ceiling via `delegation.max_concurrent_children` or `DELEGATION_MAX_CONCURRENT_CHILDREN`). Batches larger than five return a tool error rather than being silently truncated.
+- **Detached batch capacity:** model-initiated top-level calls run in the background and are hard-capped at one per process by `delegation.max_background_batches`. Capacity rejection is fail-closed; rejected work is not run inline. Transports without detached delivery reject before constructing children.
+- **Tree budget:** `delegation.max_total_descendants` hard-caps all active direct and nested descendants in the process/tree at five, preventing stacked batches or orchestrators from multiplying past the budget.
+- **Thread pool:** Uses `ThreadPoolExecutor` with the admitted batch size as max workers
 - **Progress display:** In CLI mode, a tree-view shows tool calls from each subagent in real-time with per-task completion lines. In gateway mode, progress is batched and relayed to the parent's progress callback
 - **Result ordering:** Results are sorted by task index to match input order regardless of completion order
-- **Interrupt propagation:** Interrupting the parent (e.g., sending a new message) interrupts all active children
+- **Interrupt behavior:** synchronous direct/nested calls propagate parent interruption. Detached top-level batches are no longer parent-owned; stop them with `/agents` or by stopping the process.
 
 Single-task delegation runs directly without thread pool overhead.
 
@@ -221,21 +223,22 @@ delegate_task(
 - `role="orchestrator"`: child retains the `delegation` toolset. Gated by `delegation.max_spawn_depth` (default **1** = flat, so `role="orchestrator"` is a no-op at defaults). Raise `max_spawn_depth` to 2 to allow orchestrator children to spawn leaf grandchildren; 3+ for deeper trees. There is no upper ceiling — cost is the practical limit.
 - `delegation.orchestrator_enabled: false`: global kill switch that forces every child to `leaf` regardless of the `role` parameter.
 
-**Cost warning:** With `max_spawn_depth: 3` and `max_concurrent_children: 3`, the tree can reach 3×3×3 = 27 concurrent leaf agents. Each extra level multiplies spend — raise `max_spawn_depth` intentionally.
+**Cost warning:** depth still multiplies potential work, but `max_total_descendants` is the hard process/tree budget. Keep it aligned with the intended active-child ceiling; depth never grants extra descendant slots.
 
 ## Lifetime and Durability
 
-:::warning delegate_task is synchronous — not durable
-`delegate_task` runs **inside the parent's current turn**. It blocks the parent until every child finishes (or is cancelled). It is **not** a background job queue:
+:::warning Background delegation is process-local — not durable
+Model-initiated top-level `delegate_task` calls are detached by default: they
+return a handle immediately and deliver one consolidated completion later.
+Direct programmatic callers can use synchronous execution, and nested
+orchestrator delegation remains synchronous.
 
-- If the parent is interrupted (user sends a new message, `/stop`, `/new`), all active children are cancelled and return `status="interrupted"`. Their in-progress work is discarded.
-- Children do **not** continue running after the parent turn ends.
-- Cancelled children return a structured result (`status="interrupted"`, `exit_reason="interrupted"`), but because the parent was interrupted too, that result often never makes it into a user-visible reply.
+Detached batches survive the parent turn, but **not** a Hermes process restart,
+`/new`, or host failure. They are therefore background work, not a durable job
+queue. For work that must survive process restart, use:
 
-For **durable long-running work** that must survive interrupts or outlive the current turn, use:
-
-- `cronjob` (action=`create`) — schedules a separate agent run; immune to parent-turn interrupts.
-- `terminal(background=True, notify_on_complete=True)` — long-running shell commands that keep running while the agent does other things.
+- `cronjob` (action=`create`) — schedules a separate agent run.
+- `terminal(background=True, notify_on_complete=True)` — tracked shell work.
 :::
 
 ## Key Properties
@@ -243,7 +246,8 @@ For **durable long-running work** that must survive interrupts or outlive the cu
 - Each subagent gets its **own terminal session** (separate from the parent)
 - **Nested delegation is opt-in** — only `role="orchestrator"` children can delegate further, and only when `max_spawn_depth` is raised from its default of 1 (flat). Disable globally with `orchestrator_enabled: false`.
 - Leaf subagents **cannot** call: `delegate_task`, `clarify`, `memory`, `execute_code`. Orchestrator subagents retain `delegate_task` but still cannot use the other three.
-- **Interrupt propagation** — interrupting the parent interrupts all active children (including grandchildren under orchestrators)
+- **Bounded admission** — batch width, detached batch units, and total active descendants are separate controls; capacity rejection never executes the rejected batch inline.
+- **Interrupt propagation** — synchronous direct/nested delegation propagates interruption; detached top-level batches are controlled through `/agents` or process lifecycle.
 - Only the final summary enters the parent's context, keeping token usage efficient
 - Subagents inherit the parent's **API key, provider configuration, and credential pool** (enabling key rotation on rate limits)
 
@@ -254,7 +258,7 @@ For **durable long-running work** that must survive interrupts or outlive the cu
 | **Reasoning** | Full LLM reasoning loop | Just Python code execution |
 | **Context** | Fresh isolated conversation | No conversation, just script |
 | **Tool access** | All non-blocked tools with reasoning | 7 tools via RPC, no reasoning |
-| **Parallelism** | 3 concurrent subagents by default (configurable) | Single script |
+| **Parallelism** | Up to 5 concurrent subagents (hard ceiling) | Single script |
 | **Best for** | Complex tasks needing judgment | Mechanical multi-step pipelines |
 | **Token cost** | Higher (full LLM loop) | Lower (only stdout returned) |
 | **User interaction** | None (subagents can't clarify) | None |
@@ -267,8 +271,10 @@ For **durable long-running work** that must survive interrupts or outlive the cu
 # In ~/.hermes/config.yaml
 delegation:
   max_iterations: 50                        # Max turns per child (default: 50)
-  # max_concurrent_children: 3              # Parallel children per batch (default: 3)
-  # max_spawn_depth: 1                      # Tree depth (floor 1, no ceiling, default 1 = flat). Raise to 2 to allow orchestrator children to spawn leaves; 3+ for deeper trees.
+  # max_concurrent_children: 5              # Parallel children per batch; hard cap 5.
+  # max_background_batches: 1               # Detached batches per process; hard cap 1.
+  # max_total_descendants: 5                 # Active tree descendants; hard cap 5.
+  # max_spawn_depth: 1                       # Tree depth; does not override max_total_descendants.
   # orchestrator_enabled: true              # Disable to force all children to leaf role.
   model: "google/gemini-3-flash-preview"             # Optional provider/model override
   provider: "openrouter"                             # Optional built-in provider

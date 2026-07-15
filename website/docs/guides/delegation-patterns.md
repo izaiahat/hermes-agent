@@ -217,28 +217,36 @@ Restricting toolsets keeps the subagent focused and prevents accidental side eff
 
 ## Constraints
 
-- **Default 3 parallel tasks**: batches default to 3 concurrent subagents (configurable via `delegation.max_concurrent_children` in config.yaml, no hard ceiling, only a floor of 1)
+- **Default and hard batch width 5**: each `delegate_task` call is capped by `delegation.max_concurrent_children`.
+- **One detached batch**: `delegation.max_background_batches` independently caps background batch units per process at the hard ceiling of 1. Raising batch width cannot raise the detached-batch count.
+- **Five-descendant tree budget**: `delegation.max_total_descendants` caps all active direct and nested descendants in a process/tree at 5. A rejected batch does not run synchronously as a bypass.
 - **Nested delegation is opt-in**: leaf subagents (default) cannot call `delegate_task`, `clarify`, `memory`, or `execute_code`. Orchestrator subagents (`role="orchestrator"`) retain `delegate_task` for further delegation, but only when `delegation.max_spawn_depth` is raised above the default of 1 (floor 1, no ceiling); the other three remain blocked. Disable globally via `delegation.orchestrator_enabled: false`.
 
 ### Tuning Concurrency and Depth
 
 | Config | Default | Range | Effect |
 |--------|---------|-------|--------|
-| `max_concurrent_children` | 3 | >=1 | Parallel batch size per `delegate_task` call |
+| `max_concurrent_children` | 5 | 1–5 | Parallel batch width per `delegate_task` call |
+| `max_background_batches` | 1 | 1 | Detached top-level batch units per process |
+| `max_total_descendants` | 5 | 1–5 | Active direct+nested descendants per process/tree |
 | `max_spawn_depth` | 1 | >=1 | How many delegation levels can spawn further |
 
-Example: running 30 parallel workers with nested subagents:
+Safe five-wide flat configuration:
 
 ```yaml
 delegation:
-  max_concurrent_children: 30
-  max_spawn_depth: 2
+  max_concurrent_children: 5
+  max_background_batches: 1
+  max_total_descendants: 5
+  max_spawn_depth: 1
 ```
 
+Raise depth only when nested orchestration is required; the descendant budget
+continues to cap the whole active tree.
 - **Separate terminals** — each subagent gets its own terminal session with separate working directory and state
 - **No conversation history** — subagents see only the `goal` and `context` the parent agent passes when calling `delegate_task`
 - **Default 50 iterations** — set `max_iterations` lower for simple tasks to save cost
-- **Not durable** — `delegate_task` is synchronous and runs inside the parent turn. If the parent is interrupted (new user message, `/stop`, `/new`), all active children are cancelled (`status="interrupted"`) and their work is discarded. For work that must outlive the current turn, use `cronjob` or `terminal(background=True, notify_on_complete=True)`.
+- **Process-local, not durable** — model-initiated top-level calls detach and deliver one consolidated completion later, but they still die with their hosting process. Unsupported detached-delivery transports reject before building children. Direct nested calls can run synchronously. Use `cronjob` or `terminal(background=True, notify_on_complete=True)` for durable work.
 
 ---
 

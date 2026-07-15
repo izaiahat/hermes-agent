@@ -69,7 +69,7 @@ _records_lock = threading.Lock()
 # tail after completion so `list_async_delegations()` can show recent results.
 _records: Dict[str, Dict[str, Any]] = {}
 
-_DEFAULT_MAX_ASYNC_CHILDREN = 3
+_DEFAULT_MAX_ASYNC_CHILDREN = 1
 # How many completed records to retain for status queries before pruning.
 _MAX_RETAINED_COMPLETED = 50
 
@@ -152,9 +152,8 @@ def dispatch_async_delegation(
         Optional callable to signal the child to stop (used on shutdown /
         explicit cancel).
     max_async_children
-        Concurrency cap. When at capacity the dispatch is REJECTED (the caller
-        should fall back to sync or tell the user) rather than queued, so a
-        runaway model can't pile up unbounded background work.
+        Backward-compatible caller hint. Detached admission is hard-capped at
+        one active unit per process; larger values are ignored.
 
     Returns
     -------
@@ -162,6 +161,7 @@ def dispatch_async_delegation(
         ``{"status": "dispatched", "delegation_id": ...}`` on success, or
         ``{"status": "rejected", "error": ...}`` when at capacity.
     """
+    effective_limit = 1  # hard safety ceiling; caller hints cannot widen it
     delegation_id = _new_delegation_id()
     dispatched_at = time.time()
     record: Dict[str, Any] = {
@@ -184,20 +184,19 @@ def dispatch_async_delegation(
         running = sum(
             1 for r in _records.values() if r.get("status") == "running"
         )
-        if running >= max_async_children:
+        if running >= effective_limit:
             return {
                 "status": "rejected",
                 "error": (
-                    f"Async delegation capacity reached ({max_async_children} "
+                    f"Async delegation capacity reached ({effective_limit} "
                     f"running). Wait for one to finish (its result will re-enter "
-                    f"the chat), or run this task synchronously "
-                    f"(background=false). Raise delegation.max_concurrent_children in "
-                    f"config.yaml to allow more concurrent background subagents."
+                    f"the chat), then retry. Detached delegation is hard-capped "
+                    f"at one active background batch per process."
                 ),
             }
         _records[delegation_id] = record
 
-    executor = _get_executor(max_async_children)
+    executor = _get_executor(effective_limit)
 
     def _worker() -> None:
         result: Dict[str, Any] = {}
@@ -340,6 +339,7 @@ def dispatch_async_delegation_batch(
     ``{"status": "rejected", "error": ...}`` when the async pool is at
     capacity.
     """
+    effective_limit = 1  # hard safety ceiling; caller hints cannot widen it
     delegation_id = _new_delegation_id()
     dispatched_at = time.time()
     n = len(goals)
@@ -366,19 +366,19 @@ def dispatch_async_delegation_batch(
         running = sum(
             1 for r in _records.values() if r.get("status") == "running"
         )
-        if running >= max_async_children:
+        if running >= effective_limit:
             return {
                 "status": "rejected",
                 "error": (
-                    f"Async delegation capacity reached ({max_async_children} "
+                    f"Async delegation capacity reached ({effective_limit} "
                     f"running). Wait for one to finish (its result will re-enter "
-                    f"the chat), or raise delegation.max_concurrent_children in "
-                    f"config.yaml to allow more concurrent background units."
+                    f"the chat), then retry. Detached delegation is hard-capped "
+                    f"at one active background batch per process."
                 ),
             }
         _records[delegation_id] = record
 
-    executor = _get_executor(max_async_children)
+    executor = _get_executor(effective_limit)
 
     def _worker() -> None:
         combined: Dict[str, Any] = {}

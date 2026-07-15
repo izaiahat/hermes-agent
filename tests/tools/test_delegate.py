@@ -86,7 +86,7 @@ class TestDelegateRequirements(unittest.TestCase):
         self.assertNotIn("acp_args", props)
         self.assertNotIn("acp_command", props["tasks"]["items"]["properties"])
         self.assertNotIn("acp_args", props["tasks"]["items"]["properties"])
-        self.assertNotIn("maxItems", props["tasks"])  # removed — limit is now runtime-configurable
+        self.assertEqual(props["tasks"]["maxItems"], 5)  # hard safety ceiling
 
     def test_schema_description_advertises_runtime_limits(self):
         """The model must see the user's actual concurrency / spawn-depth caps,
@@ -115,6 +115,9 @@ class TestDelegateRequirements(unittest.TestCase):
         self.assertIn(f"up to {max_children}", tasks_desc)
         # role parameter description names the spawn-depth limit.
         self.assertIn(f"max_spawn_depth={max_depth}", role_desc)
+        self.assertIn("one background unit with one handle", desc)
+        self.assertIn("NESTED orchestrator calls run synchronously", desc)
+        self.assertNotIn("N handles", desc)
         # The misleading "default 3" / "default 2" wording is gone from
         # every dynamic surface (model-facing).
         for surface in (desc, tasks_desc, role_desc):
@@ -1067,7 +1070,7 @@ class TestBlockedTools(unittest.TestCase):
             _MAX_SPAWN_DEPTH_CAP,
             _MIN_SPAWN_DEPTH,
         )
-        self.assertEqual(_get_max_concurrent_children(), 3)
+        self.assertEqual(_get_max_concurrent_children(), 5)
         self.assertEqual(MAX_DEPTH, 1)
         self.assertEqual(_get_max_spawn_depth(), 1)       # default: flat
         self.assertTrue(_get_orchestrator_enabled())      # default
@@ -2622,7 +2625,7 @@ class TestDelegateEventEnum(unittest.TestCase):
 
 
 class TestConcurrencyDefaults(unittest.TestCase):
-    """Tests for the concurrency default and no hard ceiling."""
+    """Tests for the five-wide default and hard safety ceiling."""
 
     def test_load_config_prefers_active_persistent_config_over_cli_defaults(self):
         stale_cli = types.ModuleType("cli")
@@ -2648,7 +2651,7 @@ class TestConcurrencyDefaults(unittest.TestCase):
                 "hermes_cli.config.load_config_readonly", return_value=active_config
             ):
                 self.assertEqual(_load_config()["max_concurrent_children"], 50)
-                self.assertEqual(_get_max_concurrent_children(), 50)
+                self.assertEqual(_get_max_concurrent_children(), 5)
 
     def test_load_config_falls_back_to_cli_config_when_persistent_load_fails(self):
         fallback_cli = types.ModuleType("cli")
@@ -2690,21 +2693,21 @@ class TestConcurrencyDefaults(unittest.TestCase):
                     mock_loader.assert_not_called()
 
     @patch("tools.delegate_tool._load_config", return_value={})
-    def test_default_is_three(self, mock_cfg):
+    def test_default_is_five(self, mock_cfg):
         # Clear env var if set
         with patch.dict(os.environ, {}, clear=True):
-            self.assertEqual(_get_max_concurrent_children(), 3)
+            self.assertEqual(_get_max_concurrent_children(), 5)
 
     @patch("tools.delegate_tool._load_config",
            return_value={"max_concurrent_children": 10})
-    def test_no_upper_ceiling(self, mock_cfg):
-        """Users can raise concurrency as high as they want — no hard cap."""
-        self.assertEqual(_get_max_concurrent_children(), 10)
+    def test_upper_ceiling_is_five(self, mock_cfg):
+        """Configured values above five are clamped."""
+        self.assertEqual(_get_max_concurrent_children(), 5)
 
     @patch("tools.delegate_tool._load_config",
            return_value={"max_concurrent_children": 100})
-    def test_very_high_values_honored(self, mock_cfg):
-        self.assertEqual(_get_max_concurrent_children(), 100)
+    def test_very_high_values_clamped(self, mock_cfg):
+        self.assertEqual(_get_max_concurrent_children(), 5)
 
     @patch("tools.delegate_tool._load_config",
            return_value={"max_concurrent_children": 0})
@@ -2713,37 +2716,42 @@ class TestConcurrencyDefaults(unittest.TestCase):
         self.assertEqual(_get_max_concurrent_children(), 1)
 
     @patch("tools.delegate_tool._load_config", return_value={})
-    def test_env_var_honored_uncapped(self, mock_cfg):
+    def test_env_var_is_clamped(self, mock_cfg):
         with patch.dict(os.environ, {"DELEGATION_MAX_CONCURRENT_CHILDREN": "12"}):
-            self.assertEqual(_get_max_concurrent_children(), 12)
+            self.assertEqual(_get_max_concurrent_children(), 5)
 
     @patch("tools.delegate_tool._load_config",
            return_value={"max_concurrent_children": 6})
-    def test_configured_value_returned(self, mock_cfg):
-        self.assertEqual(_get_max_concurrent_children(), 6)
+    def test_configured_value_is_clamped(self, mock_cfg):
+        self.assertEqual(_get_max_concurrent_children(), 5)
 
 
-class TestAsyncCapUnified(unittest.TestCase):
-    """max_async_children is deprecated: the async cap IS max_concurrent_children."""
+class TestBackgroundBatchCapSeparated(unittest.TestCase):
+    """Detached batch capacity is independent and hard-capped at one."""
 
     @patch("tools.delegate_tool._load_config",
-           return_value={"max_concurrent_children": 15})
-    def test_async_cap_follows_concurrent_children(self, mock_cfg):
+           return_value={"max_concurrent_children": 15, "max_background_batches": 2})
+    def test_explicit_background_batch_cap_is_clamped(self, mock_cfg):
         from tools.delegate_tool import _get_max_async_children
-        self.assertEqual(_get_max_async_children(), 15)
+        self.assertEqual(_get_max_async_children(), 1)
 
     @patch("tools.delegate_tool._load_config",
            return_value={"max_concurrent_children": 15, "max_async_children": 3})
-    def test_stale_max_async_children_ignored(self, mock_cfg):
-        """A leftover max_async_children in config must not shrink the cap."""
+    def test_stale_max_async_children_is_ignored(self, mock_cfg):
         from tools.delegate_tool import _get_max_async_children
-        self.assertEqual(_get_max_async_children(), 15)
+        self.assertEqual(_get_max_async_children(), 1)
 
     @patch("tools.delegate_tool._load_config", return_value={})
-    def test_default_matches_concurrent_children_default(self, mock_cfg):
+    def test_default_is_one_detached_batch(self, mock_cfg):
         from tools.delegate_tool import _get_max_async_children
         with patch.dict(os.environ, {}, clear=True):
-            self.assertEqual(_get_max_async_children(), _get_max_concurrent_children())
+            self.assertEqual(_get_max_async_children(), 1)
+
+    @patch("tools.delegate_tool._load_config", return_value={})
+    def test_background_batch_env_override_is_clamped(self, mock_cfg):
+        from tools.delegate_tool import _get_max_async_children
+        with patch.dict(os.environ, {"DELEGATION_MAX_BACKGROUND_BATCHES": "2"}, clear=True):
+            self.assertEqual(_get_max_async_children(), 1)
 
 
 # =========================================================================

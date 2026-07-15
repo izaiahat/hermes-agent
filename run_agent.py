@@ -3765,34 +3765,14 @@ class AIAgent:
 
     @staticmethod
     def _cap_delegate_task_calls(tool_calls: list) -> list:
-        """Truncate excess delegate_task calls to max_concurrent_children.
+        """Preserve every delegation call for explicit atomic admission.
 
-        The delegate_tool caps the task list inside a single call, but the
-        model can emit multiple separate delegate_task tool_calls in one
-        turn.  This truncates the excess, preserving all non-delegate calls.
-
-        Returns the original list if no truncation was needed.
+        The former pre-execution truncation silently dropped model-emitted tool
+        calls, so the model never received a result for the discarded call ids.
+        Batch width, background-batch capacity, and descendant capacity are now
+        enforced inside ``delegate_task`` with an explicit error result.
         """
-        from tools.delegate_tool import _get_max_concurrent_children
-        max_children = _get_max_concurrent_children()
-        delegate_count = sum(1 for tc in tool_calls if tc.function.name == "delegate_task")
-        if delegate_count <= max_children:
-            return tool_calls
-        kept_delegates = 0
-        truncated = []
-        for tc in tool_calls:
-            if tc.function.name == "delegate_task":
-                if kept_delegates < max_children:
-                    truncated.append(tc)
-                    kept_delegates += 1
-            else:
-                truncated.append(tc)
-        logger.warning(
-            "Truncated %d excess delegate_task call(s) to enforce "
-            "max_concurrent_children=%d limit",
-            delegate_count - max_children, max_children,
-        )
-        return truncated
+        return tool_calls
 
     @staticmethod
     def _deduplicate_tool_calls(tool_calls: list) -> list:
@@ -3804,6 +3784,13 @@ class AIAgent:
         seen: set = set()
         unique: list = []
         for tc in tool_calls:
+            # Delegation calls must reach the atomic admission controller one by
+            # one so every model-emitted call id receives either an execution
+            # result or an explicit capacity rejection. Identical arguments do
+            # not make two delegation requests interchangeable.
+            if tc.function.name == "delegate_task":
+                unique.append(tc)
+                continue
             key = (tc.function.name, tc.function.arguments)
             if key not in seen:
                 seen.add(key)

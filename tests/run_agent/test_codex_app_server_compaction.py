@@ -1,4 +1,5 @@
 from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 from agent.codex_runtime import _record_codex_app_server_compaction
 from agent.conversation_compression import COMPACTION_STATUS, compress_context
@@ -59,9 +60,7 @@ class DummyAgent:
 
 
 def test_codex_app_server_native_auto_mode_leaves_thread_compaction_to_codex():
-    agent = DummyAgent(
-        TurnResult(thread_id="thread-1", turn_id="compact-turn-1")
-    )
+    agent = DummyAgent(TurnResult(thread_id="thread-1", turn_id="compact-turn-1"))
     messages = [{"role": "user", "content": "hi"}]
 
     returned, prompt = compress_context(
@@ -80,9 +79,7 @@ def test_codex_app_server_native_auto_mode_leaves_thread_compaction_to_codex():
 
 
 def test_codex_app_server_manual_compression_routes_to_codex_thread():
-    agent = DummyAgent(
-        TurnResult(thread_id="thread-1", turn_id="compact-turn-1")
-    )
+    agent = DummyAgent(TurnResult(thread_id="thread-1", turn_id="compact-turn-1"))
     messages = [
         {"role": "user", "content": "hi"},
         {"role": "assistant", "content": "hello"},
@@ -142,6 +139,45 @@ def test_codex_app_server_hermes_mode_auto_compression_routes_to_codex_thread():
     assert agent.context_compressor.compression_count == 1
 
 
+def test_codex_app_server_manual_compaction_uses_global_gate():
+    agent = DummyAgent(TurnResult(thread_id="thread-1", turn_id="compact-turn-1"))
+    gate = MagicMock()
+    with patch("agent.codex_throttle.codex_request_gate", return_value=gate) as gate_fn:
+        compress_context(
+            agent,
+            [{"role": "user", "content": "hi"}],
+            "system",
+            approx_tokens=100000,
+            force=True,
+        )
+    gate_fn.assert_called_once_with()
+    gate.__enter__.assert_called_once()
+    gate.__exit__.assert_called_once()
+
+
+def test_compaction_admission_rejection_preserves_session_and_bookkeeping():
+    from agent.codex_throttle import CodexGateAdmissionError
+
+    agent = DummyAgent(TurnResult(thread_id="thread-1", turn_id="compact-turn-1"))
+    gate = MagicMock()
+    gate.__enter__.side_effect = CodexGateAdmissionError("timeout", "capacity busy")
+    messages = [{"role": "user", "content": "hi"}]
+    with patch("agent.codex_throttle.codex_request_gate", return_value=gate):
+        returned, prompt = compress_context(
+            agent,
+            messages,
+            "system",
+            approx_tokens=100000,
+            force=True,
+        )
+    assert returned is messages
+    assert prompt == "cached prompt"
+    assert agent._codex_session.calls == 0
+    assert agent._codex_session.closed is False
+    assert agent.context_compressor.compression_count == 0
+    assert any("admission rejected" in warning for warning in agent.warnings)
+
+
 def test_codex_app_server_compression_failure_preserves_bookkeeping():
     agent = DummyAgent(TurnResult(error="compact failed"))
     messages = [{"role": "user", "content": "hi"}]
@@ -163,9 +199,7 @@ def test_codex_app_server_compression_failure_preserves_bookkeeping():
 
 
 def test_codex_app_server_native_compaction_notice_emits_status_and_event():
-    agent = DummyAgent(
-        TurnResult(thread_id="thread-1", turn_id="normal-turn-1")
-    )
+    agent = DummyAgent(TurnResult(thread_id="thread-1", turn_id="normal-turn-1"))
     turn = TurnResult(
         thread_id="thread-1",
         turn_id="normal-turn-1",

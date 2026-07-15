@@ -7973,6 +7973,9 @@ def _(rid, params: dict) -> dict:
         is_spawn_paused,
         list_active_subagents,
         _get_max_concurrent_children,
+        _get_max_background_batches,
+        _get_max_total_descendants,
+        active_descendant_count,
         _get_max_spawn_depth,
     )
 
@@ -7983,6 +7986,9 @@ def _(rid, params: dict) -> dict:
             "paused": is_spawn_paused(),
             "max_spawn_depth": _get_max_spawn_depth(),
             "max_concurrent_children": _get_max_concurrent_children(),
+            "max_background_batches": _get_max_background_batches(),
+            "max_total_descendants": _get_max_total_descendants(),
+            "active_descendants": active_descendant_count(),
         },
     )
 
