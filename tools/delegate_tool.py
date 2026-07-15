@@ -12,6 +12,7 @@ tool calls or reasoning.
 """
 
 import logging
+from contextlib import suppress
 import time
 import weakref
 from typing import Any, Dict, List, Optional
@@ -32,6 +33,8 @@ from tools.delegate_tool_config import (  # noqa: F401
     _get_max_spawn_depth, _get_orchestrator_enabled, _get_subagent_approval_callback, _get_worktree_isolation,
     _inherit_parent_capabilities, _load_config, _merge_request_overrides, _resolve_child_credential_pool,
     _resolve_child_runtime, _resolve_delegation_credentials,
+    _get_max_background_batches, _get_max_total_descendants, _try_reserve_descendants,
+    active_descendant_count, _reset_descendant_budget_for_tests, _DescendantLease,
     _subagent_auto_approve, _subagent_auto_deny,
 )
 from tools.delegate_tool_dispatch import _Batch, _announce_batch, _capture_origin, _run_batch
@@ -499,11 +502,30 @@ def delegate_task(
     )
     if err:
         return tool_error(err)
-    batch = _Batch(
-        task_list, children, parent_agent, creds, context, top_role, max_children,
-        live_deleg_id, live_writers, live_paths, *origin, overall_start,
-    )
-    return _run_batch(batch, background)
+    # Atomic descendant admission: reserve one lease per child BEFORE any child
+    # runs, so a burst of concurrent delegate_task calls cannot each individually
+    # pass a per-call width check and jointly exceed the box's total budget.
+    leases, active_before, limit = _try_reserve_descendants(len(task_list))
+    if leases is None:
+        for child in children or []:
+            with suppress(Exception):
+                close = getattr(child, "close", None)
+                if callable(close):
+                    close()
+        return tool_error(
+            f"delegation refused: {len(task_list)} more children would exceed the active-descendant "
+            f"budget ({active_before} active, limit {limit}). Wait for running children or raise "
+            "delegation.max_total_descendants."
+        )
+    try:
+        batch = _Batch(
+            task_list, children, parent_agent, creds, context, top_role, max_children,
+            live_deleg_id, live_writers, live_paths, *origin, overall_start,
+        )
+        return _run_batch(batch, background)
+    finally:
+        for lease in leases:
+            lease.release()
 
 
 # ── OpenAI function-calling schema ──────────────────────────────────────────

@@ -3813,7 +3813,12 @@ def _compress_context_via_codex_app_server(
         agent._emit_status(COMPACTION_STATUS)
     _activity_heartbeat = _CompressionActivityHeartbeat(agent, emit_client_status=True).start()
     try:
-        result = codex_session.compact_thread()
+        from agent.codex_throttle import codex_request_gate
+        # Box-wide Codex admission: the auxiliary/app-server paths hold a subscription
+        # slot exactly like an ordinary turn does, so they must queue behind the same
+        # gate or a compression pass can 429 every live seat.
+        with codex_request_gate():
+            result = codex_session.compact_thread()
     except BaseException:
         _activity_heartbeat.stop("context compression failed")
         raise

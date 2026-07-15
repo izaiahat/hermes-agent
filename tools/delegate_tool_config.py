@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import threading
 import os
 from typing import Any, Dict, List, Optional
 from utils import base_url_hostname, is_truthy_value
@@ -14,7 +15,15 @@ logger = logging.getLogger("tools.delegate_tool")  # log-record parity with the 
 # match hermes_cli.runtime_provider.RUNTIME_PROVIDER_TYPE_CUSTOM.
 _RUNTIME_PROVIDER_CUSTOM = "custom"
 
-_DEFAULT_MAX_CONCURRENT_CHILDREN = 10
+# Hard safety ceilings for this operator/runtime. Upstream removed its ceiling entirely
+# (floor of 1 only); a box that can be driven to N children by config alone is how the
+# 2026-09-12 swap-critical incident happened, so width, detached batches and TOTAL active
+# descendants are all bounded here and admission is refused atomically at the spawn site.
+_DEFAULT_MAX_CONCURRENT_CHILDREN = 5
+_DEFAULT_MAX_BACKGROUND_BATCHES = 1
+_descendant_budget_lock = threading.Lock()
+_active_descendants = 0
+_descendant_budget_epoch = 0
 # One-shot guard: _get_max_concurrent_children() runs on every get_definitions()
 # schema rebuild, so the >10 cost advisory would otherwise log on every turn.
 _HIGH_CONCURRENCY_WARNED = False
@@ -82,22 +91,33 @@ def _warn_once(flag_name: str, message: str, *args: Any) -> None:
         globals()[flag_name] = True
         logger.warning(message, *args)
 
-def _get_max_concurrent_children() -> int:
-    """delegation.max_concurrent_children > DELEGATION_MAX_CONCURRENT_CHILDREN env > 10.
 
-    Floor of 1 is the only bound enforced; there is no ceiling.
-    """
-    result = _knob(
-        "max_concurrent_children", "DELEGATION_MAX_CONCURRENT_CHILDREN", lambda v: max(1, int(v)),
-        _DEFAULT_MAX_CONCURRENT_CHILDREN,
-        f"delegation.max_concurrent_children=%r is not a valid integer; using default {_DEFAULT_MAX_CONCURRENT_CHILDREN}",
-    )
-    if result > 10 and _cfg().get("max_concurrent_children") is not None:
-        _warn_once(
-            "_HIGH_CONCURRENCY_WARNED", "delegation.max_concurrent_children=%d: each child consumes API tokens "
-            "independently. High values multiply cost linearly.", result,
+def _get_max_concurrent_children() -> int:
+    """Return the per-call child width, clamped to the hard safety ceiling 5."""
+    cfg = _load_config()
+    val = cfg.get("max_concurrent_children")
+    if val is None:
+        val = os.getenv("DELEGATION_MAX_CONCURRENT_CHILDREN")
+    if val is None:
+        return _DEFAULT_MAX_CONCURRENT_CHILDREN
+    try:
+        parsed = int(val)
+    except (TypeError, ValueError):
+        logger.warning(
+            "delegation.max_concurrent_children=%r is invalid; using %d",
+            val,
+            _DEFAULT_MAX_CONCURRENT_CHILDREN,
         )
-    return result
+        return _DEFAULT_MAX_CONCURRENT_CHILDREN
+    clamped = min(5, max(1, parsed))
+    if clamped != parsed:
+        logger.warning(
+            "delegation.max_concurrent_children=%d outside [1, 5]; clamping to %d",
+            parsed,
+            clamped,
+        )
+    return clamped
+
 
 def _get_independent_completions() -> bool:
     """delegation.independent_completions (bool, default False): split a background call into per-task / per-group
@@ -554,3 +574,109 @@ def _resolve_child_runtime(
     if isinstance(child_max_tokens, int):
         kwargs["max_tokens"] = child_max_tokens
     return kwargs
+
+
+
+def _get_max_background_batches() -> int:
+    """Return the hard-capped detached top-level batch capacity."""
+    cfg = _load_config()
+    val = cfg.get("max_background_batches")
+    if val is None:
+        val = os.getenv("DELEGATION_MAX_BACKGROUND_BATCHES")
+    if val is not None:
+        try:
+            parsed = int(val)
+        except (TypeError, ValueError):
+            logger.warning(
+                "delegation.max_background_batches=%r is invalid; using %d",
+                val,
+                _DEFAULT_MAX_BACKGROUND_BATCHES,
+            )
+        else:
+            if parsed != 1:
+                logger.warning(
+                    "delegation.max_background_batches=%d violates the hard ceiling 1; using 1",
+                    parsed,
+                )
+    return _DEFAULT_MAX_BACKGROUND_BATCHES
+
+
+
+def _get_max_total_descendants() -> int:
+    """Return the process/tree child budget, hard-capped at five."""
+    cfg = _load_config()
+    val = cfg.get("max_total_descendants")
+    if val is None:
+        val = os.getenv("DELEGATION_MAX_TOTAL_DESCENDANTS")
+    if val is None:
+        return 5
+    try:
+        parsed = int(val)
+    except (TypeError, ValueError):
+        logger.warning("delegation.max_total_descendants=%r is invalid; using 5", val)
+        return 5
+    clamped = min(5, max(1, parsed))
+    if clamped != parsed:
+        logger.warning(
+            "delegation.max_total_descendants=%d outside [1, 5]; clamping to %d",
+            parsed,
+            clamped,
+        )
+    return clamped
+
+
+
+class _DescendantLease:
+    """One idempotent active-child reservation bound to a budget epoch."""
+
+    def __init__(self, epoch: int):
+        self._epoch = epoch
+        self._released = False
+
+    def release(self) -> None:
+        global _active_descendants
+        with _descendant_budget_lock:
+            if self._released:
+                return
+            self._released = True
+            if self._epoch != _descendant_budget_epoch:
+                return
+            if _active_descendants <= 0:
+                logger.error("Descendant budget underflow prevented")
+                return
+            _active_descendants -= 1
+
+
+
+def active_descendant_count() -> int:
+    """Return the number of descendant slots reserved in this process."""
+    with _descendant_budget_lock:
+        return _active_descendants
+
+
+
+def _try_reserve_descendants(
+    count: int,
+) -> tuple[Optional[list[_DescendantLease]], int, int]:
+    """Atomically reserve one independent lease per requested child."""
+    global _active_descendants
+    limit = _get_max_total_descendants()
+    with _descendant_budget_lock:
+        active_before = _active_descendants
+        if count < 1 or active_before + count > limit:
+            return None, active_before, limit
+        _active_descendants += count
+        return (
+            [_DescendantLease(_descendant_budget_epoch) for _ in range(count)],
+            active_before,
+            limit,
+        )
+
+
+
+def _reset_descendant_budget_for_tests() -> None:
+    """Reset process-local admission state; test-only helper."""
+    global _active_descendants, _descendant_budget_epoch
+    with _descendant_budget_lock:
+        _active_descendants = 0
+        _descendant_budget_epoch += 1

@@ -1276,6 +1276,8 @@ DEFAULT_CONFIG = {
         # Max parallel children per batch AND max concurrent background delegation units; async
         # dispatches beyond it run synchronously. Floor 1, no ceiling.
         "max_concurrent_children": 10,
+        "max_background_batches": 1,   # hard-capped detached batch units per process
+        "max_total_descendants": 5,    # hard-capped direct+nested active children
         # Background fan-outs return as ONE message when the whole call finishes. true = each task
         # (or `group`) returns on its own as it finishes — more new turns for the orchestrator.
         "independent_completions": False,

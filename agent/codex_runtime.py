@@ -479,7 +479,12 @@ def run_codex_app_server_turn(agent, *, user_message: str, original_user_message
                                   "without a truthful pre-compaction transcript boundary")
     _ensure_codex_session(agent)
     try:
-        turn = agent._codex_session.run_turn(user_input=user_message)
+        from agent.codex_throttle import codex_request_gate
+        # Box-wide Codex admission: the auxiliary/app-server paths hold a subscription
+        # slot exactly like an ordinary turn does, so they must queue behind the same
+        # gate or a compression pass can 429 every live seat.
+        with codex_request_gate():
+            turn = agent._codex_session.run_turn(user_input=user_message)
     except Exception as exc:
         logger.exception("codex app-server turn failed")
         _close_codex_session(agent)

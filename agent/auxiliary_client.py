@@ -1476,9 +1476,15 @@ class _CodexCompletionsAdapter:
         try:
             guard.start()
             from agent.codex_runtime import _bypass_sdk_request_transform, _consume_codex_event_stream
+            from agent.codex_throttle import codex_request_gate, note_success
             # Keep bulk wire payload out of the SDK's GIL-holding request transform.
             stream_kwargs = _bypass_sdk_request_transform({**resp_kwargs, "stream": True})
-            event_stream = self._client.responses.create(**stream_kwargs)
+            # Box-wide Codex admission: the auxiliary/app-server paths hold a subscription
+            # slot exactly like an ordinary turn does, so they must queue behind the same
+            # gate or a compression pass can 429 every live seat.
+            with codex_request_gate():
+                event_stream = self._client.responses.create(**stream_kwargs)
+            note_success()
             guard.adopt_stream(event_stream)
             # The timer may fire while responses.create() is blocked; if the cancelled attempt
             # had no stream to close then, close it now that it is attempt-owned — never the shared client.

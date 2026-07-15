@@ -1,5 +1,6 @@
 import time
 from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -144,6 +145,45 @@ def test_codex_app_server_compaction_heartbeat_refreshes_activity_while_waiting(
     assert all(
         p is ActivityProvenance.AGENT_COMPRESSION for p in agent.touch_provenances
     )
+
+
+def test_codex_app_server_manual_compaction_uses_global_gate():
+    agent = DummyAgent(TurnResult(thread_id="thread-1", turn_id="compact-turn-1"))
+    gate = MagicMock()
+    with patch("agent.codex_throttle.codex_request_gate", return_value=gate) as gate_fn:
+        compress_context(
+            agent,
+            [{"role": "user", "content": "hi"}],
+            "system",
+            approx_tokens=100000,
+            force=True,
+        )
+    gate_fn.assert_called_once_with()
+    gate.__enter__.assert_called_once()
+    gate.__exit__.assert_called_once()
+
+
+def test_compaction_admission_rejection_preserves_session_and_bookkeeping():
+    from agent.codex_throttle import CodexGateAdmissionError
+
+    agent = DummyAgent(TurnResult(thread_id="thread-1", turn_id="compact-turn-1"))
+    gate = MagicMock()
+    gate.__enter__.side_effect = CodexGateAdmissionError("timeout", "capacity busy")
+    messages = [{"role": "user", "content": "hi"}]
+    with patch("agent.codex_throttle.codex_request_gate", return_value=gate):
+        returned, prompt = compress_context(
+            agent,
+            messages,
+            "system",
+            approx_tokens=100000,
+            force=True,
+        )
+    assert returned is messages
+    assert prompt == "cached prompt"
+    assert agent._codex_session.calls == 0
+    assert agent._codex_session.closed is False
+    assert agent.context_compressor.compression_count == 0
+    assert any("admission rejected" in warning for warning in agent.warnings)
 
 
 
