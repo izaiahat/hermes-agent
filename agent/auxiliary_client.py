@@ -1535,6 +1535,9 @@ class _CodexCompletionsAdapter:
         )
         attempt_stream_lock = threading.Lock()
         attempt_stream: List[Any] = []
+        subscription_base = "https://chatgpt.com/backend-api/codex"
+        client_base = str(getattr(self._client, "base_url", "") or "").rstrip("/")
+        is_subscription_codex = client_base == subscription_base
 
         def _timeout_message() -> str:
             return f"Codex auxiliary Responses stream exceeded {float(total_timeout):.1f}s total timeout"
@@ -1643,49 +1646,58 @@ class _CodexCompletionsAdapter:
                 _notify_aux_progress()
                 _check_cancelled()
 
-            event_stream = self._client.responses.create(**stream_kwargs)
-            with attempt_stream_lock:
-                attempt_stream.append(event_stream)
-            # The timer can fire while responses.create() is blocked. If the
-            # cancelled attempt had no stream to close at that instant, close it
-            # now that it is safely attempt-owned; never touch the shared client.
-            if (
-                timed_out.is_set()
-                and callable(protected_cancel_check)
-                and _captured_aux_cancel_requested(protected_cancel_check)
-            ):
-                close_fn = getattr(event_stream, "close", None)
-                if callable(close_fn):
-                    try:
-                        close_fn()
-                    except Exception:
-                        logger.debug(
-                            "Codex auxiliary: late cancelled attempt stream close failed",
-                            exc_info=True,
-                        )
-            try:
-                # Some Codex-compatible hosts accept ``stream=True`` but return
-                # a completed Responses object instead of an SSE iterator. Do
-                # not hand that object to the event consumer: typed Responses
-                # (and compatibility shims such as SimpleNamespace) are not
-                # event streams and may not be iterable at all.
-                if hasattr(event_stream, "output"):
-                    final = event_stream
-                else:
-                    final = _consume_codex_event_stream(
-                        event_stream,
-                        model=str(resp_kwargs.get("model") or model),
-                        on_event=_on_each_event,
-                    )
-            finally:
-                close_fn = getattr(event_stream, "close", None)
-                if callable(close_fn):
-                    try:
-                        close_fn()
-                    except Exception:
-                        pass
+            from contextlib import nullcontext
+
+            gate_cm = nullcontext()
+            if is_subscription_codex:
+                from agent.codex_throttle import codex_request_gate
+
+                gate_cm = codex_request_gate()
+
+            with gate_cm:
+                event_stream = self._client.responses.create(**stream_kwargs)
                 with attempt_stream_lock:
-                    attempt_stream.clear()
+                    attempt_stream.append(event_stream)
+                # The timer can fire while responses.create() is blocked. If the
+                # cancelled attempt had no stream to close at that instant, close it
+                # now that it is safely attempt-owned; never touch the shared client.
+                if (
+                    timed_out.is_set()
+                    and callable(protected_cancel_check)
+                    and _captured_aux_cancel_requested(protected_cancel_check)
+                ):
+                    close_fn = getattr(event_stream, "close", None)
+                    if callable(close_fn):
+                        try:
+                            close_fn()
+                        except Exception:
+                            logger.debug(
+                                "Codex auxiliary: late cancelled attempt stream close failed",
+                                exc_info=True,
+                            )
+                try:
+                    # Some Codex-compatible hosts accept ``stream=True`` but return
+                    # a completed Responses object instead of an SSE iterator. Do
+                    # not hand that object to the event consumer: typed Responses
+                    # (and compatibility shims such as SimpleNamespace) are not
+                    # event streams and may not be iterable at all.
+                    if hasattr(event_stream, "output"):
+                        final = event_stream
+                    else:
+                        final = _consume_codex_event_stream(
+                            event_stream,
+                            model=str(resp_kwargs.get("model") or model),
+                            on_event=_on_each_event,
+                        )
+                finally:
+                    close_fn = getattr(event_stream, "close", None)
+                    if callable(close_fn):
+                        try:
+                            close_fn()
+                        except Exception:
+                            pass
+                    with attempt_stream_lock:
+                        attempt_stream.clear()
 
             if final is None:
                 raise RuntimeError("Codex auxiliary Responses stream did not return a final response")
@@ -1726,7 +1738,13 @@ class _CodexCompletionsAdapter:
                     total_tokens=getattr(resp_usage, "total_tokens", 0)
                         or (resp_usage.get("total_tokens", 0) if isinstance(resp_usage, dict) else 0),
                 )
+            if is_subscription_codex:
+                from agent.codex_throttle import note_success
+                note_success()
         except Exception as exc:
+            if is_subscription_codex:
+                from agent.codex_throttle import note_rate_limited_from_error
+                note_rate_limited_from_error(exc)
             if timed_out.is_set():
                 raise TimeoutError(_timeout_message()) from exc
             logger.debug("Codex auxiliary Responses API call failed: %s", exc)

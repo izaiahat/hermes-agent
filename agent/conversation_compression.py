@@ -3768,10 +3768,31 @@ def _compress_context_via_codex_app_server(
         _compaction_done_emitted = True
         _emit_compaction_done(agent)
 
+    from agent.codex_throttle import (
+        CodexGateAdmissionError,
+        codex_request_gate,
+        note_rate_limited_from_error,
+        note_success,
+    )
+
     _activity_heartbeat: Optional[_CompressionActivityHeartbeat] = None
+    result = None
     try:
         _activity_heartbeat = _CompressionActivityHeartbeat(agent).start()
-        result = codex_session.compact_thread()
+        with codex_request_gate():
+            result = codex_session.compact_thread()
+    except CodexGateAdmissionError as exc:
+        if _activity_heartbeat is not None:
+            _activity_heartbeat.stop("context compression admission rejected")
+        _complete_compaction_lifecycle()
+        try:
+            agent._emit_warning(f"⚠ Codex compaction admission rejected: {exc}")
+        except Exception:
+            pass
+        existing_prompt = getattr(agent, "_cached_system_prompt", None)
+        if not existing_prompt:
+            existing_prompt = agent._build_system_prompt(system_message)
+        return messages, existing_prompt
     except BaseException:
         if _activity_heartbeat is not None:
             _activity_heartbeat.stop("context compression failed")
@@ -3783,6 +3804,11 @@ def _compress_context_via_codex_app_server(
     else:
         _activity_heartbeat.stop("context compression completed")
 
+    assert result is not None
+    if getattr(result, "error", None):
+        note_rate_limited_from_error(result.error)
+    else:
+        note_success()
     if getattr(result, "should_retire", False):
         try:
             codex_session.close()

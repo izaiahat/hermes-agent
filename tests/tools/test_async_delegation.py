@@ -209,19 +209,18 @@ def test_dispatch_rejected_at_capacity():
         ev.wait(timeout=60)
         return {"status": "completed", "summary": "x"}
 
-    for i in range(2):
-        r = ad.dispatch_async_delegation(
-            goal=f"task{i}", context=None, toolsets=None, role="leaf",
-            model="m", session_key="", runner=blocker, max_async_children=2,
-        )
-        assert r["status"] == "dispatched"
+    first = ad.dispatch_async_delegation(
+        goal="task0", context=None, toolsets=None, role="leaf",
+        model="m", session_key="", runner=blocker, max_async_children=2,
+    )
+    assert first["status"] == "dispatched"
 
-    r3 = ad.dispatch_async_delegation(
-        goal="task3", context=None, toolsets=None, role="leaf", model="m",
+    second = ad.dispatch_async_delegation(
+        goal="task1", context=None, toolsets=None, role="leaf", model="m",
         session_key="", runner=blocker, max_async_children=2,
     )
-    assert r3["status"] == "rejected"
-    assert "capacity reached" in r3["error"]
+    assert second["status"] == "rejected"
+    assert "capacity reached" in second["error"]
     ev.set()
 
 

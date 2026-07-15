@@ -69,16 +69,20 @@ Apply in this order:
 Why `F` and `E` are checked before `D`: once decomposition is explicit, Kael should choose the correct child topology rather than collapsing everything into one oversized lane.
 
 ## Concurrency and spawn limits
-- `max_concurrent_children=10`
-- `max_spawn_depth=3`
-- research bursts: spawn all immediately and supervise in parallel
+- `max_concurrent_children=5` (batch width, not a global active-child count)
+- `max_background_batches=1` per process
+- `max_total_descendants=5` per process/tree
+- `max_spawn_depth=4`; depth never overrides the descendant budget
+- research bursts: dispatch one flat batch of at most five leaves and wait for
+  the consolidated completion before dispatching another batch
 - code review across many independent files: 1 `gpt-5.6-sol` leaf per file when each file is bounded
 - architecture decisions spanning multiple domains: 1 `gpt-5.6-sol` orchestrator CLI child per domain, with leaves beneath it
 
 ## Failure recovery
 - `gpt-5.6-sol` timeout → retry once, then mark partial and continue
-- Codex CLI failure → inspect sandbox mode and retry with alternate sandbox when appropriate
-- native `delegate_task` failure → fall back to `terminal + hermes chat`
+- native Codex failure → inspect the Hermes-managed child receipt, then retry once with reduced fan-out or route to a flat gpt-5.6-sol leaf
+- native `delegate_task` capacity rejection → wait for the active batch, then
+  retry through native `delegate_task` with a smaller flat batch
 - bad child output → do not trust silently; add a follow-up lane and annotate the gap
 
 ## Smoke-test commands
@@ -95,10 +99,12 @@ cd ~/.hermes/hermes-agent
 # delegate_task(goal="Reply exactly CHILD_OK", model={provider:"openai-codex", model:"gpt-5.6-sol"}, toolsets=[])
 ```
 
-### Codex CLI long-context lane
-```bash
-cd ~/.hermes/hermes-agent
-codex exec --skip-git-repo-check --sandbox read-only --ephemeral "Reply exactly CODEX_OK"
+### Native Codex long-context leaf
+```python
+# from a live Kael session
+# delegate_task(goal="<self-contained long-context task>",
+#               model={provider:"openai-codex", model:"gpt-5.6-sol"},
+#               toolsets=["file"])
 ```
 
 ### gpt-5.6-sol orchestrator CLI lane

@@ -79,7 +79,7 @@ class TestDelegateRequirements(unittest.TestCase):
         self.assertNotIn("acp_args", props)
         self.assertNotIn("acp_command", props["tasks"]["items"]["properties"])
         self.assertNotIn("acp_args", props["tasks"]["items"]["properties"])
-        self.assertNotIn("maxItems", props["tasks"])  # removed — limit is now runtime-configurable
+        self.assertEqual(props["tasks"]["maxItems"], 5)
 
     def test_top_level_description_compact_and_complete(self):
         """The top-level description must stay compact while keeping every
@@ -141,7 +141,7 @@ class TestChildSystemPrompt(unittest.TestCase):
 class TestStripBlockedTools(unittest.TestCase):
     def test_removes_blocked_toolsets(self):
         result = _strip_blocked_tools(["terminal", "file", "delegation", "clarify", "memory", "code_execution"])
-        self.assertEqual(sorted(result), ["code_execution", "file", "terminal"])
+        self.assertEqual(sorted(result), ["file", "terminal"])
 
     def test_strips_cronjob_toolset(self):
         """Regression for issue #43466: child subagents must not inherit
@@ -195,9 +195,7 @@ class TestStripBlockedTools(unittest.TestCase):
             "memory",
         ):
             self.assertIn(toolset_name, disabled)
-        # code_execution is deliberately NOT denied — children keep
-        # execute_code for programmatic tool calling (Teknium, Jul 2026).
-        self.assertNotIn("code_execution", disabled)
+        self.assertIn("code_execution", disabled)
 
         definitions = model_tools.get_tool_definitions(
             enabled_toolsets=kwargs["enabled_toolsets"],
@@ -640,11 +638,8 @@ class TestSubagentCostRollup(unittest.TestCase):
 
 class TestBlockedTools(unittest.TestCase):
 
-    def test_execute_code_not_blocked(self):
-        """Children retain execute_code (programmatic tool calling) so they
-        can batch mechanical work instead of burning reasoning iterations
-        (Teknium, Jul 2026)."""
-        self.assertNotIn("execute_code", DELEGATE_BLOCKED_TOOLS)
+    def test_execute_code_blocked(self):
+        self.assertIn("execute_code", DELEGATE_BLOCKED_TOOLS)
 
 class TestDelegationCredentialResolution(unittest.TestCase):
     """Tests for provider:model credential resolution in delegation config."""
@@ -1439,56 +1434,117 @@ class TestDelegateEventEnum(unittest.TestCase):
 
 
 class TestConcurrencyDefaults(unittest.TestCase):
-    """Tests for the concurrency default and no hard ceiling."""
+    """Tests for the hard five-wide per-call ceiling."""
+
+    @patch("tools.delegate_tool._load_config", return_value={})
+    def test_default_is_five(self, mock_cfg):
+        self.assertEqual(_get_max_concurrent_children(), 5)
 
     def test_load_config_prefers_active_persistent_config_over_cli_defaults(self):
         stale_cli = types.ModuleType("cli")
-        stale_cli.CLI_CONFIG = {
-            "delegation": {
-                "max_iterations": 45,
-                "model": "",
-                "provider": "",
-                "base_url": "",
-                "api_key": "",
-            }
-        }
-        active_config = {
-            "delegation": {
-                "max_iterations": 50,
-                "max_concurrent_children": 50,
-                "max_spawn_depth": 10,
-            }
-        }
-
+        setattr(stale_cli, "CLI_CONFIG", {"delegation": {"max_concurrent_children": 3}})
+        active_config = {"delegation": {"max_concurrent_children": 50}}
         with patch.dict("sys.modules", {"cli": stale_cli}):
             with patch(
                 "hermes_cli.config.load_config_readonly", return_value=active_config
             ):
                 self.assertEqual(_load_config()["max_concurrent_children"], 50)
-                self.assertEqual(_get_max_concurrent_children(), 50)
+                self.assertEqual(_get_max_concurrent_children(), 5)
 
-
-    @patch("tools.delegate_tool._load_config",
-           return_value={"max_concurrent_children": 0})
+    @patch(
+        "tools.delegate_tool._load_config",
+        return_value={"max_concurrent_children": 0},
+    )
     def test_zero_clamped_to_one(self, mock_cfg):
-        """Floor of 1 is enforced; zero or negative values raise to 1."""
         self.assertEqual(_get_max_concurrent_children(), 1)
 
-class TestAsyncCapUnified(unittest.TestCase):
-    """max_async_children is deprecated: the async cap IS max_concurrent_children."""
+    @patch(
+        "tools.delegate_tool._load_config",
+        return_value={"max_concurrent_children": 999},
+    )
+    def test_very_high_values_clamped(self, mock_cfg):
+        self.assertEqual(_get_max_concurrent_children(), 5)
 
-    @patch("tools.delegate_tool._load_config",
-           return_value={"max_concurrent_children": 15})
-    def test_async_cap_follows_concurrent_children(self, mock_cfg):
-        from tools.delegate_tool import _get_max_async_children
-        self.assertEqual(_get_max_async_children(), 15)
+    @patch("tools.delegate_tool._load_config", return_value={})
+    @patch.dict("os.environ", {"DELEGATION_MAX_CONCURRENT_CHILDREN": "9"})
+    def test_env_var_is_clamped(self, mock_cfg):
+        self.assertEqual(_get_max_concurrent_children(), 5)
 
-    @patch("tools.delegate_tool._load_config",
-           return_value={"max_concurrent_children": 15, "max_async_children": 3})
-    def test_stale_max_async_children_ignored(self, mock_cfg):
-        """A leftover max_async_children in config must not shrink the cap."""
+    @patch(
+        "tools.delegate_tool._load_config",
+        return_value={"max_concurrent_children": 4},
+    )
+    def test_configured_value_below_ceiling_is_preserved(self, mock_cfg):
+        self.assertEqual(_get_max_concurrent_children(), 4)
+
+
+class TestBackgroundBatchCapSeparated(unittest.TestCase):
+    """Detached batch capacity is independent and hard-capped at one."""
+
+    @patch(
+        "tools.delegate_tool._load_config",
+        return_value={"max_background_batches": 8},
+    )
+    def test_explicit_background_batch_cap_is_clamped(self, mock_cfg):
+        from tools.delegate_tool import _get_max_background_batches
+
+        self.assertEqual(_get_max_background_batches(), 1)
+
+    @patch(
+        "tools.delegate_tool._load_config",
+        return_value={"max_concurrent_children": 5, "max_async_children": 3},
+    )
+    def test_stale_max_async_children_is_ignored(self, mock_cfg):
         from tools.delegate_tool import _get_max_async_children
-        self.assertEqual(_get_max_async_children(), 15)
+
+        self.assertEqual(_get_max_async_children(), 1)
+
+    @patch("tools.delegate_tool._load_config", return_value={})
+    def test_default_is_one_detached_batch(self, mock_cfg):
+        from tools.delegate_tool import _get_max_background_batches
+
+        self.assertEqual(_get_max_background_batches(), 1)
+
+    @patch("tools.delegate_tool._load_config", return_value={})
+    @patch.dict("os.environ", {"DELEGATION_MAX_BACKGROUND_BATCHES": "7"})
+    def test_background_batch_env_override_is_clamped(self, mock_cfg):
+        from tools.delegate_tool import _get_max_background_batches
+
+        self.assertEqual(_get_max_background_batches(), 1)
+
+
+class TestDescendantAdmissionBudget(unittest.TestCase):
+    @patch(
+        "tools.delegate_tool._load_config",
+        return_value={"max_total_descendants": 5},
+    )
+    def test_reservations_are_atomic_and_released_by_independent_leases(self, mock_cfg):
+        from tools.delegate_tool import (
+            _reset_descendant_budget_for_tests,
+            _try_reserve_descendants,
+            active_descendant_count,
+        )
+
+        _reset_descendant_budget_for_tests()
+        leases, before, limit = _try_reserve_descendants(5)
+        self.assertEqual((before, limit), (0, 5))
+        self.assertIsNotNone(leases)
+        self.assertEqual(active_descendant_count(), 5)
+
+        rejected, active, limit = _try_reserve_descendants(1)
+        self.assertIsNone(rejected)
+        self.assertEqual((active, limit), (5, 5))
+
+        assert leases is not None
+        leases[0].release()
+        replacement, active, limit = _try_reserve_descendants(1)
+        self.assertIsNotNone(replacement)
+        self.assertEqual((active, limit), (4, 5))
+        for lease in leases[1:]:
+            lease.release()
+        assert replacement is not None
+        replacement[0].release()
+        self.assertEqual(active_descendant_count(), 0)
 
 # =========================================================================
 # max_spawn_depth clamping

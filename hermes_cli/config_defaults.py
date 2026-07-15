@@ -1767,11 +1767,9 @@ DEFAULT_CONFIG = {
                                      # (floor 30s) to enforce a hard cap.
         "reasoning_effort": "",  # subagent effort: "ultra", "max", "xhigh", "high",
                                  # "medium", "low", "minimal", "none" (empty = inherit)
-        "max_concurrent_children": 3,  # unified concurrency cap: max parallel children per batch
-                                       # AND max concurrent background (background=true)
-                                       # delegation units. New async dispatches beyond the cap
-                                       # fall back to synchronous execution. Floor of 1, no ceiling.
-                                       # (Replaces the deprecated max_async_children.)
+        "max_concurrent_children": 5,  # hard-capped parallel children per batch
+        "max_background_batches": 1,   # hard-capped detached batch units per process
+        "max_total_descendants": 5,    # hard-capped direct+nested active children
         # Orchestrator role controls (see tools/delegate_tool.py:_get_max_spawn_depth
         # and _get_orchestrator_enabled).  Floored at 1, no upper ceiling —
         # raise deliberately, each level multiplies API cost.
