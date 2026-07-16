@@ -3068,6 +3068,7 @@ def compress_context(
         if compressed == messages_before_compression:
             if messages != messages_before_compression:
                 messages[:] = copy.deepcopy(messages_before_compression)
+            agent._last_compaction_in_place = False
             logger.info(
                 "Compression made no progress (session=%s) — skipping boundary rewrite.",
                 agent.session_id or "none",
@@ -3136,6 +3137,39 @@ def compress_context(
                 )
                 _release_lock()
                 return messages, _existing_sp
+
+        # A compressor can return a cloned-but-unchanged transcript when its
+        # safety anchors leave no useful middle window. Do not append the todo
+        # snapshot or call archive_and_compact() in that case: doing so turns a
+        # no-op into N -> N+1, archives another full copy, and can grow the DB
+        # indefinitely while provider context never shrinks. Compare semantic
+        # message equality rather than list identity because the compressor's
+        # pruning pre-pass always returns shallow copies. A real summary or a
+        # real pruning change remains eligible even when a tiny test fixture is
+        # not yet smaller in rough-token terms; the overflow retry path applies
+        # the separate 5% material-progress rule.
+        _candidate_tokens = estimate_request_tokens_rough(
+            compressed, system_prompt="", tools=None
+        )
+        _original_tokens = estimate_request_tokens_rough(
+            messages, system_prompt="", tools=None
+        )
+        if compressed == messages:
+            agent._last_compaction_in_place = False
+            logger.warning(
+                "context compression made no material progress: "
+                "session=%s messages=%d->%d rough_tokens=~%s->~%s; "
+                "skipping todo append and persistence",
+                agent.session_id or "none",
+                len(messages),
+                len(compressed),
+                f"{_original_tokens:,}",
+                f"{_candidate_tokens:,}",
+            )
+            _existing_sp = getattr(agent, "_cached_system_prompt", None)
+            if not _existing_sp:
+                _existing_sp = agent._build_system_prompt(system_message)
+            return messages, _existing_sp
 
         summary_error = getattr(agent.context_compressor, "_last_summary_error", None)
         if summary_error:

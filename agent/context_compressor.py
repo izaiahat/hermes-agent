@@ -5434,9 +5434,9 @@ This compaction should PRIORITISE preserving all information related to the focu
                 continue
             if self._is_context_summary_message(msg):
                 continue
+            content = msg.get("content")
             if last_any < 0:
                 last_any = i
-            content = msg.get("content")
             if isinstance(content, str) and content.strip():
                 return i
             if isinstance(content, list):
