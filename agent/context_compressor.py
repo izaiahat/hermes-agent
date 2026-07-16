@@ -3963,11 +3963,17 @@ Write only the summary body. Do not include any preamble or prefix."""
         last_any = -1
         for i in range(len(messages) - 1, head_end - 1, -1):
             msg = messages[i]
-            if msg.get("role") != "assistant" or self._is_context_summary_message(msg):
+            if msg.get("role") != "assistant":
                 continue
+            content = msg.get("content")
+            # A compaction handoff is a historical boundary. Newer tool-only
+            # assistant activity can still be the fallback anchor, but scanning
+            # THROUGH the handoff would resurrect an older visible reply and pull
+            # the tail across an already-compacted transcript.
+            if self._is_context_summary_message(msg):
+                return last_any
             if last_any < 0:
                 last_any = i
-            content = msg.get("content")
             # Multimodal content: any non-empty text block counts.
             if (isinstance(content, str) and content.strip()) or (isinstance(content, list) and any(
                 isinstance(p, dict) and isinstance(t := (p.get("text") or p.get("content")), str) and t.strip()
