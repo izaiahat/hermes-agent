@@ -381,6 +381,51 @@ class TestFindTailCutByTokensAnchorsAssistant:
         ]
         assert any("VISIBLE REPLY" in (t or "") for t in tail_contents)
 
+    def test_old_assistant_summary_does_not_collapse_tail_cut(self, compressor):
+        """A persisted summary banner must not anchor the whole transcript."""
+        from agent.context_compressor import SUMMARY_PREFIX
+
+        c = compressor
+        c.tail_token_budget = 100
+        messages = [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "initial task"},
+            {"role": "assistant", "content": "protected head reply"},
+            {"role": "assistant", "content": f"{SUMMARY_PREFIX}\nold summary"},
+        ]
+        for i in range(40):
+            call_id = f"c{i}"
+            messages.extend(
+                [
+                    {"role": "user", "content": f"tool request {i}"},
+                    {
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": [
+                            {
+                                "id": call_id,
+                                "function": {"name": "read", "arguments": "{}"},
+                            }
+                        ],
+                    },
+                    {
+                        "role": "tool",
+                        "content": "x" * 200,
+                        "tool_call_id": call_id,
+                    },
+                ]
+            )
+
+        head_end = c._protect_head_size(messages)
+        compress_start = c._align_boundary_forward(messages, head_end)
+        cut = c._find_tail_cut_by_tokens(messages, head_end=head_end)
+
+        summary_idx = 3
+        assert head_end == summary_idx
+        assert compress_start < cut
+        assert cut > summary_idx
+        assert c._find_last_assistant_message_idx(messages, head_end) > summary_idx
+
 
 # ---------------------------------------------------------------------------
 # End-to-end: compress() preserves the reply

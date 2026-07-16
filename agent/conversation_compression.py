@@ -663,8 +663,8 @@ def compress_context(
     # If compression aborted (aux LLM failed to produce a usable summary)
     # the compressor returns the input messages unchanged.  Surface the
     # error to the user, skip the session-rotation work entirely (no
-    # session has logically ended), and let auto-compress callers detect
-    # the no-op via len(returned) == len(input).
+    # session has logically ended). The explicit abort flag and unchanged
+    # transcript distinguish this from valid same-row-count compression.
     if getattr(agent.context_compressor, "_last_compress_aborted", False):
         try:
             _err = getattr(agent.context_compressor, "_last_summary_error", None) or "unknown error"
@@ -693,23 +693,13 @@ def compress_context(
         # real pruning change remains eligible even when a tiny test fixture is
         # not yet smaller in rough-token terms; the overflow retry path applies
         # the separate 5% material-progress rule.
-        _candidate_tokens = estimate_request_tokens_rough(
-            compressed, system_prompt="", tools=None
-        )
-        _original_tokens = estimate_request_tokens_rough(
-            messages, system_prompt="", tools=None
-        )
         if compressed == messages:
-            agent._last_compaction_in_place = False
             logger.warning(
-                "context compression made no material progress: "
-                "session=%s messages=%d->%d rough_tokens=~%s->~%s; "
+                "context compression made no changes: "
+                "session=%s messages=%d; "
                 "skipping todo append and persistence",
                 agent.session_id or "none",
                 len(messages),
-                len(compressed),
-                f"{_original_tokens:,}",
-                f"{_candidate_tokens:,}",
             )
             _existing_sp = getattr(agent, "_cached_system_prompt", None)
             if not _existing_sp:
