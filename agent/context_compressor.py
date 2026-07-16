@@ -5428,13 +5428,17 @@ This compaction should PRIORITISE preserving all information related to the focu
         last_any = -1
         for i in range(len(messages) - 1, head_end - 1, -1):
             msg = messages[i]
-            if msg.get("role") != "assistant" or self._is_context_summary_content(
-                msg.get("content")
-            ):
-                continue
-            if self._is_context_summary_message(msg):
+            if msg.get("role") != "assistant":
                 continue
             content = msg.get("content")
+            # A compaction handoff is a historical boundary. Newer tool-only
+            # assistant activity can remain the fallback anchor, but scanning
+            # through the handoff would resurrect an older visible reply and
+            # pull the tail across an already-compacted transcript.
+            if self._is_context_summary_message(
+                msg
+            ) or self._is_context_summary_content(content):
+                return last_any
             if last_any < 0:
                 last_any = i
             if isinstance(content, str) and content.strip():
