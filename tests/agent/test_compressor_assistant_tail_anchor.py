@@ -149,6 +149,46 @@ class TestFindLastAssistantMessageIdx:
         idx = compressor._find_last_assistant_message_idx(messages, head_end=0)
         assert idx == 1
 
+    def test_skips_assistant_context_summary_before_tool_only_tail(
+        self, compressor
+    ):
+        """A prior assistant-role compaction summary is continuity state, not
+        the latest visible reply. When newer assistant turns are tool-only,
+        fallback must anchor the newest real assistant turn rather than the
+        summary at the start of the transcript."""
+        from agent.context_compressor import SUMMARY_PREFIX
+
+        messages = [
+            {"role": "assistant", "content": f"{SUMMARY_PREFIX}\nold handoff"},
+            {"role": "user", "content": "continue the task"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "c1",
+                        "function": {"name": "t", "arguments": "{}"},
+                    }
+                ],
+            },
+            {"role": "tool", "content": "result", "tool_call_id": "c1"},
+            {"role": "user", "content": "latest task state"},
+        ]
+
+        assert compressor._find_last_assistant_message_idx(messages, head_end=0) == 2
+
+    def test_only_assistant_context_summary_returns_negative_one(
+        self, compressor
+    ):
+        from agent.context_compressor import SUMMARY_PREFIX
+
+        messages = [
+            {"role": "assistant", "content": f"{SUMMARY_PREFIX}\nold handoff"},
+            {"role": "user", "content": "current task"},
+        ]
+
+        assert compressor._find_last_assistant_message_idx(messages, head_end=0) == -1
+
     def test_returns_negative_one_when_no_assistant(self, compressor):
         messages = [
             {"role": "user", "content": "q1"},

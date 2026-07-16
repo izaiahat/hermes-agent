@@ -163,6 +163,71 @@ class TestInPlaceCompaction:
             )
             assert calls["n"] == 0
 
+    def test_no_progress_does_not_append_todo_or_archive_live_rows(self):
+        """A cloned-but-unchanged compressor result is a real no-op.
+
+        Regression for the kael-sol 2026-07-16 loop: the assistant tail anchor
+        left no useful window, ContextCompressor returned a cloned transcript,
+        and compress_context appended the todo snapshot before persisting it as
+        N -> N+1. Repeated in-place passes archived hundreds of thousands of
+        duplicate rows while provider context never shrank.
+        """
+        from hermes_state import SessionDB
+        from agent.conversation_compression import compress_context
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db = SessionDB(db_path=Path(tmp) / "t.db")
+            sid = "ip_no_progress"
+            _seed(db, sid, "no-progress")
+            agent = _make_agent(db, sid, in_place=True)
+            agent._last_flushed_db_idx = 5
+            agent._flushed_db_message_ids = {101, 102}
+            agent._last_compaction_in_place = True
+
+            messages = [
+                {
+                    "role": "user" if i % 2 == 0 else "assistant",
+                    "content": f"msg {i}",
+                }
+                for i in range(8)
+            ]
+
+            # Match ContextCompressor's no-window shape: it returns a shallow
+            # clone, not the original list object, with no material reduction.
+            agent.context_compressor.compress = (
+                lambda current, current_tokens=None, focus_topic=None, force=False: [
+                    message.copy() for message in current
+                ]
+            )
+            agent._todo_store.format_for_injection = (
+                lambda: "[todo snapshot must not be appended]"
+            )
+
+            before = db._conn.execute(
+                "SELECT COUNT(*), SUM(active), SUM(compacted) "
+                "FROM messages WHERE session_id = ?",
+                (sid,),
+            ).fetchone()
+            result, _ = compress_context(
+                agent, messages, approx_tokens=100_000, system_message="sys"
+            )
+            after = db._conn.execute(
+                "SELECT COUNT(*), SUM(active), SUM(compacted) "
+                "FROM messages WHERE session_id = ?",
+                (sid,),
+            ).fetchone()
+
+            assert result is messages
+            assert len(result) == 8
+            assert all(
+                "todo snapshot" not in str(message.get("content"))
+                for message in result
+            )
+            assert tuple(after) == tuple(before) == (8, 8, 0)
+            assert agent._last_compaction_in_place is False
+            assert agent._last_flushed_db_idx == 5
+            assert agent._flushed_db_message_ids == {101, 102}
+
     def test_rotation_still_preflushes(self):
         """Rotation MUST pre-flush so current-turn messages survive in the
         preserved old (parent) session before it is ended (#47202)."""

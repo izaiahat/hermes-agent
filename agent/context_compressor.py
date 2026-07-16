@@ -2577,9 +2577,16 @@ This compaction should PRIORITISE preserving all information related to the focu
             msg = messages[i]
             if msg.get("role") != "assistant":
                 continue
+            content = msg.get("content")
+            # A prior compaction summary is continuity scaffolding, not a
+            # user-visible assistant reply. Treating an assistant-role summary
+            # as the latest visible reply can pull the tail cut all the way back
+            # to the start of a long tool-heavy session, leaving no useful
+            # compression window (#29824 follow-up).
+            if self._is_context_summary_content(content):
+                continue
             if last_any < 0:
                 last_any = i
-            content = msg.get("content")
             if isinstance(content, str) and content.strip():
                 return i
             if isinstance(content, list):
