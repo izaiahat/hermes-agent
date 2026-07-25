@@ -278,6 +278,80 @@ class TestRunTurn:
             {"role": "assistant", "content": "parent after approval"}
         ]
 
+    def test_native_subagent_completion_does_not_end_primary_turn(self):
+        client = FakeClient()
+        root_thread = "thread-fake-001"
+        child_thread = "thread-child-001"
+        seen: list[dict] = []
+
+        client.queue_notification(
+            "item/completed",
+            threadId=root_thread,
+            turnId="turn-fake-001",
+            item={
+                "type": "subAgentActivity",
+                "id": "spawn-1",
+                "kind": "started",
+                "agentPath": "/root/reviewer",
+                "agentThreadId": child_thread,
+            },
+        )
+        client.queue_notification(
+            "item/completed",
+            threadId=child_thread,
+            turnId="turn-child-001",
+            item={
+                "type": "agentMessage",
+                "id": "child-message",
+                "phase": "final_answer",
+                "text": "child result",
+            },
+        )
+        client.queue_notification(
+            "turn/completed",
+            threadId=child_thread,
+            turn={
+                "id": "turn-child-001",
+                "status": "failed",
+                "error": {"message": "child failed"},
+            },
+        )
+        client.queue_notification(
+            "item/completed",
+            threadId=root_thread,
+            turnId="turn-fake-001",
+            item={
+                "type": "agentMessage",
+                "id": "root-message",
+                "phase": "final_answer",
+                "text": "primary result",
+            },
+        )
+        client.queue_notification(
+            "turn/completed",
+            threadId=root_thread,
+            turn={
+                "id": "turn-fake-001",
+                "status": "completed",
+                "error": None,
+            },
+        )
+
+        result = make_session(client, on_event=seen.append).run_turn(
+            "delegate", turn_timeout=2.0
+        )
+
+        assert result.final_text == "primary result"
+        assert result.error is None
+        assert not any(
+            (note.get("params") or {}).get("threadId") == child_thread
+            for note in seen
+        )
+        assert not any(
+            msg.get("content") == "child result"
+            for msg in result.projected_messages
+        )
+
 
 
     def test_tool_iteration_counter_ticks(self):
