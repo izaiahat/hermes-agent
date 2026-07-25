@@ -196,6 +196,80 @@ class TestRunTurn:
         # turn_id propagated for downstream session-DB linkage
         assert r.turn_id == "turn-fake-001"
 
+    def test_native_subagent_completion_does_not_end_primary_turn(self):
+        """Child turns share the primary app-server notification stream."""
+        client = FakeClient()
+        root_thread = "thread-fake-001"
+        child_thread = "thread-child-001"
+        seen: list[dict] = []
+
+        client.queue_notification(
+            "item/completed",
+            threadId=root_thread,
+            turnId="turn-fake-001",
+            item={
+                "type": "subAgentActivity",
+                "id": "spawn-1",
+                "kind": "started",
+                "agentPath": "/root/reviewer",
+                "agentThreadId": child_thread,
+            },
+        )
+        client.queue_notification(
+            "item/completed",
+            threadId=child_thread,
+            turnId="turn-child-001",
+            item={
+                "type": "agentMessage",
+                "id": "child-message",
+                "phase": "final_answer",
+                "text": "child result",
+            },
+        )
+        client.queue_notification(
+            "turn/completed",
+            threadId=child_thread,
+            turn={
+                "id": "turn-child-001",
+                "status": "failed",
+                "error": {"message": "child failed"},
+            },
+        )
+        client.queue_notification(
+            "item/completed",
+            threadId=root_thread,
+            turnId="turn-fake-001",
+            item={
+                "type": "agentMessage",
+                "id": "root-message",
+                "phase": "final_answer",
+                "text": "primary result",
+            },
+        )
+        client.queue_notification(
+            "turn/completed",
+            threadId=root_thread,
+            turn={
+                "id": "turn-fake-001",
+                "status": "completed",
+                "error": None,
+            },
+        )
+
+        r = make_session(client, on_event=seen.append).run_turn(
+            "delegate", turn_timeout=2.0
+        )
+
+        assert r.final_text == "primary result"
+        assert r.error is None
+        assert any(
+            (note.get("params") or {}).get("threadId") == child_thread
+            for note in seen
+        )
+        assert not any(
+            msg.get("content") == "child result" for msg in r.projected_messages
+        )
+
     def test_token_usage_notification_is_captured(self):
         client = FakeClient()
         client.queue_notification(

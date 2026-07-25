@@ -125,6 +125,38 @@ def _coerce_turn_input_text(user_input: Any) -> str:
     return "" if user_input is None else str(user_input)
 
 
+def _record_native_subagent_threads(
+    note: dict[str, Any],
+    *,
+    root_thread_id: str,
+    subagent_thread_ids: set[str],
+) -> None:
+    """Learn child thread ids from multiplexed Codex multi-agent events."""
+    params = note.get("params") or {}
+    item = params.get("item") or {}
+    if not isinstance(item, dict):
+        return
+
+    candidates: list[Any] = []
+    if item.get("type") == "subAgentActivity":
+        candidates.append(item.get("agentThreadId"))
+    if item.get("type") == "collabAgentToolCall":
+        candidates.append(item.get("senderThreadId"))
+        candidates.extend(item.get("receiverThreadIds") or [])
+
+    for candidate in candidates:
+        if isinstance(candidate, str) and candidate and candidate != root_thread_id:
+            subagent_thread_ids.add(candidate)
+
+
+def _is_native_subagent_notification(
+    note: dict[str, Any], subagent_thread_ids: set[str]
+) -> bool:
+    """Return True when a multiplexed notification belongs to a child thread."""
+    thread_id = (note.get("params") or {}).get("threadId")
+    return isinstance(thread_id, str) and thread_id in subagent_thread_ids
+
+
 # Substrings in codex stderr / JSON-RPC error messages that signal the
 # subprocess died because its OAuth credentials are no longer valid.
 # Kept conservative: we only redirect users to `codex login` when we're
@@ -451,6 +483,10 @@ class CodexAppServerSession:
         # within post_tool_quiet_timeout and the turn hasn't completed, we
         # fast-fail and retire the session.
         last_tool_completion_at: Optional[float] = None
+        # Codex native subagents multiplex child turns over this connection.
+        # Track their thread ids so a child's message/completion cannot replace
+        # or terminate the primary result.
+        subagent_thread_ids: set[str] = set()
 
         while time.monotonic() < deadline and not turn_complete:
             if self._interrupt_event.is_set():
@@ -508,6 +544,18 @@ class CodexAppServerSession:
                     _apply_token_usage_notification(result, pending)
                     _apply_compaction_notification(result, pending)
                     self._track_pending_file_change(pending)
+                    _record_native_subagent_threads(
+                        pending,
+                        root_thread_id=self._thread_id,
+                        subagent_thread_ids=subagent_thread_ids,
+                    )
+                    if _is_native_subagent_notification(
+                        pending, subagent_thread_ids
+                    ):
+                        # Child activity is liveness for the primary turn, but
+                        # its messages/completion are not the primary result.
+                        last_tool_completion_at = None
+                        continue
                     proj = projector.project(pending)
                     if proj.messages:
                         result.projected_messages.extend(proj.messages)
@@ -544,12 +592,24 @@ class CodexAppServerSession:
 
             _apply_token_usage_notification(result, note)
             _apply_compaction_notification(result, note)
+            _record_native_subagent_threads(
+                note,
+                root_thread_id=self._thread_id,
+                subagent_thread_ids=subagent_thread_ids,
+            )
 
             # Track in-progress fileChange items so the approval bridge
             # can surface a real change summary when codex requests
             # approval (the approval params themselves don't carry the
             # changeset). Quirk #4 fix.
             self._track_pending_file_change(note)
+
+            if _is_native_subagent_notification(note, subagent_thread_ids):
+                # Keep child events observable through on_event, but prevent
+                # child agentMessage/turn-completed events from becoming the
+                # primary Hermes response or ending the primary turn.
+                last_tool_completion_at = None
+                continue
 
             # Project into messages
             projection = projector.project(note)
