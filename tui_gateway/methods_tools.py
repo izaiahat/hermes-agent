@@ -1079,7 +1079,12 @@ def _(rid, params: dict) -> dict:
             deliver=_str_arg(params, "deliver") or None)
         return _ok(rid, json.loads(raw))
     if action in {"remove", "pause", "resume"}:
-        return _ok(rid, json.loads(cronjob(action=action, job_id=jid)))
+        extra = {}
+        if action == "pause":
+            # A pause needs a durable, auditable reason; the TUI gateway names
+            # itself when the caller supplied none.
+            extra["reason"] = params.get("reason") or "paused from TUI gateway"
+        return _ok(rid, json.loads(cronjob(action=action, job_id=jid, **extra)))
     return _err(rid, 4016, f"unknown cron action: {action}")
 
 

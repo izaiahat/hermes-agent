@@ -505,7 +505,10 @@ def finalize_turn(
     _platform = getattr(agent, "platform", None) or ""
     _response_transformed = False
     _pre_transform_response = None
-    if final_response and not interrupted:
+    # transform_llm_output must see interrupted partial text too, not only a
+    # completed response: a safety/redaction transform cannot skip a partial
+    # reply that a gateway may still deliver.
+    if final_response:
         final_response, _response_transformed, _pre_transform_response = _apply_output_hooks(
             agent, final_response, logger, platform=_platform, effective_task_id=effective_task_id,
             turn_id=turn_id, original_user_message=original_user_message, messages=messages,
