@@ -1222,6 +1222,8 @@ def cronjob(
             )
 
         if normalized == "pause":
+            if not str(reason or "").strip():
+                return tool_error("reason is required for action 'pause' so paused_reason is always durable", success=False)
             updated = pause_job(job_id, reason=reason)
             _notify_provider_jobs_changed_safe()
             return json.dumps({"success": True, "job": _format_job(updated)}, indent=2)
@@ -1482,6 +1484,10 @@ Important safety rule: cron-run sessions should not recursively schedule more cr
             "job_id": {
                 "type": "string",
                 "description": "Required for update/pause/resume/remove/run"
+            },
+            "reason": {
+                "type": "string",
+                "description": "REQUIRED for action=pause. Durable human-readable explanation stored as paused_reason."
             },
             "prompt": {
                 "type": "string",

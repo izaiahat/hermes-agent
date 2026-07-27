@@ -279,6 +279,11 @@ class TestUpdateJob:
 
 
 class TestPauseResumeJob:
+    def test_pause_requires_reason(self, tmp_cron_dir):
+        job = create_job(prompt="Pause me", schedule="every 1h")
+        with pytest.raises(ValueError, match="paused_reason is required"):
+            pause_job(job["id"])
+
     def test_pause_sets_state(self, tmp_cron_dir):
         job = create_job(prompt="Pause me", schedule="every 1h")
         paused = pause_job(job["id"], reason="user paused")

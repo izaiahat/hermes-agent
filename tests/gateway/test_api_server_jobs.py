@@ -287,7 +287,7 @@ class TestPauseJob:
                 data = await resp.json()
                 assert data["job"] == paused_job
                 assert data["job"]["enabled"] is False
-                mock_pause.assert_called_once_with(VALID_JOB_ID)
+                mock_pause.assert_called_once_with(VALID_JOB_ID, reason="paused from jobs API")
 
 
 # ---------------------------------------------------------------------------
@@ -397,8 +397,9 @@ class TestCronUnavailable:
         app = _create_app(adapter)
         captured = {}
 
-        def _plain_pause(job_id):
+        def _plain_pause(job_id, *, reason=None):
             captured["job_id"] = job_id
+            captured["reason"] = reason
             return SAMPLE_JOB
 
         async with TestClient(TestServer(app)) as cli:
@@ -410,6 +411,7 @@ class TestCronUnavailable:
                 data = await resp.json()
                 assert data["job"] == SAMPLE_JOB
                 assert captured["job_id"] == VALID_JOB_ID
+                assert captured["reason"] == "paused from jobs API"
 
     @pytest.mark.asyncio
     async def test_list_handler_no_self_binding(self, adapter):

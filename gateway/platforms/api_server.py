@@ -5726,7 +5726,13 @@ class APIServerAdapter(BasePlatformAdapter):
         if id_err:
             return id_err
         try:
-            job = _cron_pause(job_id)
+            try:
+                body = await request.json()
+            except Exception:
+                body = {}
+            reason = str((body or {}).get("reason") or "paused from jobs API").strip()
+            assert _cron_pause is not None
+            job = _cron_pause(job_id, reason=reason)
             if not job:
                 return web.json_response({"error": "Job not found"}, status=404)
             _notify_cron_provider_jobs_changed()
