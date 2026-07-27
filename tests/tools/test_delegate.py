@@ -1546,6 +1546,88 @@ class TestDescendantAdmissionBudget(unittest.TestCase):
         replacement[0].release()
         self.assertEqual(active_descendant_count(), 0)
 
+    @patch("agent.codex_throttle.try_acquire_codex_delegate_slots")
+    @patch("agent.codex_throttle.is_enabled", return_value=True)
+    @patch(
+        "tools.delegate_tool._load_config",
+        return_value={"max_total_descendants": 3},
+    )
+    def test_global_codex_leases_release_with_local_leases(
+        self, mock_cfg, mock_enabled, mock_acquire
+    ):
+        from tools.delegate_tool import (
+            _reset_descendant_budget_for_tests,
+            _try_reserve_descendants,
+            active_descendant_count,
+        )
+
+        global_leases = [MagicMock(), MagicMock()]
+        mock_acquire.return_value = (global_leases, 1, 7)
+        _reset_descendant_budget_for_tests()
+
+        leases, active, limit = _try_reserve_descendants(
+            2, use_global_codex_gate=True
+        )
+        self.assertIsNotNone(leases)
+        self.assertEqual((active, limit, active_descendant_count()), (0, 3, 2))
+        assert leases is not None
+        for lease in leases:
+            lease.release()
+            lease.release()
+        for global_lease in global_leases:
+            global_lease.release.assert_called_once_with()
+        self.assertEqual(active_descendant_count(), 0)
+
+    @patch("agent.codex_throttle.try_acquire_codex_delegate_slots")
+    @patch("agent.codex_throttle.is_enabled", return_value=True)
+    @patch(
+        "tools.delegate_tool._load_config",
+        return_value={"max_total_descendants": 5},
+    )
+    def test_global_codex_denial_reserves_nothing(
+        self, mock_cfg, mock_enabled, mock_acquire
+    ):
+        from tools.delegate_tool import (
+            _reset_descendant_budget_for_tests,
+            _try_reserve_descendants,
+            active_descendant_count,
+        )
+
+        mock_acquire.return_value = (None, 7, 7)
+        _reset_descendant_budget_for_tests()
+        leases, active, limit = _try_reserve_descendants(
+            1, use_global_codex_gate=True
+        )
+        self.assertIsNone(leases)
+        self.assertEqual((active, limit, active_descendant_count()), (7, 7, 0))
+
+    @patch("agent.codex_throttle.try_acquire_codex_delegate_slots")
+    @patch("agent.codex_throttle.is_enabled", return_value=False)
+    @patch(
+        "tools.delegate_tool._load_config",
+        return_value={"max_total_descendants": 2},
+    )
+    def test_explicit_codex_gate_disable_bypasses_global_slots(
+        self, mock_cfg, mock_enabled, mock_acquire
+    ):
+        from tools.delegate_tool import (
+            _reset_descendant_budget_for_tests,
+            _try_reserve_descendants,
+            active_descendant_count,
+        )
+
+        _reset_descendant_budget_for_tests()
+        leases, active, limit = _try_reserve_descendants(
+            2, use_global_codex_gate=True
+        )
+        mock_acquire.assert_not_called()
+        self.assertIsNotNone(leases)
+        self.assertEqual((active, limit, active_descendant_count()), (0, 2, 2))
+        assert leases is not None
+        for lease in leases:
+            lease.release()
+        self.assertEqual(active_descendant_count(), 0)
+
 # =========================================================================
 # max_spawn_depth clamping
 # =========================================================================
