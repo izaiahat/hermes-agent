@@ -626,11 +626,13 @@ def _get_max_total_descendants() -> int:
 
 
 
+
 class _DescendantLease:
     """One idempotent active-child reservation bound to a budget epoch."""
 
-    def __init__(self, epoch: int):
+    def __init__(self, epoch: int, global_lease=None):
         self._epoch = epoch
+        self._global_lease = global_lease
         self._released = False
 
     def release(self) -> None:
@@ -639,14 +641,15 @@ class _DescendantLease:
             if self._released:
                 return
             self._released = True
-            if self._epoch != _descendant_budget_epoch:
-                return
-            if _active_descendants <= 0:
-                logger.error("Descendant budget underflow prevented")
-                return
-            _active_descendants -= 1
-
-
+            global_lease = self._global_lease
+            self._global_lease = None
+            if self._epoch == _descendant_budget_epoch:
+                if _active_descendants <= 0:
+                    logger.error("Descendant budget underflow prevented")
+                else:
+                    _active_descendants -= 1
+        if global_lease is not None:
+            global_lease.release()
 
 def active_descendant_count() -> int:
     """Return the number of descendant slots reserved in this process."""
@@ -655,24 +658,46 @@ def active_descendant_count() -> int:
 
 
 
+
 def _try_reserve_descendants(
     count: int,
+    *,
+    use_global_codex_gate: bool = False,
 ) -> tuple[Optional[list[_DescendantLease]], int, int]:
-    """Atomically reserve one independent lease per requested child."""
+    """Atomically reserve process-local and optional host-wide child slots."""
     global _active_descendants
     limit = _get_max_total_descendants()
     with _descendant_budget_lock:
         active_before = _active_descendants
         if count < 1 or active_before + count > limit:
             return None, active_before, limit
+        global_leases = [None] * count
+        if use_global_codex_gate:
+            try:
+                from agent.codex_throttle import (
+                    is_enabled as codex_gate_is_enabled,
+                    try_acquire_codex_delegate_slots,
+                )
+
+                if codex_gate_is_enabled():
+                    reserved, host_active, host_limit = try_acquire_codex_delegate_slots(count)
+                else:
+                    reserved, host_active, host_limit = [None] * count, 0, count
+            except Exception:
+                logger.exception("Shared Codex descendant gate unavailable; denying delegation")
+                return None, limit, limit
+            if reserved is None:
+                return None, host_active, host_limit
+            global_leases = list(reserved)
         _active_descendants += count
         return (
-            [_DescendantLease(_descendant_budget_epoch) for _ in range(count)],
+            [
+                _DescendantLease(_descendant_budget_epoch, global_lease)
+                for global_lease in global_leases
+            ],
             active_before,
             limit,
         )
-
-
 
 def _reset_descendant_budget_for_tests() -> None:
     """Reset process-local admission state; test-only helper."""
@@ -680,3 +705,18 @@ def _reset_descendant_budget_for_tests() -> None:
     with _descendant_budget_lock:
         _active_descendants = 0
         _descendant_budget_epoch += 1
+
+
+
+def _delegation_uses_codex(parent_agent) -> bool:
+    """Resolve whether this child path uses the shared Codex subscription."""
+    cfg = _load_config()
+    provider = str(
+        cfg.get("provider") or getattr(parent_agent, "provider", "") or ""
+    ).strip().lower()
+    base_url = str(
+        cfg.get("base_url") or getattr(parent_agent, "base_url", "") or ""
+    ).strip().lower()
+    return provider == "openai-codex" or (
+        "chatgpt.com" in base_url and "/backend-api/codex" in base_url
+    )

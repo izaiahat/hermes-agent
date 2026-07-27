@@ -35,6 +35,7 @@ from tools.delegate_tool_config import (  # noqa: F401
     _resolve_child_runtime, _resolve_delegation_credentials,
     _get_max_background_batches, _get_max_total_descendants, _try_reserve_descendants,
     active_descendant_count, _reset_descendant_budget_for_tests, _DescendantLease,
+    _delegation_uses_codex,
     _subagent_auto_approve, _subagent_auto_deny,
 )
 from tools.delegate_tool_dispatch import _Batch, _announce_batch, _capture_origin, _run_batch
@@ -505,7 +506,10 @@ def delegate_task(
     # Atomic descendant admission: reserve one lease per child BEFORE any child
     # runs, so a burst of concurrent delegate_task calls cannot each individually
     # pass a per-call width check and jointly exceed the box's total budget.
-    leases, active_before, limit = _try_reserve_descendants(len(task_list))
+    # A Codex-backed child consumes a slot of the SHARED subscription, not just a
+    # process-local one, so its admission must also pass the host-wide gate.
+    leases, active_before, limit = _try_reserve_descendants(
+        len(task_list), use_global_codex_gate=_delegation_uses_codex(parent_agent))
     if leases is None:
         for child in children or []:
             with suppress(Exception):

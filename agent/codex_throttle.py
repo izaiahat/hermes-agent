@@ -10,8 +10,8 @@ Hermes can drive that one account from several places **at once**:
   * the main gateway agent process,
   * one or more TUI dashboards (e.g. the Hermes Desktop dashboard on its own port)
     and the ``tui_gateway.slash_worker`` processes they spawn,
-  * sub-agent / delegation fan-out (hard-capped at five active descendants per
-    process/tree).
+  * sub-agent / delegation fan-out (per-tree bounded, plus a crash-safe shared
+    live-descendant ceiling across every Hermes process on the host).
 
 Because those are *separate processes* (and, for sub-agents, separate threads) that
 all share one Codex account, an in-process ``asyncio``/``threading`` semaphore cannot
@@ -49,7 +49,8 @@ TUI, slash-worker, auxiliary, app-server, compaction, and delegated launch paths
 on one policy even when a shell wrapper did not source the file:
 
   HERMES_CODEX_GATE_DISABLED                   set truthy to disable the gate entirely
-  HERMES_CODEX_MAX_CONCURRENCY                 box-wide request ceiling (default and hard cap 5)
+  HERMES_CODEX_MAX_CONCURRENCY                 box-wide request ceiling (default and hard cap 7)
+  HERMES_CODEX_MAX_DELEGATES                   box-wide live Codex delegate ceiling (default and hard cap 7)
   HERMES_CODEX_MIN_CONCURRENCY                 floor the adaptive permit never drops below (default 1)
   HERMES_CODEX_CONCURRENCY_START               permit value on fresh state (default = MAX)
   HERMES_CODEX_ADAPTIVE_CONCURRENCY            enable the AIMD permit (default on; moot when MAX==MIN)
@@ -173,7 +174,8 @@ _LOADED_THROTTLE_ENV_FILE = _load_throttle_env()
 # Only the explicit operator switch disables admission. Missing POSIX locking is
 # an unavailable-gate error, never an implicit bypass.
 _DISABLED = _env_bool("HERMES_CODEX_GATE_DISABLED", False)
-_MAX_CONCURRENCY = min(5, max(1, _env_int("HERMES_CODEX_MAX_CONCURRENCY", 5)))
+_MAX_CONCURRENCY = min(7, max(1, _env_int("HERMES_CODEX_MAX_CONCURRENCY", 7)))
+_MAX_DELEGATES = min(7, max(1, _env_int("HERMES_CODEX_MAX_DELEGATES", 7)))
 # AIMD adaptive concurrency: the gate keeps a shared "permit" in [MIN, MAX] that grows
 # additively while healthy and shrinks multiplicatively on a 429/503.  When MAX == MIN
 # (e.g. both 1) the permit is fixed and the gate behaves like the old static semaphore.
@@ -219,6 +221,8 @@ _RETRY_AFTER_HONOR_MAX = max(
 
 _STATE_NAME = "state.json"
 _STATE_LOCK_NAME = "state.lock"
+_DELEGATE_ADMISSION_LOCK_NAME = "delegate-admission.lock"
+_DELEGATE_SLOT_PREFIX = "delegate_slot_"
 
 # Per-thread reentrancy depth so a nested Codex call on the same worker thread
 # never blocks on a slot the thread already owns.
@@ -249,6 +253,7 @@ def runtime_config() -> dict:
         ),
         "gate_dir": str(gate_dir) if gate_dir else None,
         "max_concurrency": _MAX_CONCURRENCY,
+        "max_delegates": _MAX_DELEGATES,
         "min_concurrency": _MIN_CONCURRENCY,
         "concurrency_start": _CONCURRENCY_START,
         "adaptive": _ADAPTIVE,
@@ -269,6 +274,205 @@ def _gate_dir() -> Optional[Path]:
         return gate_dir
     except Exception:
         return None
+
+
+class CodexDelegateSlotLease:
+    """One crash-safe host-wide live-delegate reservation.
+
+    The authoritative live count is the number of locked ``delegate_slot_*``
+    files. ``flock`` releases automatically on process death, so stale JSON
+    metadata can never strand capacity.
+    """
+
+    def __init__(self, fd: int, slot: int):
+        self._fd = fd
+        self.slot = slot
+        self._released = False
+
+    def release(self) -> None:
+        if self._released:
+            return
+        self._released = True
+        import fcntl as _fcntl
+
+        try:
+            _fcntl.flock(self._fd, _fcntl.LOCK_UN)
+        except Exception:
+            pass
+        try:
+            os.close(self._fd)
+        except Exception:
+            pass
+
+
+def _delegate_admission_lock(gate_dir: Path) -> Optional[int]:
+    """Acquire the short-lived lock that makes multi-slot admission atomic."""
+    if not _HAVE_FCNTL:
+        return None
+    import fcntl as _fcntl
+
+    fd: Optional[int] = None
+    try:
+        fd = os.open(
+            str(gate_dir / _DELEGATE_ADMISSION_LOCK_NAME),
+            os.O_RDWR | os.O_CREAT,
+            0o600,
+        )
+        _fcntl.flock(fd, _fcntl.LOCK_EX)
+        return fd
+    except Exception:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except Exception:
+                pass
+        return None
+
+
+def _release_lock_fd(fd: Optional[int]) -> None:
+    if fd is None:
+        return
+    import fcntl as _fcntl
+
+    try:
+        _fcntl.flock(fd, _fcntl.LOCK_UN)
+    except Exception:
+        pass
+    try:
+        os.close(fd)
+    except Exception:
+        pass
+
+
+def try_acquire_codex_delegate_slots(
+    count: int,
+) -> tuple[Optional[list[CodexDelegateSlotLease]], int, int]:
+    """Atomically reserve ``count`` host-wide live Codex delegate slots.
+
+    Admission is non-blocking once the short metadata lock is held. If the
+    requested batch would exceed the shared ceiling, every provisional slot is
+    released and the whole batch is denied before child construction.
+    """
+    limit = _MAX_DELEGATES
+    if count < 1 or count > limit or _DISABLED or not _HAVE_FCNTL:
+        return None, limit, limit
+    import fcntl as _fcntl
+
+    gate_dir = _gate_dir()
+    if gate_dir is None:
+        return None, limit, limit
+    admission_fd = _delegate_admission_lock(gate_dir)
+    if admission_fd is None:
+        return None, limit, limit
+    acquired: list[CodexDelegateSlotLease] = []
+    busy = 0
+    try:
+        for slot in range(limit):
+            slot_path = gate_dir / f"{_DELEGATE_SLOT_PREFIX}{slot}.lock"
+            try:
+                fd = os.open(str(slot_path), os.O_RDWR | os.O_CREAT, 0o600)
+            except Exception:
+                continue
+            try:
+                _fcntl.flock(fd, _fcntl.LOCK_EX | _fcntl.LOCK_NB)
+            except OSError as exc:
+                try:
+                    os.close(fd)
+                except Exception:
+                    pass
+                if exc.errno in (errno.EACCES, errno.EAGAIN):
+                    busy += 1
+                continue
+            except Exception:
+                try:
+                    os.close(fd)
+                except Exception:
+                    pass
+                continue
+            lease = CodexDelegateSlotLease(fd, slot)
+            acquired.append(lease)
+            try:
+                metadata = json.dumps(
+                    {
+                        "pid": os.getpid(),
+                        "thread": threading.get_ident(),
+                        "acquired_at": time.time(),
+                    },
+                    sort_keys=True,
+                ).encode("utf-8")
+                os.ftruncate(fd, 0)
+                os.write(fd, metadata)
+                os.fsync(fd)
+            except Exception:
+                pass
+            if len(acquired) == count:
+                return acquired, busy, limit
+        for lease in acquired:
+            lease.release()
+        return None, busy, limit
+    finally:
+        _release_lock_fd(admission_fd)
+
+
+def codex_delegate_runtime_snapshot() -> dict:
+    """Return a secret-free readback of the shared live-delegate slots."""
+    gate_dir = _gate_dir() if not _DISABLED else None
+    if gate_dir is None or not _HAVE_FCNTL:
+        return {
+            "enabled": False,
+            "max_delegates": _MAX_DELEGATES,
+            "active_delegates": None,
+            "holders": [],
+        }
+    import fcntl as _fcntl
+
+    admission_fd = _delegate_admission_lock(gate_dir)
+    if admission_fd is None:
+        return {
+            "enabled": True,
+            "max_delegates": _MAX_DELEGATES,
+            "active_delegates": None,
+            "holders": [],
+        }
+    holders = []
+    try:
+        for slot in range(_MAX_DELEGATES):
+            path = gate_dir / f"{_DELEGATE_SLOT_PREFIX}{slot}.lock"
+            try:
+                fd = os.open(str(path), os.O_RDWR | os.O_CREAT, 0o600)
+            except Exception:
+                continue
+            busy = False
+            try:
+                _fcntl.flock(fd, _fcntl.LOCK_EX | _fcntl.LOCK_NB)
+            except OSError as exc:
+                busy = exc.errno in (errno.EACCES, errno.EAGAIN)
+            except Exception:
+                busy = True
+            if busy:
+                metadata = {}
+                try:
+                    metadata = json.loads(path.read_text(encoding="utf-8") or "{}")
+                except Exception:
+                    pass
+                holders.append({"slot": slot, **metadata})
+            else:
+                try:
+                    _fcntl.flock(fd, _fcntl.LOCK_UN)
+                except Exception:
+                    pass
+            try:
+                os.close(fd)
+            except Exception:
+                pass
+        return {
+            "enabled": True,
+            "max_delegates": _MAX_DELEGATES,
+            "active_delegates": len(holders),
+            "holders": holders,
+        }
+    finally:
+        _release_lock_fd(admission_fd)
 
 
 # ── shared state (cooldown / pacing) ─────────────────────────────────────────

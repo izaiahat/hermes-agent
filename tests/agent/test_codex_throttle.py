@@ -21,6 +21,21 @@ def _gate_process_worker(index, release_event, result_queue):
         result_queue.put(("error", index, exc.reason))
 
 
+def _delegate_gate_process_worker(index, release_event, result_queue):
+    from agent.codex_throttle import try_acquire_codex_delegate_slots
+
+    leases, active_before, limit = try_acquire_codex_delegate_slots(1)
+    if leases is None:
+        result_queue.put(("denied", index, active_before, limit))
+        return
+    result_queue.put(("acquired", index, active_before, limit))
+    try:
+        release_event.wait(timeout=10)
+    finally:
+        for lease in leases:
+            lease.release()
+
+
 def _reload_throttle(monkeypatch, tmp_path, *, base="60", cap="300"):
     # Keep unit tests isolated from the operator's live root throttle policy.
     monkeypatch.setenv(
@@ -254,13 +269,15 @@ def test_zero_timeout_rejects_immediately(monkeypatch, tmp_path):
     assert time.monotonic() - started < 0.1
 
 
-def test_policy_cannot_raise_hard_ceiling_above_five(monkeypatch, tmp_path):
+def test_policy_cannot_raise_hard_ceiling_above_seven(monkeypatch, tmp_path):
     throttle, _ = _reload_with_policy(
         monkeypatch,
         tmp_path,
-        "HERMES_CODEX_MAX_CONCURRENCY=99\n",
+        "HERMES_CODEX_MAX_CONCURRENCY=99\nHERMES_CODEX_MAX_DELEGATES=99\n",
     )
-    assert throttle.runtime_config()["max_concurrency"] == 5
+    snapshot = throttle.runtime_config()
+    assert snapshot["max_concurrency"] == 7
+    assert snapshot["max_delegates"] == 7
 
 
 def test_box_wide_gate_is_shared_across_processes(monkeypatch, tmp_path):
@@ -305,3 +322,50 @@ def test_box_wide_gate_is_shared_across_processes(monkeypatch, tmp_path):
     errors = [item for item in results if item[0] == "error"]
     assert errors == [("error", errors[0][1], "timeout")]
     assert all(process.exitcode == 0 for process in processes)
+
+
+def test_box_wide_delegate_gate_admits_seven_and_denies_eighth(monkeypatch, tmp_path):
+    root = tmp_path / "isolated-hermes-root"
+    root.mkdir()
+    policy = tmp_path / "delegate-policy.env"
+    policy.write_text(
+        "\n".join([
+            "HERMES_CODEX_MAX_CONCURRENCY=7",
+            "HERMES_CODEX_MIN_CONCURRENCY=1",
+            "HERMES_CODEX_CONCURRENCY_START=7",
+            "HERMES_CODEX_MAX_DELEGATES=7",
+        ]),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(root))
+    monkeypatch.setenv("HERMES_CODEX_THROTTLE_ENV_FILE", str(policy))
+    from agent import codex_throttle
+
+    throttle = importlib.reload(codex_throttle)
+    ctx = multiprocessing.get_context("spawn")
+    release = ctx.Event()
+    result_queue = ctx.Queue()
+    holders = [
+        ctx.Process(target=_delegate_gate_process_worker, args=(i, release, result_queue))
+        for i in range(7)
+    ]
+    for process in holders:
+        process.start()
+    acquired = [result_queue.get(timeout=10) for _ in holders]
+    assert all(row[0] == "acquired" for row in acquired)
+
+    eighth = ctx.Process(
+        target=_delegate_gate_process_worker,
+        args=(7, release, result_queue),
+    )
+    eighth.start()
+    denied = result_queue.get(timeout=10)
+    assert denied[0] == "denied"
+    assert denied[2:] == (7, 7)
+    assert throttle.codex_delegate_runtime_snapshot()["active_delegates"] == 7
+
+    release.set()
+    for process in holders + [eighth]:
+        process.join(timeout=10)
+    assert all(process.exitcode == 0 for process in holders + [eighth])
+    assert throttle.codex_delegate_runtime_snapshot()["active_delegates"] == 0
