@@ -2213,9 +2213,39 @@ def _resolve_use_tui(args) -> bool:
         return False
 
 
+_MAX_QUERY_FILE_BYTES = 8 * 1024 * 1024
+
+
+def _load_chat_query_file(args) -> None:
+    """Load ``--query-file`` bytes without transporting the query in argv."""
+    query_file = getattr(args, "query_file", None)
+    if not query_file:
+        return
+    path = Path(query_file).expanduser()
+    try:
+        if path.is_symlink() or not path.is_file():
+            raise ValueError("path must be a regular non-symlink file")
+        size = path.stat().st_size
+        if size > _MAX_QUERY_FILE_BYTES:
+            raise ValueError("file exceeds the 8 MiB query limit")
+        query_bytes = path.read_bytes()
+        if not query_bytes:
+            raise ValueError("file is empty")
+        if b"\x00" in query_bytes:
+            raise ValueError("file contains a NUL byte")
+        args.query = query_bytes.decode("utf-8")
+    except (OSError, UnicodeDecodeError, ValueError) as exc:
+        print(f"Error: could not load --query-file: {exc}", file=sys.stderr)
+        raise SystemExit(2) from exc
+
+
 def cmd_chat(args):
     """Run interactive chat CLI."""
+    _load_chat_query_file(args)
     use_tui = _resolve_use_tui(args)
+    if getattr(args, "query_file", None) and use_tui:
+        print("Error: --query-file is for non-interactive chat; add --cli.", file=sys.stderr)
+        raise SystemExit(2)
 
     _apply_safe_mode(args)
 
