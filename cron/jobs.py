@@ -2147,15 +2147,22 @@ def resnapshot_all_unpinned() -> List[Dict[str, Any]]:
 
 
 def pause_job(job_id: str, reason: Optional[str] = None) -> Optional[Dict[str, Any]]:
-    """Pause a job without deleting it. Accepts a job ID or name."""
+    """Pause a job without deleting it. A durable reason is mandatory.
+
+    A job paused with no recorded reason is indistinguishable from one paused by
+    accident, and nobody can later tell whether it is safe to resume.
+    """
     job = resolve_job_ref(job_id)
     if not job:
         return None
+    normalized_reason = str(reason or "").strip()
+    if not normalized_reason:
+        raise ValueError("paused_reason is required when pausing a cron job")
     return update_job(job["id"], {
         "enabled": False,
         "state": "paused",
         "paused_at": _hermes_now().isoformat(),
-        "paused_reason": reason,
+        "paused_reason": normalized_reason,
     })
 
 

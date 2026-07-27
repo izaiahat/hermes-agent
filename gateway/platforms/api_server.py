@@ -3449,8 +3449,20 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             return self._cron_error_response(e)
 
     async def _handle_pause_job(self, request: "web.Request") -> "web.Response":
-        """POST /api/jobs/{job_id}/pause — pause a cron job."""
-        return await self._job_lookup_or_mutate(request, _cron_pause, notify=True)
+        """POST /api/jobs/{job_id}/pause — pause a cron job.
+
+        ``reason`` is read from the JSON body; the route names itself when the
+        caller supplied none, because pause_job now requires a durable reason.
+        """
+        job_id, err = self._cron_request_guard(request, need_job_id=True)
+        if err:
+            return err
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        reason = str((body or {}).get("reason") or "paused from jobs API").strip()
+        return self._job_response(lambda jid: _cron_pause(jid, reason=reason), job_id, notify=True)
 
     async def _handle_resume_job(self, request: "web.Request") -> "web.Response":
         """POST /api/jobs/{job_id}/resume — resume a paused cron job."""

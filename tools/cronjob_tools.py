@@ -1023,6 +1023,10 @@ Jobs run in a fresh session with no current-chat context, so prompts must be sel
                 "type": "string",
                 "description": "Required for update/pause/resume/remove/run. For resnap: the job to adopt the current global inference resolution (omit if all=true)."
             },
+            "reason": {
+                "type": "string",
+                "description": "REQUIRED for action=pause. Durable human-readable explanation stored as paused_reason."
+            },
             "all": {
                 "type": "boolean",
                 "description": "Only for action='resnap'. all=true refreshes the inference snapshot of EVERY unpinned agent job to the current global resolution (bulk 'make everything follow my new default'). Must be explicitly set to true — never implied. Omit (or false) to resnap a single job via job_id."
