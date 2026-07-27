@@ -290,13 +290,20 @@ class TestUnifiedCronjobTool:
         created = json.loads(cronjob(action="create", prompt="Check", schedule="every 1h"))
         job_id = created["job_id"]
 
-        paused = json.loads(cronjob(action="pause", job_id=job_id))
+        paused = json.loads(cronjob(action="pause", job_id=job_id, reason="operator maintenance"))
         assert paused["success"] is True
         assert paused["job"]["state"] == "paused"
+        assert paused["job"]["paused_reason"] == "operator maintenance"
 
         resumed = json.loads(cronjob(action="resume", job_id=job_id))
         assert resumed["success"] is True
         assert resumed["job"]["state"] == "scheduled"
+
+    def test_pause_rejects_missing_reason(self):
+        created = json.loads(cronjob(action="create", prompt="Check", schedule="every 1h"))
+        result = json.loads(cronjob(action="pause", job_id=created["job_id"]))
+        assert result["success"] is False
+        assert "reason is required" in result["error"]
 
     def test_update_schedule_recomputes_display(self):
         created = json.loads(cronjob(action="create", prompt="Check", schedule="every 1h"))

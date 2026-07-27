@@ -52,7 +52,7 @@ def test_claim_paused_job_returns_false(temp_home):
     from cron.jobs import create_job, claim_job_for_fire, pause_job
 
     job = create_job(prompt="x", schedule="every 5m", name="p")
-    pause_job(job["id"])
+    pause_job(job["id"], reason="test paused job must not fire")
     assert claim_job_for_fire(job["id"]) is False
 
 
