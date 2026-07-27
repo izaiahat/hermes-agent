@@ -13659,7 +13659,8 @@ def _(rid, params: dict) -> dict:
                 ),
             )
         if action in {"remove", "pause", "resume"}:
-            return _ok(rid, json.loads(cronjob(action=action, job_id=jid)))
+            reason = params.get("reason") or "paused from TUI gateway"
+            return _ok(rid, json.loads(cronjob(action=action, job_id=jid, reason=reason)))
         return _err(rid, 4016, f"unknown cron action: {action}")
     except Exception as e:
         return _err(rid, 5023, str(e))

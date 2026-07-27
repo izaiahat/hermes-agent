@@ -337,10 +337,12 @@ def finalize_turn(
     _response_transformed = False
 
     # Plugin hook: transform_llm_output
-    # Fired once per turn after the tool-calling loop completes.
+    # Fired once per turn after the tool-calling loop completes, including
+    # interrupted turns that still have non-empty partial text. Safety
+    # transforms must see the exact text that a gateway may return.
     # Plugins can transform the LLM's output text before it's returned.
     # First hook to return a string wins; None/empty return leaves text unchanged.
-    if final_response and not interrupted:
+    if final_response:
         try:
             from hermes_cli.plugins import invoke_hook as _invoke_hook
             _transform_results = _invoke_hook(

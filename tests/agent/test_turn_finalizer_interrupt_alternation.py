@@ -196,3 +196,31 @@ def test_interrupt_without_tool_tail_adds_nothing():
     _finalize(agent, messages, interrupted=True, final_response="partial reply")
     assert len(messages) == before
     assert messages[-1]["role"] == "assistant"
+
+
+def test_interrupted_nonempty_response_runs_transform_hook(monkeypatch):
+    agent = _StubAgent()
+    agent.platform = "discord"
+    messages = _interrupted_tool_tail()
+    calls = []
+
+    def fake_invoke_hook(name, **kwargs):
+        calls.append((name, kwargs))
+        if name == "transform_llm_output":
+            return ["Blocked: interrupted source output suppressed."]
+        return []
+
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", fake_invoke_hook)
+    result = _finalize(
+        agent,
+        messages,
+        interrupted=True,
+        final_response="Hook — partial script body",
+    )
+
+    assert result["final_response"] == "Blocked: interrupted source output suppressed."
+    assert result["response_transformed"] is True
+    transform_calls = [kwargs for name, kwargs in calls if name == "transform_llm_output"]
+    assert len(transform_calls) == 1
+    assert transform_calls[0]["response_text"] == "Hook — partial script body"
+    assert transform_calls[0]["platform"] == "discord"
