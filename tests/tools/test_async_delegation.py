@@ -700,6 +700,82 @@ def test_descendant_budget_is_atomic_and_lease_release_is_idempotent(monkeypatch
     assert dt.active_descendant_count() == 0
 
 
+def test_global_codex_descendant_leases_release_with_local_leases(monkeypatch):
+    import agent.codex_throttle as throttle
+    import tools.delegate_tool as dt
+
+    class GlobalLease:
+        def __init__(self):
+            self.release_calls = 0
+
+        def release(self):
+            self.release_calls += 1
+
+    global_leases = [GlobalLease(), GlobalLease()]
+    monkeypatch.setattr(dt, "_load_config", lambda: {"max_total_descendants": 3})
+    monkeypatch.setattr(throttle, "is_enabled", lambda: True)
+    monkeypatch.setattr(
+        throttle,
+        "try_acquire_codex_delegate_slots",
+        lambda count: (global_leases[:count], 1, 7),
+    )
+
+    leases, active, limit = dt._try_reserve_descendants(
+        2, use_global_codex_gate=True
+    )
+
+    assert leases is not None
+    assert (active, limit, dt.active_descendant_count()) == (0, 3, 2)
+    for lease in leases:
+        lease.release()
+        lease.release()
+    assert [lease.release_calls for lease in global_leases] == [1, 1]
+    assert dt.active_descendant_count() == 0
+
+
+def test_global_codex_denial_reports_host_capacity_and_reserves_nothing(monkeypatch):
+    import agent.codex_throttle as throttle
+    import tools.delegate_tool as dt
+
+    monkeypatch.setattr(dt, "_load_config", lambda: {"max_total_descendants": 5})
+    monkeypatch.setattr(throttle, "is_enabled", lambda: True)
+    monkeypatch.setattr(
+        throttle,
+        "try_acquire_codex_delegate_slots",
+        lambda count: (None, 7, 7),
+    )
+
+    leases, active, limit = dt._try_reserve_descendants(
+        1, use_global_codex_gate=True
+    )
+
+    assert leases is None
+    assert (active, limit, dt.active_descendant_count()) == (7, 7, 0)
+
+
+def test_explicit_codex_gate_disable_bypasses_global_slots(monkeypatch):
+    import agent.codex_throttle as throttle
+    import tools.delegate_tool as dt
+
+    monkeypatch.setattr(dt, "_load_config", lambda: {"max_total_descendants": 2})
+    monkeypatch.setattr(throttle, "is_enabled", lambda: False)
+    monkeypatch.setattr(
+        throttle,
+        "try_acquire_codex_delegate_slots",
+        lambda count: pytest.fail("disabled gate must not touch shared slots"),
+    )
+
+    leases, active, limit = dt._try_reserve_descendants(
+        2, use_global_codex_gate=True
+    )
+
+    assert leases is not None
+    assert (active, limit, dt.active_descendant_count()) == (0, 2, 2)
+    for lease in leases:
+        lease.release()
+    assert dt.active_descendant_count() == 0
+
+
 def test_stale_lease_cannot_release_a_new_budget_epoch(monkeypatch):
     import tools.delegate_tool as dt
 
