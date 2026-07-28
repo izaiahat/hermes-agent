@@ -111,18 +111,38 @@ describe('ModelSettings', () => {
     await waitFor(() => expect(getGlobalModelInfo).toHaveBeenCalled())
     await waitFor(() => expect(getGlobalModelOptions).toHaveBeenCalled())
 
-    // Open the provider Select — every provider from the full payload should be
-    // listed, including unconfigured providers before they have models.
+    // Open the provider Select — it should reflect the configured inventory
+    // returned by the backend rather than reviving providers absent from it.
     const triggers = await screen.findAllByRole('combobox')
     fireEvent.click(triggers[0])
 
-    // "Nous" shows in both the trigger and the open list; the unconfigured
-    // provider is the unique signal of the full universe.
+    // "Nous" shows in both the trigger and the open list. DeepSeek is absent
+    // because this payload only contains the configured Nous provider.
     expect((await screen.findAllByText('Nous')).length).toBeGreaterThan(0)
-    expect(await screen.findByText(/DeepSeek/)).toBeTruthy()
+    expect(screen.queryByText(/DeepSeek/)).toBeNull()
   })
 
   it('activates an unconfigured api_key provider inline by saving its key', async () => {
+    getGlobalModelOptions.mockResolvedValueOnce({
+      providers: [
+        {
+          name: 'Nous',
+          slug: 'nous',
+          models: ['hermes-4', 'hermes-4-mini'],
+          authenticated: true,
+          capabilities: { 'hermes-4': { reasoning: true, fast: true } }
+        },
+        {
+          name: 'DeepSeek',
+          slug: 'deepseek',
+          models: [],
+          authenticated: false,
+          auth_type: 'api_key',
+          key_env: 'DEEPSEEK_API_KEY'
+        }
+      ]
+    })
+
     await renderModelSettings()
 
     await waitFor(() => expect(getGlobalModelOptions).toHaveBeenCalled())
