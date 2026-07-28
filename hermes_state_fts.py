@@ -212,6 +212,69 @@ class SessionFtsSetupMixin:
         """True when the current FTS storage layout should be treated as stale (optimize-storage has work)."""
         return cls._db_has_legacy_inline_fts(cursor) or cls._db_has_trigram_tool_calls_projection(cursor)
 
+    def _ensure_fts_write_latency_policy(self) -> None:
+        """Persist a bounded-latency FTS5 merge policy when needed.
+
+        FTS5 keeps these settings inside each virtual table's ``*_config`` shadow
+        table. Missing rows mean SQLite's defaults (automerge=4, crisismerge=16),
+        either of which may merge segments synchronously inside an unrelated
+        message INSERT while holding the sole WAL writer slot. Probe first and
+        take a write transaction only when a table lacks the Hermes policy, so an
+        ordinary SessionDB open stays read-only at this step.
+        """
+        if self.read_only or not self._fts_enabled:
+            return
+
+        tables = ("messages_fts", "messages_fts_trigram", "messages_fts_cjk")
+        expected = {"automerge": self._FTS_AUTOMERGE, "crisismerge": self._FTS_CRISISMERGE}
+
+        def _pending(conn: sqlite3.Connection) -> bool:
+            for table in tables:
+                if conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)
+                ).fetchone() is None:
+                    continue
+                rows = conn.execute(
+                    f"SELECT k, v FROM {table}_config WHERE k IN ('automerge', 'crisismerge')"
+                ).fetchall()
+                live = {str(row[0]): int(row[1]) for row in rows}
+                if any(live.get(key) != value for key, value in expected.items()):
+                    return True
+            return False
+
+        try:
+            with self._lock:
+                conn = self._conn
+                if conn is None:
+                    return
+                needs_update = _pending(conn)
+        except sqlite3.OperationalError as exc:
+            logger.debug("FTS write-latency policy probe skipped: %s", exc)
+            return
+        if not needs_update:
+            return
+
+        def _apply(conn: sqlite3.Connection) -> None:
+            for table in tables:
+                if conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)
+                ).fetchone() is None:
+                    continue
+                rows = conn.execute(
+                    f"SELECT k, v FROM {table}_config WHERE k IN ('automerge', 'crisismerge')"
+                ).fetchall()
+                live = {str(row[0]): int(row[1]) for row in rows}
+                for key, value in expected.items():
+                    if live.get(key) != value:
+                        conn.execute(f"INSERT INTO {table}({table}, rank) VALUES(?, ?)", (key, value))
+
+        try:
+            self._execute_write(_apply)
+        except sqlite3.Error as exc:
+            # Opening a session must never fail because optional search-index
+            # tuning lost a race; a later open retries the policy.
+            logger.warning("FTS write-latency policy update deferred: %s", exc)
+
     def _warn_trigram_unavailable(self, exc: sqlite3.OperationalError) -> None:
         """Log once that the trigram tokenizer is missing; base FTS5 stays enabled."""
         if getattr(self, "_trigram_unavailable_warned", False):  # attr is lazily created here

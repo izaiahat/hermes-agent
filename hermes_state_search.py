@@ -182,14 +182,23 @@ class SessionSearchMixin:
         SystemError CPython's sqlite3 layer can raise under cross-thread errmsg scrambling)."""
         if not self._fts_enabled:
             return
+        started = time.monotonic()
+        max_pages = int(getattr(self, "_FTS_MERGE_MAX_PAGES_PER_INDEX", 32))
         try:
-            self._merge_fts_incrementally(max_pages=self._FTS_MERGE_MAX_PAGES_PER_INDEX)
+            executed = self._merge_fts_incrementally(max_pages=max_pages)
         except Exception as exc:  # noqa: BLE001 - post-commit maintenance
             # The canonical write is already committed before this cadence runs. No maintenance failure —
             # including the bare SystemError the CPython sqlite3 layer can raise under cross-thread errmsg
             # scrambling — may escape and make the caller replay an ambiguous, possibly-durable write
             # (#90734, #85079).
             logger.warning("FTS incremental merge failed after commit: %s", exc)
+            return
+        elapsed = time.monotonic() - started
+        if elapsed >= float(getattr(self, "_SLOW_WRITE_LOG_SECONDS", 2.0)):
+            logger.warning(
+                "Slow bounded FTS merge: pid=%d commands=%s pages=%d elapsed=%.3fs",
+                os.getpid(), executed, max_pages, elapsed,
+            )
 
     # ── Deferred rebuild engine (base + CJK backfills) ─────────────────────
 

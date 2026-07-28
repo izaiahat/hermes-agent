@@ -432,7 +432,16 @@ class SessionDB(
     _CHECKPOINT_EVERY_N_WRITES = 50
     # Bounded FTS ``'merge'`` (ms of lock each) instead of ``'optimize'`` (9-18s per index on a 10GB
     # DB, longer than a writer's patience); up to _COMMANDS_PER_PASS per index, stopping on no-progress.
-    _FTS_MERGE_EVERY_N_WRITES, _FTS_MERGE_MAX_PAGES_PER_INDEX, _FTS_MERGE_COMMANDS_PER_PASS = 1000, 500, 4
+    # FTS5's inline automerge/crisismerge can turn an ordinary message INSERT into
+    # an unbounded segment merge while it holds the sole WAL writer slot. Disable
+    # the inline work and run short bounded merge passes after committed writes
+    # instead, using the existing no-progress detection.
+    _FTS_AUTOMERGE = 0
+    _FTS_CRISISMERGE = 1_000_000
+    _FTS_MERGE_EVERY_N_WRITES = 50
+    _FTS_MERGE_MAX_PAGES_PER_INDEX = 32
+    _FTS_MERGE_COMMANDS_PER_PASS = 1
+    _SLOW_WRITE_LOG_SECONDS = 2.0
     # Imports cap lower than exports: an import holds one BEGIN IMMEDIATE.
     _IMPORT_MAX_SESSIONS, _IMPORT_MAX_MESSAGES_PER_SESSION, _IMPORT_MAX_TOTAL_MESSAGES = 500, 10_000, 50_000
     _IMPORT_MAX_SESSION_BYTES, _IMPORT_MAX_TOTAL_BYTES = 5 * 1024 * 1024, 25 * 1024 * 1024
@@ -707,6 +716,7 @@ class SessionDB(
         _secure_state_db_files(self.db_path, create_main=True)
         self._conn = self._open_writer_conn()
         self._init_schema()
+        self._ensure_fts_write_latency_policy()
 
     def _connect_and_init_with_lock_patience(self) -> None:
         """Open + init, waiting out a sibling's write lock with jittered patience:
@@ -887,6 +897,9 @@ class SessionDB(
         # settlement unknown and must propagate — this helper owns non-idempotent transcript/counter
         # mutations, not just idempotent UPSERTs.
         ioerr_begin_retried = False
+        operation_started = time.monotonic()
+        fn_name = getattr(fn, "__qualname__", getattr(fn, "__name__", "write"))
+        attempt = 0
         while True:
             self._raise_if_db_corrupt()
             # NOTE: the replaced/generation live probe runs INSIDE the lock below,
@@ -900,23 +913,41 @@ class SessionDB(
             # later writes (#105567). Inside the lock the probe only ever sees the
             # stable post-close state (identity cleared → adopt / reopen path).
             fn_started = False
+            attempt += 1
             try:
+                attempt_started = time.monotonic()
                 with self._lock:
                     self._raise_if_db_replaced()
                     if self._conn is None:  # close() raced this writer
                         self._reopen_after_close_locked(context="write")
                     self._conn.execute("BEGIN IMMEDIATE")
+                    lock_acquired = time.monotonic()
                     try:
                         fn_started = True
                         result = fn(self._conn)
+                        body_finished = time.monotonic()
                         self._conn.commit()
+                        committed = time.monotonic()
                     except BaseException:
                         try:
                             self._conn.rollback()
                         except Exception:
                             pass
                         raise
-                # Success — periodic best-effort checkpoint + FTS merge.
+                elapsed = committed - operation_started
+                if elapsed >= self._SLOW_WRITE_LOG_SECONDS:
+                    # Name WHERE the time went: waiting for the writer slot, the
+                    # callback body, or the commit. Without this split a slow
+                    # write is indistinguishable from a slow disk.
+                    logger.warning(
+                        "Slow state.db write: pid=%d fn=%s total=%.3fs attempt=%d "
+                        "begin_wait=%.3fs body=%.3fs commit=%.3fs",
+                        os.getpid(), fn_name, elapsed, attempt,
+                        lock_acquired - attempt_started,
+                        body_finished - lock_acquired,
+                        committed - body_finished,
+                    )
+                # Success — periodic best-effort checkpoint + bounded FTS merge.
                 self._write_count += 1
                 if self._write_count % self._CHECKPOINT_EVERY_N_WRITES == 0:
                     self._try_wal_checkpoint()
