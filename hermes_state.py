@@ -2453,21 +2453,16 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
     _WRITE_RETRY_SLOW_MAX_S = 1.000  # 1s
     # Attempt a WAL checkpoint every N successful writes (PASSIVE mode).
     _CHECKPOINT_EVERY_N_WRITES = 50
-    # Retain the existing coarse 1000-write maintenance cadence, but replace
-    # the unbounded FTS5 ``'optimize'`` (measured holding the write lock for
-    # 9-18 s per index on a 10 GB production DB — longer than a competing
-    # writer's full retry patience, surfacing as "database is locked" /
-    # session_persistence_failed) with bounded ``'merge'`` commands. A
-    # positive merge rank is an approximate output-page budget, so each
-    # command holds the write lock for milliseconds; up to
-    # ``_FTS_MERGE_COMMANDS_PER_PASS`` commands run per index per cadence,
-    # stopping early on the documented no-progress signal. ``usermerge`` is
-    # lowered to 2 so positive merges act on any level with >= 2 segments —
-    # without that, levels below the default threshold of 4 are skipped and
-    # a fragmented index never converges (SQLite FTS5 §6.8-6.9).
-    _FTS_MERGE_EVERY_N_WRITES = 1000
-    _FTS_MERGE_MAX_PAGES_PER_INDEX = 500
-    _FTS_MERGE_COMMANDS_PER_PASS = 4
+    # Disable FTS5 inline automerge/crisismerge work: either policy can turn an
+    # ordinary message INSERT into an unbounded segment merge while holding the
+    # sole WAL writer slot. Hermes instead runs short positive-rank merge passes
+    # after committed writes, using the existing no-progress detection.
+    _FTS_AUTOMERGE = 0
+    _FTS_CRISISMERGE = 1_000_000
+    _FTS_MERGE_EVERY_N_WRITES = 50
+    _FTS_MERGE_MAX_PAGES_PER_INDEX = 32
+    _FTS_MERGE_COMMANDS_PER_PASS = 1
+    _SLOW_WRITE_LOG_SECONDS = 2.0
     # Session imports intentionally use a lower cap than exports: import holds
     # one BEGIN IMMEDIATE transaction, so bounded batches avoid starving live
     # gateway/CLI writers. The dashboard accepts one exported JSON/JSONL file
@@ -2671,6 +2666,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 self._conn.execute("PRAGMA foreign_keys=ON")
                 self._fts_cjk_loaded = load_fts5_cjk_extension(self._conn)
                 self._init_schema()
+                self._ensure_fts_write_latency_policy()
 
             def _connect_and_init_with_lock_patience():
                 # Lock contention during open: _init_schema's DDL/reconcile
@@ -3070,6 +3066,84 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 self._warn_fts5_unavailable(exc)
             return False
 
+    def _ensure_fts_write_latency_policy(self) -> None:
+        """Persist a bounded-latency FTS5 merge policy when needed.
+
+        FTS5 stores these settings inside each virtual table's ``*_config``
+        shadow table. Missing rows mean SQLite defaults (automerge=4,
+        crisismerge=16), both of which may merge segments synchronously inside
+        an unrelated message INSERT. Inspect first and take a write transaction
+        only when a table is missing the Hermes policy, so ordinary SessionDB
+        opens remain read-only at this step.
+        """
+        if self.read_only or not self._fts_enabled:
+            return
+
+        tables = (
+            "messages_fts",
+            "messages_fts_trigram",
+            "messages_fts_cjk",
+        )
+        expected = {
+            "automerge": self._FTS_AUTOMERGE,
+            "crisismerge": self._FTS_CRISISMERGE,
+        }
+
+        def _pending(conn: sqlite3.Connection) -> bool:
+            for table in tables:
+                if conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+                    (table,),
+                ).fetchone() is None:
+                    continue
+                rows = conn.execute(
+                    f"SELECT k, v FROM {table}_config "
+                    "WHERE k IN ('automerge', 'crisismerge')"
+                ).fetchall()
+                live = {str(row[0]): int(row[1]) for row in rows}
+                if any(live.get(key) != value for key, value in expected.items()):
+                    return True
+            return False
+
+        try:
+            with self._lock:
+                conn = self._conn
+                if conn is None:
+                    return
+                needs_update = _pending(conn)
+        except sqlite3.OperationalError as exc:
+            logger.debug("FTS write-latency policy probe skipped: %s", exc)
+            return
+        if not needs_update:
+            return
+
+        def _apply(conn: sqlite3.Connection) -> None:
+            for table in tables:
+                if conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+                    (table,),
+                ).fetchone() is None:
+                    continue
+                rows = conn.execute(
+                    f"SELECT k, v FROM {table}_config "
+                    "WHERE k IN ('automerge', 'crisismerge')"
+                ).fetchall()
+                live = {str(row[0]): int(row[1]) for row in rows}
+                for key, value in expected.items():
+                    if live.get(key) == value:
+                        continue
+                    conn.execute(
+                        f"INSERT INTO {table}({table}, rank) VALUES(?, ?)",
+                        (key, value),
+                    )
+
+        try:
+            self._execute_write(_apply)
+        except sqlite3.Error as exc:
+            # Opening a session must not fail because optional search-index
+            # tuning lost a race. A later SessionDB open retries the policy.
+            logger.warning("FTS write-latency policy update deferred: %s", exc)
+
     def _execute_write(
         self,
         fn: Callable[[sqlite3.Connection], T],
@@ -3102,6 +3176,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         if patience_s is None:
             patience_s = self._WRITE_PATIENCE_S
         deadline = time.monotonic() + patience_s
+        operation_started = time.monotonic()
+        fn_name = getattr(fn, "__qualname__", getattr(fn, "__name__", "write"))
+        attempt = 0
         # Set on the first compression-busy collision so the short wait is
         # measured from then, not from the start of the write.
         compression_deadline: Optional[float] = None
@@ -3117,24 +3194,40 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             return "no more rows available" in str(exc).lower()
 
         while True:
+            attempt += 1
             try:
+                attempt_started = time.monotonic()
                 with self._lock:
                     self._conn.execute("BEGIN IMMEDIATE")
+                    lock_acquired = time.monotonic()
                     try:
                         result = fn(self._conn)
+                        body_finished = time.monotonic()
                         self._conn.commit()
+                        committed = time.monotonic()
                     except BaseException:
                         try:
                             self._conn.rollback()
                         except Exception:
                             pass
                         raise
-                # Success — periodic best-effort checkpoint + FTS merge.
+                elapsed = committed - operation_started
+                if elapsed >= self._SLOW_WRITE_LOG_SECONDS:
+                    logger.warning(
+                        "Slow state.db write: pid=%d fn=%s total=%.3fs "
+                        "attempt=%d begin_wait=%.3fs body=%.3fs commit=%.3fs",
+                        os.getpid(), fn_name, elapsed, attempt,
+                        lock_acquired - attempt_started,
+                        body_finished - lock_acquired,
+                        committed - body_finished,
+                    )
+
+                # Success — periodic best-effort bounded FTS merge + checkpoint.
                 self._write_count += 1
-                if self._write_count % self._CHECKPOINT_EVERY_N_WRITES == 0:
-                    self._try_wal_checkpoint()
                 if self._write_count % self._FTS_MERGE_EVERY_N_WRITES == 0:
                     self._try_incremental_merge_fts()
+                if self._write_count % self._CHECKPOINT_EVERY_N_WRITES == 0:
+                    self._try_wal_checkpoint()
                 return result
             except SessionCompressionInProgressError:
                 # A live foreign compression lock is transient: the compressor

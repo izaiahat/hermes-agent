@@ -83,15 +83,27 @@ class SessionSearchMixin:
         """Run one bounded FTS5 merge pass without failing the completed write."""
         if not self._fts_enabled:
             return
+        started = time.monotonic()
+        max_pages = int(getattr(self, "_FTS_MERGE_MAX_PAGES_PER_INDEX", 32))
         try:
-            self._merge_fts_incrementally(
-                max_pages=self._FTS_MERGE_MAX_PAGES_PER_INDEX
+            executed = self._merge_fts_incrementally(
+                max_pages=max_pages
             )
         except sqlite3.Error as exc:
             # Routine maintenance is best effort, but unexpected SQLite errors
             # must remain visible instead of being silently mistaken for an
             # optional missing index.
             logger.warning("FTS incremental merge failed: %s", exc)
+            return
+        elapsed = time.monotonic() - started
+        if elapsed >= float(getattr(self, "_SLOW_WRITE_LOG_SECONDS", 2.0)):
+            logger.warning(
+                "Slow bounded FTS merge: pid=%d commands=%d pages=%d elapsed=%.3fs",
+                os.getpid(),
+                executed,
+                max_pages,
+                elapsed,
+            )
 
     def fts_rebuild_status(self) -> Optional[Dict[str, Any]]:
         """Return deferred-rebuild progress, or None when no rebuild pending.

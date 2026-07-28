@@ -2407,18 +2407,64 @@ class TestOptimizeFts:
 
         monkeypatch.setattr(db, "_merge_fts_incrementally", _counting_merge)
         monkeypatch.setattr(db, "optimize_fts", _unexpected_optimize)
+        # The one-time FTS policy repair is itself a write during DB open;
+        # reset here so this test controls the cadence boundary exactly.
+        db._write_count = 0
         db.create_session(session_id="s1", source="cli")
         for i in range(3):
             db.append_message(session_id="s1", role="user", content=f"needle {i}")
         assert calls == []  # Four successful writes are below the boundary.
         db.append_message(session_id="s1", role="user", content="needle 3")
-        assert calls == [500]  # The fifth write gets the production page budget.
+        budget = db._FTS_MERGE_MAX_PAGES_PER_INDEX
+        assert calls == [budget]
         for i in range(4, 8):
             db.append_message(session_id="s1", role="user", content=f"needle {i}")
-        assert calls == [500]
+        assert calls == [budget]
         db.append_message(session_id="s1", role="user", content="needle 8")
-        assert calls == [500, 500]  # The tenth write is the next boundary.
+        assert calls == [budget, budget]
         assert len(db.search_messages("needle")) == 9
+
+    def test_write_latency_policy_disables_inline_fts_merges(self, db):
+        for table in db._FTS_TABLES:
+            if not db._fts_table_exists(table):
+                continue
+            rows = db._conn.execute(
+                f"SELECT k, v FROM {table}_config "
+                "WHERE k IN ('automerge', 'crisismerge')"
+            ).fetchall()
+            config = {str(row[0]): int(row[1]) for row in rows}
+            assert config == {
+                "automerge": db._FTS_AUTOMERGE,
+                "crisismerge": db._FTS_CRISISMERGE,
+            }
+
+    def test_reopen_repairs_stale_fts_write_latency_policy(self, db):
+        db_path = db.db_path
+        tables = [table for table in db._FTS_TABLES if db._fts_table_exists(table)]
+        for table in tables:
+            db._conn.execute(
+                f"INSERT INTO {table}({table}, rank) VALUES('automerge', 4)"
+            )
+            db._conn.execute(
+                f"INSERT INTO {table}({table}, rank) VALUES('crisismerge', 16)"
+            )
+        db.close()
+
+        reopened = SessionDB(db_path=db_path)
+        try:
+            assert reopened._conn is not None
+            for table in tables:
+                rows = reopened._conn.execute(
+                    f"SELECT k, v FROM {table}_config "
+                    "WHERE k IN ('automerge', 'crisismerge')"
+                ).fetchall()
+                config = {str(row[0]): int(row[1]) for row in rows}
+                assert config == {
+                    "automerge": reopened._FTS_AUTOMERGE,
+                    "crisismerge": reopened._FTS_CRISISMERGE,
+                }
+        finally:
+            reopened.close()
 
 
 
