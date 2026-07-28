@@ -225,55 +225,61 @@ class SessionFtsSetupMixin:
         if self.read_only or not self._fts_enabled:
             return
 
-        tables = ("messages_fts", "messages_fts_trigram", "messages_fts_cjk")
+        tables = ["messages_fts"]
+        if self._trigram_available:
+            tables.append("messages_fts_trigram")
+        # A tokenizer-capable CJK index is write-ACTIVE while historical backfill
+        # is still pending: insert triggers index every new message even though
+        # ``_fts_cjk_available`` stays false until coverage completes. Tune it
+        # whenever the extension is loaded; skip only a retained table this
+        # runtime cannot safely open.
+        if self._fts_cjk_loaded:
+            tables.append("messages_fts_cjk")
         expected = {"automerge": self._FTS_AUTOMERGE, "crisismerge": self._FTS_CRISISMERGE}
 
-        def _pending(conn: sqlite3.Connection) -> bool:
-            for table in tables:
-                if conn.execute(
-                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)
-                ).fetchone() is None:
-                    continue
-                rows = conn.execute(
-                    f"SELECT k, v FROM {table}_config WHERE k IN ('automerge', 'crisismerge')"
-                ).fetchall()
-                live = {str(row[0]): int(row[1]) for row in rows}
-                if any(live.get(key) != value for key, value in expected.items()):
-                    return True
-            return False
+        def _table_pending(conn: sqlite3.Connection, table: str) -> bool:
+            if conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)
+            ).fetchone() is None:
+                return False
+            rows = conn.execute(
+                f"SELECT k, v FROM {table}_config WHERE k IN ('automerge', 'crisismerge')"
+            ).fetchall()
+            live = {str(row[0]): int(row[1]) for row in rows}
+            return any(live.get(key) != value for key, value in expected.items())
 
-        try:
-            with self._lock:
-                conn = self._conn
-                if conn is None:
+        pending: list = []
+        with self._lock:
+            conn = self._conn
+            if conn is None:
+                return
+            for table in tables:
+                try:
+                    if _table_pending(conn, table):
+                        pending.append(table)
+                except sqlite3.OperationalError as exc:
+                    logger.debug("FTS write-latency policy probe skipped for %s: %s", table, exc)
+
+        # One transaction PER INDEX so an unavailable optional tokenizer can never
+        # roll back policy already applied to the base or trigram index.
+        for table in pending:
+            def _apply(conn: sqlite3.Connection, table_name: str = table) -> None:
+                if not _table_pending(conn, table_name):
                     return
-                needs_update = _pending(conn)
-        except sqlite3.OperationalError as exc:
-            logger.debug("FTS write-latency policy probe skipped: %s", exc)
-            return
-        if not needs_update:
-            return
-
-        def _apply(conn: sqlite3.Connection) -> None:
-            for table in tables:
-                if conn.execute(
-                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)
-                ).fetchone() is None:
-                    continue
                 rows = conn.execute(
-                    f"SELECT k, v FROM {table}_config WHERE k IN ('automerge', 'crisismerge')"
+                    f"SELECT k, v FROM {table_name}_config WHERE k IN ('automerge', 'crisismerge')"
                 ).fetchall()
                 live = {str(row[0]): int(row[1]) for row in rows}
                 for key, value in expected.items():
                     if live.get(key) != value:
-                        conn.execute(f"INSERT INTO {table}({table}, rank) VALUES(?, ?)", (key, value))
+                        conn.execute(
+                            f"INSERT INTO {table_name}({table_name}, rank) VALUES(?, ?)", (key, value))
 
-        try:
-            self._execute_write(_apply)
-        except sqlite3.Error as exc:
-            # Opening a session must never fail because optional search-index
-            # tuning lost a race; a later open retries the policy.
-            logger.warning("FTS write-latency policy update deferred: %s", exc)
+            try:
+                self._execute_write(_apply)
+            except sqlite3.Error as exc:
+                logger.warning(
+                    "FTS write-latency policy update deferred for %s: %s", table, exc)
 
     def _warn_trigram_unavailable(self, exc: sqlite3.OperationalError) -> None:
         """Log once that the trigram tokenizer is missing; base FTS5 stays enabled."""

@@ -432,11 +432,12 @@ class SessionDB(
     _CHECKPOINT_EVERY_N_WRITES = 50
     # Bounded FTS ``'merge'`` (ms of lock each) instead of ``'optimize'`` (9-18s per index on a 10GB
     # DB, longer than a writer's patience); up to _COMMANDS_PER_PASS per index, stopping on no-progress.
-    # FTS5's inline automerge/crisismerge can turn an ordinary message INSERT into
-    # an unbounded segment merge while it holds the sole WAL writer slot. Disable
-    # the inline work and run short bounded merge passes after committed writes
-    # instead, using the existing no-progress detection.
-    _FTS_AUTOMERGE = 0
+    # ``automerge`` stays ENABLED so every writer — including short-lived SessionDB
+    # handles — advances incremental segment maintenance on the database-global
+    # write stream. Only the unbounded ``crisismerge`` path is made effectively
+    # unreachable, because that is the one that can turn an ordinary message
+    # INSERT into a long merge while it holds the sole WAL writer slot.
+    _FTS_AUTOMERGE = 4
     _FTS_CRISISMERGE = 1_000_000
     _FTS_MERGE_EVERY_N_WRITES = 50
     _FTS_MERGE_MAX_PAGES_PER_INDEX = 32
@@ -947,12 +948,13 @@ class SessionDB(
                         body_finished - lock_acquired,
                         committed - body_finished,
                     )
-                # Success — periodic best-effort checkpoint + bounded FTS merge.
+                # Success — periodic best-effort checkpoint. FTS5's persistent
+                # automerge policy does bounded incremental maintenance on the
+                # database-global write stream, so this hot path never runs an
+                # explicit merge (and never a full optimize).
                 self._write_count += 1
                 if self._write_count % self._CHECKPOINT_EVERY_N_WRITES == 0:
                     self._try_wal_checkpoint()
-                if self._write_count % self._FTS_MERGE_EVERY_N_WRITES == 0:
-                    self._try_incremental_merge_fts()
                 return result
             except SessionCompressionInProgressError:
                 # Transient (see _COMPRESSION_BUSY_WAIT_S): a steer landing mid-compression must not abort.
