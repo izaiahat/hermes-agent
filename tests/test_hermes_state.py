@@ -2442,7 +2442,12 @@ class TestOptimizeFts:
             conn.close()
 
     def test_write_latency_policy_keeps_global_automerge(self, db):
-        for table in db._FTS_TABLES:
+        usable = ["messages_fts"]
+        if db._trigram_available:
+            usable.append("messages_fts_trigram")
+        if db._fts_cjk_loaded:
+            usable.append("messages_fts_cjk")
+        for table in usable:
             if not db._fts_table_exists(table):
                 continue
             rows = db._conn.execute(
@@ -2455,9 +2460,43 @@ class TestOptimizeFts:
                 "crisismerge": db._FTS_CRISISMERGE,
             }
 
+    def test_pending_active_cjk_receives_write_latency_policy(self, db):
+        if not db._fts_table_exists("messages_fts_cjk"):
+            db._conn.execute(
+                "CREATE VIRTUAL TABLE messages_fts_cjk USING fts5(content)"
+            )
+        db._conn.execute(
+            "INSERT INTO messages_fts_cjk(messages_fts_cjk, rank) "
+            "VALUES('automerge', 0)"
+        )
+        db._conn.execute(
+            "INSERT INTO messages_fts_cjk(messages_fts_cjk, rank) "
+            "VALUES('crisismerge', 16)"
+        )
+        db._fts_cjk_loaded = True
+        db._fts_cjk_available = False
+
+        db._ensure_fts_write_latency_policy()
+
+        config = dict(
+            db._conn.execute(
+                "SELECT k, v FROM messages_fts_cjk_config "
+                "WHERE k IN ('automerge', 'crisismerge')"
+            ).fetchall()
+        )
+        assert config == {
+            "automerge": db._FTS_AUTOMERGE,
+            "crisismerge": db._FTS_CRISISMERGE,
+        }
+
     def test_reopen_repairs_stale_fts_write_latency_policy(self, db):
         db_path = db.db_path
-        tables = [table for table in db._FTS_TABLES if db._fts_table_exists(table)]
+        tables = ["messages_fts"]
+        if db._trigram_available:
+            tables.append("messages_fts_trigram")
+        if db._fts_cjk_loaded:
+            tables.append("messages_fts_cjk")
+        tables = [table for table in tables if db._fts_table_exists(table)]
         for table in tables:
             db._conn.execute(
                 f"INSERT INTO {table}({table}, rank) VALUES('automerge', 4)"

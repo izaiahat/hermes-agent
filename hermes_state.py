@@ -3084,7 +3084,12 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         tables = ["messages_fts"]
         if self._trigram_available:
             tables.append("messages_fts_trigram")
-        if self._fts_cjk_available:
+        # A tokenizer-capable CJK index remains write-active while historical
+        # backfill is pending: insert triggers index every new message even
+        # though `_fts_cjk_available` stays false until coverage is complete.
+        # Tune it whenever the tokenizer extension is loaded; skip only a
+        # retained table that this runtime cannot safely open.
+        if self._fts_cjk_loaded:
             tables.append("messages_fts_cjk")
         expected = {
             "automerge": self._FTS_AUTOMERGE,
