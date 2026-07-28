@@ -1,9 +1,7 @@
 """Tests for SessionDB WAL checkpoint strategy (issue #45383).
 
-Verifies that ALL checkpoints on the shared state.db use PASSIVE mode:
-periodic, close(), and pre-VACUUM. TRUNCATE fires a full WAL reset, and
-transient per-cron-run connections closing many times an hour would race
-the live gateway writer and corrupt B-tree pages (#45383).
+Verifies that periodic and close-time checkpoints use PASSIVE mode (safe for
+shared live DBs) while explicit pre-VACUUM maintenance may still use TRUNCATE.
 """
 
 import sqlite3
@@ -97,6 +95,7 @@ class TestCloseUsesPassive:
 
     def test_close_uses_passive_mode(self, db):
         """close() checkpoints PASSIVE, never TRUNCATE."""
+
         real_conn = db._conn
         execute_calls = []
 
@@ -110,8 +109,8 @@ class TestCloseUsesPassive:
 
         db.close()
 
-        truncate_calls = [c for c in execute_calls if "wal_checkpoint(TRUNCATE)" in c]
         passive_calls = [c for c in execute_calls if "wal_checkpoint(PASSIVE)" in c]
+        truncate_calls = [c for c in execute_calls if "wal_checkpoint(TRUNCATE)" in c]
         assert len(truncate_calls) == 0, (
             "close() must NOT TRUNCATE (races the live gateway writer, #45383)"
         )
@@ -121,6 +120,7 @@ class TestCloseUsesPassive:
 
     def test_close_logs_debug_on_failure(self, db, caplog):
         """Failed PASSIVE checkpoint at close logs debug (close is best-effort)."""
+
         mock_conn = MagicMock()
         mock_conn.execute.side_effect = sqlite3.OperationalError("database is locked")
         db._conn = mock_conn
