@@ -2453,11 +2453,12 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
     _WRITE_RETRY_SLOW_MAX_S = 1.000  # 1s
     # Attempt a WAL checkpoint every N successful writes (PASSIVE mode).
     _CHECKPOINT_EVERY_N_WRITES = 50
-    # Disable FTS5 inline automerge/crisismerge work: either policy can turn an
-    # ordinary message INSERT into an unbounded segment merge while holding the
-    # sole WAL writer slot. Hermes instead runs short positive-rank merge passes
-    # after committed writes, using the existing no-progress detection.
-    _FTS_AUTOMERGE = 0
+    # Keep SQLite's database-global incremental automerge enabled so short-lived
+    # SessionDB handles still advance maintenance. Raise crisismerge high enough
+    # that an ordinary message append never performs an all-segments crisis merge
+    # inside its transaction. The bounded manual-merge constants remain for
+    # explicit maintenance paths, never for the routine write hot path.
+    _FTS_AUTOMERGE = 4
     _FTS_CRISISMERGE = 1_000_000
     _FTS_MERGE_EVERY_N_WRITES = 50
     _FTS_MERGE_MAX_PAGES_PER_INDEX = 32
@@ -3067,65 +3068,67 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             return False
 
     def _ensure_fts_write_latency_policy(self) -> None:
-        """Persist a bounded-latency FTS5 merge policy when needed.
+        """Persist a bounded-latency, database-global FTS5 merge policy.
 
-        FTS5 stores these settings inside each virtual table's ``*_config``
-        shadow table. Missing rows mean SQLite defaults (automerge=4,
-        crisismerge=16), both of which may merge segments synchronously inside
-        an unrelated message INSERT. Inspect first and take a write transaction
-        only when a table is missing the Hermes policy, so ordinary SessionDB
-        opens remain read-only at this step.
+        ``automerge`` stays enabled so every writer — including short-lived
+        SessionDB handles — advances incremental segment maintenance. Only the
+        unbounded ``crisismerge`` path is made effectively unreachable. Each
+        usable index is updated in its own transaction so an unavailable
+        optional tokenizer can never roll back policy already applied to the
+        base or trigram index. The read probe keeps ordinary opens write-free
+        once the persistent settings are correct.
         """
         if self.read_only or not self._fts_enabled:
             return
 
-        tables = (
-            "messages_fts",
-            "messages_fts_trigram",
-            "messages_fts_cjk",
-        )
+        tables = ["messages_fts"]
+        if self._trigram_available:
+            tables.append("messages_fts_trigram")
+        if self._fts_cjk_available:
+            tables.append("messages_fts_cjk")
         expected = {
             "automerge": self._FTS_AUTOMERGE,
             "crisismerge": self._FTS_CRISISMERGE,
         }
 
-        def _pending(conn: sqlite3.Connection) -> bool:
-            for table in tables:
-                if conn.execute(
-                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
-                    (table,),
-                ).fetchone() is None:
-                    continue
-                rows = conn.execute(
-                    f"SELECT k, v FROM {table}_config "
-                    "WHERE k IN ('automerge', 'crisismerge')"
-                ).fetchall()
-                live = {str(row[0]): int(row[1]) for row in rows}
-                if any(live.get(key) != value for key, value in expected.items()):
-                    return True
-            return False
+        def _table_pending(conn: sqlite3.Connection, table: str) -> bool:
+            if conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+                (table,),
+            ).fetchone() is None:
+                return False
+            rows = conn.execute(
+                f"SELECT k, v FROM {table}_config "
+                "WHERE k IN ('automerge', 'crisismerge')"
+            ).fetchall()
+            live = {str(row[0]): int(row[1]) for row in rows}
+            return any(live.get(key) != value for key, value in expected.items())
 
-        try:
-            with self._lock:
-                conn = self._conn
-                if conn is None:
+        pending: List[str] = []
+        with self._lock:
+            conn = self._conn
+            if conn is None:
+                return
+            for table in tables:
+                try:
+                    if _table_pending(conn, table):
+                        pending.append(table)
+                except sqlite3.OperationalError as exc:
+                    logger.debug(
+                        "FTS write-latency policy probe skipped for %s: %s",
+                        table,
+                        exc,
+                    )
+
+        for table in pending:
+            def _apply(
+                conn: sqlite3.Connection,
+                table_name: str = table,
+            ) -> None:
+                if not _table_pending(conn, table_name):
                     return
-                needs_update = _pending(conn)
-        except sqlite3.OperationalError as exc:
-            logger.debug("FTS write-latency policy probe skipped: %s", exc)
-            return
-        if not needs_update:
-            return
-
-        def _apply(conn: sqlite3.Connection) -> None:
-            for table in tables:
-                if conn.execute(
-                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
-                    (table,),
-                ).fetchone() is None:
-                    continue
                 rows = conn.execute(
-                    f"SELECT k, v FROM {table}_config "
+                    f"SELECT k, v FROM {table_name}_config "
                     "WHERE k IN ('automerge', 'crisismerge')"
                 ).fetchall()
                 live = {str(row[0]): int(row[1]) for row in rows}
@@ -3133,16 +3136,21 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     if live.get(key) == value:
                         continue
                     conn.execute(
-                        f"INSERT INTO {table}({table}, rank) VALUES(?, ?)",
+                        f"INSERT INTO {table_name}({table_name}, rank) "
+                        "VALUES(?, ?)",
                         (key, value),
                     )
 
-        try:
-            self._execute_write(_apply)
-        except sqlite3.Error as exc:
-            # Opening a session must not fail because optional search-index
-            # tuning lost a race. A later SessionDB open retries the policy.
-            logger.warning("FTS write-latency policy update deferred: %s", exc)
+            try:
+                self._execute_write(_apply)
+            except sqlite3.Error as exc:
+                # Optional search-index tuning must not make session open fail.
+                # Per-index transactions preserve already-applied base policy.
+                logger.warning(
+                    "FTS write-latency policy update deferred for %s: %s",
+                    table,
+                    exc,
+                )
 
     def _execute_write(
         self,
@@ -3222,10 +3230,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                         committed - body_finished,
                     )
 
-                # Success — periodic best-effort bounded FTS merge + checkpoint.
+                # Success — periodic best-effort checkpoint. FTS5's persistent
+                # automerge policy performs bounded incremental maintenance on
+                # the database-global write stream; never run full optimize
+                # from this hot path.
                 self._write_count += 1
-                if self._write_count % self._FTS_MERGE_EVERY_N_WRITES == 0:
-                    self._try_incremental_merge_fts()
                 if self._write_count % self._CHECKPOINT_EVERY_N_WRITES == 0:
                     self._try_wal_checkpoint()
                 return result

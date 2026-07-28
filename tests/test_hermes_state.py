@@ -2393,38 +2393,55 @@ class TestOptimizeFts:
 
 
 
-    def test_write_path_merges_fts_only_at_cadence_boundary(self, db, monkeypatch):
-        """Routine writes use bounded merge and never full optimize."""
-        db._FTS_MERGE_EVERY_N_WRITES = 5
-        calls = []
+    def test_write_path_never_runs_explicit_fts_maintenance(self, db, monkeypatch):
+        """Routine writes rely on persistent automerge, not explicit merges."""
 
-        def _counting_merge(*, max_pages):
-            calls.append(max_pages)
-            return 0
+        def _forbidden(*args, **kwargs):
+            raise AssertionError("explicit FTS maintenance reached write hot path")
 
-        def _unexpected_optimize():
-            raise AssertionError("routine cadence must not call optimize")
-
-        monkeypatch.setattr(db, "_merge_fts_incrementally", _counting_merge)
-        monkeypatch.setattr(db, "optimize_fts", _unexpected_optimize)
-        # The one-time FTS policy repair is itself a write during DB open;
-        # reset here so this test controls the cadence boundary exactly.
-        db._write_count = 0
+        monkeypatch.setattr(db, "_merge_fts_incrementally", _forbidden)
+        monkeypatch.setattr(db, "optimize_fts", _forbidden)
         db.create_session(session_id="s1", source="cli")
-        for i in range(3):
-            db.append_message(session_id="s1", role="user", content=f"needle {i}")
-        assert calls == []  # Four successful writes are below the boundary.
-        db.append_message(session_id="s1", role="user", content="needle 3")
-        budget = db._FTS_MERGE_MAX_PAGES_PER_INDEX
-        assert calls == [budget]
-        for i in range(4, 8):
-            db.append_message(session_id="s1", role="user", content=f"needle {i}")
-        assert calls == [budget]
-        db.append_message(session_id="s1", role="user", content="needle 8")
-        assert calls == [budget, budget]
-        assert len(db.search_messages("needle")) == 9
+        for i in range(60):
+            db.append_message(
+                session_id="s1",
+                role="user",
+                content=f"needle {i}",
+            )
+        assert len(db.search_messages("needle", limit=100)) == 60
 
-    def test_write_latency_policy_disables_inline_fts_merges(self, db):
+    def test_automerge_progresses_across_short_lived_handles(self, db):
+        db_path = db.db_path
+        db.create_session(session_id="s1", source="cli")
+        tables = [
+            table
+            for table in ("messages_fts", "messages_fts_trigram")
+            if db._fts_table_exists(table)
+        ]
+        db.close()
+
+        for i in range(100):
+            handle = SessionDB(db_path=db_path)
+            try:
+                handle.append_message(
+                    session_id="s1",
+                    role="user",
+                    content=f"short-lived writer message {i}",
+                )
+            finally:
+                handle.close()
+
+        conn = sqlite3.connect(str(db_path))
+        try:
+            for table in tables:
+                segments = conn.execute(
+                    f"SELECT COUNT(DISTINCT segid) FROM {table}_idx"
+                ).fetchone()[0]
+                assert segments < 100
+        finally:
+            conn.close()
+
+    def test_write_latency_policy_keeps_global_automerge(self, db):
         for table in db._FTS_TABLES:
             if not db._fts_table_exists(table):
                 continue
