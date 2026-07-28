@@ -232,7 +232,12 @@ def _resolve_async_wake_sid(origin_wake_sid: str, origin_session_history_deliver
         if async_delivery_supported():
             return ""
     except Exception:
-        return ""
+        # Fail CLOSED: a probe that raised proves nothing about whether this
+        # session can receive a detached completion. "" means "async is fine,
+        # push the completion later"; None is the run-synchronously signal the
+        # caller already handles, so an unknown capability runs in-turn instead
+        # of handing out a handle with no durable consumer.
+        return None
     if origin_wake_sid and origin_session_history_delivery:
         logger.info(
             "delegate_task: session %s resumes server history — detached result will be persisted "
