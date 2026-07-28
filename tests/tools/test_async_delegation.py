@@ -716,6 +716,76 @@ def test_concurrent_dispatch_respects_capacity():
     gate.set()
 
 
+@pytest.mark.parametrize("probe_failure", [False, True])
+def test_unsupported_or_failed_async_delivery_runs_synchronously(
+    monkeypatch, probe_failure
+):
+    import json
+    from unittest.mock import MagicMock
+
+    import gateway.session_context as session_context
+    import tools.delegate_tool as dt
+
+    parent = MagicMock()
+    parent._delegate_depth = 0
+    parent._interrupt_requested = False
+    parent._active_children = []
+    parent._active_children_lock = None
+    built = []
+    fake_child = MagicMock()
+    fake_child._delegate_role = "leaf"
+    fake_child._subagent_id = "sync-child"
+    monkeypatch.setattr(
+        dt,
+        "_build_child_agent",
+        lambda **kwargs: (built.append(kwargs), fake_child)[1],
+    )
+    monkeypatch.setattr(
+        dt,
+        "_resolve_delegation_credentials",
+        lambda *args, **kwargs: {
+            "model": "m",
+            "provider": None,
+            "base_url": None,
+            "api_key": None,
+            "api_mode": None,
+            "command": None,
+            "args": None,
+        },
+    )
+    monkeypatch.setattr(
+        dt,
+        "_run_single_child",
+        lambda *args, **kwargs: {
+            "task_index": args[0],
+            "status": "completed",
+            "summary": "sync fallback completed",
+            "api_calls": 1,
+            "duration_seconds": 0.1,
+            "model": "m",
+            "exit_reason": "completed",
+        },
+    )
+    if probe_failure:
+        monkeypatch.setattr(
+            session_context,
+            "async_delivery_supported",
+            lambda: (_ for _ in ()).throw(RuntimeError("probe failed")),
+        )
+    else:
+        monkeypatch.setattr(
+            session_context, "async_delivery_supported", lambda: False
+        )
+
+    result = json.loads(
+        dt.delegate_task(goal="run-safely", background=True, parent_agent=parent)
+    )
+    assert len(built) == 1
+    assert result["results"][0]["status"] == "completed"
+    assert result["results"][0]["summary"] == "sync fallback completed"
+    assert dt.active_descendant_count() == 0
+
+
 # ---------------------------------------------------------------------------
 # Gateway routing: session_key -> platform/chat_id, rich formatting, injection
 # ---------------------------------------------------------------------------

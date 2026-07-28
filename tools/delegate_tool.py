@@ -3771,7 +3771,7 @@ def delegate_task(
             from gateway.session_context import async_delivery_supported
             _async_ok = async_delivery_supported()
         except Exception:
-            _async_ok = True
+            _async_ok = False
 
         _wake_sid = ""
         if not _async_ok:

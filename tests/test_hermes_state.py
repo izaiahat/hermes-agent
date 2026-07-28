@@ -1572,10 +1572,26 @@ class TestSchemaInit:
         else:
             assert mode == "wal"
 
-
-
-
-
+    def test_fts_tables_use_external_content_sources(self, db):
+        definitions = dict(
+            db._conn.execute(
+                "SELECT name, sql FROM sqlite_master "
+                "WHERE name IN ('messages_fts', 'messages_fts_trigram')"
+            ).fetchall()
+        )
+        assert "content='messages'" in definitions["messages_fts"]
+        assert (
+            "content='messages_fts_trigram_src'"
+            in definitions["messages_fts_trigram"]
+        )
+        shadow_tables = {
+            row[0]
+            for row in db._conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+        }
+        assert "messages_fts_content" not in shadow_tables
+        assert "messages_fts_trigram_content" not in shadow_tables
 
 
     def test_telegram_topic_binding_roundtrip_requires_explicit_schema(self, tmp_path):
