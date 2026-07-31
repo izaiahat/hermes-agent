@@ -2862,29 +2862,42 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
     @staticmethod
     def _db_has_legacy_inline_fts(cursor: sqlite3.Cursor) -> bool:
-        """True when messages_fts exists in ANY pre-v23 shape.
+        """True when the stored FTS layout still needs the v23 optimization.
 
-        v23's messages_fts is external-content over THREE real columns
-        (content, tool_name, tool_calls). Every pre-v23 shape lacks the
-        tool_name/tool_calls columns — whether the old inline single-column
-        form (v11..v22) or the even older external-content single-column form
-        (v10-era, pre-#16751). We therefore detect "needs optimize" as "the
-        stored CREATE lacks the tool_name column", which is the precise v23
-        marker and correctly catches BOTH legacy variants.
+        The base table in v23 is external-content over three real columns
+        (content, tool_name, tool_calls). Every pre-v23 base shape lacks the
+        tool metadata columns. A short-lived migration path also produced a
+        *hybrid* layout: the base table had the three v23 columns, but the
+        trigram table still used ``content='messages'`` and indexed tool rows
+        instead of reading through ``messages_fts_trigram_src``. Some of those
+        databases were incorrectly stamped ``fts_storage_version=1``. Detect
+        the physical definitions, not that advisory marker, so the resumable
+        optimizer can repair both legacy and hybrid layouts.
 
-        Returns False when messages_fts doesn't exist yet (fresh DB mid-init):
-        the post-migration FTS setup block will create it in the v23 shape.
+        Returns False when the base table does not exist yet (fresh DB
+        mid-init), or when the optional trigram table is absent because that
+        tokenizer is unavailable.
         """
-        row = cursor.execute(
-            "SELECT sql FROM sqlite_master "
-            "WHERE type = 'table' AND name = 'messages_fts'"
-        ).fetchone()
-        if row is None:
+        definitions: dict[str, str] = {}
+        for row in cursor.execute(
+            "SELECT name, sql FROM sqlite_master WHERE type = 'table' "
+            "AND name IN ('messages_fts', 'messages_fts_trigram')"
+        ).fetchall():
+            name = row[0] if not isinstance(row, sqlite3.Row) else row["name"]
+            sql = row[1] if not isinstance(row, sqlite3.Row) else row["sql"]
+            definitions[str(name)] = str(sql or "")
+
+        base_sql = definitions.get("messages_fts")
+        if base_sql is None:
             return False
-        sql = (row[0] if not isinstance(row, sqlite3.Row) else row["sql"]) or ""
-        # The v23 table declares tool_name/tool_calls columns. Their absence
-        # means a legacy shape that doesn't index tool metadata → optimize.
-        return "tool_name" not in sql
+        if "tool_name" not in base_sql or "tool_calls" not in base_sql:
+            return True
+
+        trigram_sql = definitions.get("messages_fts_trigram")
+        if trigram_sql is None:
+            return False
+        normalized = "".join(trigram_sql.lower().split()).replace('"', "'")
+        return "content='messages_fts_trigram_src'" not in normalized
 
     def _warn_trigram_unavailable(self, exc: sqlite3.OperationalError) -> None:
         """Log once that the trigram tokenizer is missing; base FTS5 stays enabled."""
