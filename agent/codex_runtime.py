@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import logging
+import sys
 import time
 from types import SimpleNamespace
 from typing import Any, Callable, Dict, List
@@ -951,6 +952,18 @@ _TERMINAL_EVENT_TYPES = frozenset({
     "response.failed",
 })
 
+# A malformed or replaying SSE producer must never be able to grow the
+# consumer process without bound.  The auxiliary compression path uses this
+# same consumer and can otherwise retain every output-text delta until a
+# terminal frame arrives.  A wall-clock timeout is not sufficient protection:
+# under swap thrash its timer thread may not run promptly.  These ceilings are
+# deliberately far above any legitimate Hermes response while still failing
+# closed before a bad stream can threaten the host.
+_CODEX_STREAM_MAX_EVENTS = 250_000
+_CODEX_STREAM_MAX_RETAINED_CHARS = 16 * 1024 * 1024
+_CODEX_STREAM_MAX_OUTPUT_ITEMS = 4_096
+_CODEX_STREAM_MAX_OUTPUT_ITEM_BYTES = 64 * 1024 * 1024
+
 
 def _event_field(event: Any, name: str, default: Any = None) -> Any:
     """Field access that handles both attr-style (SDK objects) and dict (raw JSON) events."""
@@ -1015,6 +1028,10 @@ def _consume_codex_event_stream(
     on_first_delta=None,
     on_event=None,
     interrupt_check=None,
+    max_events: int = _CODEX_STREAM_MAX_EVENTS,
+    max_retained_chars: int = _CODEX_STREAM_MAX_RETAINED_CHARS,
+    max_output_items: int = _CODEX_STREAM_MAX_OUTPUT_ITEMS,
+    max_output_item_bytes: int = _CODEX_STREAM_MAX_OUTPUT_ITEM_BYTES,
 ) -> SimpleNamespace:
     """Consume a Codex Responses SSE event stream and return a final response.
 
@@ -1069,8 +1086,66 @@ def _consume_codex_event_stream(
     terminal_incomplete_details: Any = None
     terminal_error: Any = None
     saw_terminal = False
+    event_count = 0
+    retained_chars = 0
+    retained_output_item_bytes = 0
+    retained_output_object_ids: set[int] = set()
+
+    def _retain_text(value: Any, *, field: str) -> str:
+        """Charge retained stream text to a hard per-response budget."""
+        nonlocal retained_chars
+        if not isinstance(value, str):
+            value = str(value)
+        retained_chars += len(value)
+        if max_retained_chars > 0 and retained_chars > max_retained_chars:
+            raise RuntimeError(
+                "Codex Responses stream retained-text limit exceeded "
+                f"while collecting {field}: {retained_chars} > "
+                f"{max_retained_chars} characters"
+            )
+        return value
+
+    def _charge_output_item(value: Any) -> None:
+        """Bound the approximate Python heap retained by completed items.
+
+        SDK models are ordinary Python object graphs. Walking their containers
+        and ``__dict__`` fields avoids serialising (and copying) a malformed
+        giant item merely to measure it.
+        """
+        nonlocal retained_output_item_bytes
+        stack = [value]
+        while stack:
+            current = stack.pop()
+            object_id = id(current)
+            if object_id in retained_output_object_ids:
+                continue
+            retained_output_object_ids.add(object_id)
+            retained_output_item_bytes += sys.getsizeof(current)
+            if (
+                max_output_item_bytes > 0
+                and retained_output_item_bytes > max_output_item_bytes
+            ):
+                raise RuntimeError(
+                    "Codex Responses stream output-item byte limit exceeded: "
+                    f"{retained_output_item_bytes} > {max_output_item_bytes} bytes"
+                )
+            if isinstance(current, dict):
+                stack.extend(current.keys())
+                stack.extend(current.values())
+            elif isinstance(current, (list, tuple, set, frozenset)):
+                stack.extend(current)
+            else:
+                attributes = getattr(current, "__dict__", None)
+                if isinstance(attributes, dict):
+                    stack.extend(attributes.values())
 
     for event in event_iter:
+        event_count += 1
+        if max_events > 0 and event_count > max_events:
+            raise RuntimeError(
+                "Codex Responses stream event limit exceeded: "
+                f"{event_count} > {max_events} events"
+            )
         if on_event is not None:
             try:
                 on_event(event)
@@ -1118,6 +1193,7 @@ def _consume_codex_event_stream(
         if "output_text.delta" in event_type or event_type == "response.output_text.delta":
             delta_text = _event_field(event, "delta", "")
             if delta_text and active_message_phase == "commentary":
+                delta_text = _retain_text(delta_text, field="commentary")
                 commentary_text_deltas.append(delta_text)
                 # Preserve CLI/backward compatibility when no first-class
                 # commentary consumer is installed.
@@ -1133,6 +1209,7 @@ def _consume_codex_event_stream(
                     except Exception:
                         logger.debug("Codex stream on_reasoning_delta raised", exc_info=True)
             elif delta_text:
+                delta_text = _retain_text(delta_text, field="output text")
                 collected_text_deltas.append(delta_text)
                 if not has_tool_calls:
                     if not first_delta_fired:
@@ -1176,6 +1253,12 @@ def _consume_codex_event_stream(
         if event_type == "response.output_item.done":
             done_item = _event_field(event, "item")
             if done_item is not None:
+                if max_output_items > 0 and len(collected_output_items) >= max_output_items:
+                    raise RuntimeError(
+                        "Codex Responses stream output-item limit exceeded: "
+                        f"more than {max_output_items} items"
+                    )
+                _charge_output_item(done_item)
                 collected_output_items.append(done_item)
                 done_phase = _item_field(done_item, "phase", None)
                 done_phase = done_phase.strip().lower() if isinstance(done_phase, str) else None

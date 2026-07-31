@@ -535,6 +535,82 @@ def test_consume_codex_stream_separates_commentary_from_analysis(monkeypatch):
 
 
 
+def test_consume_codex_stream_bounds_retained_output_text():
+    from agent.codex_runtime import _consume_codex_event_stream
+
+    events = _FakeCreateStream([
+        SimpleNamespace(type="response.output_text.delta", delta="1234"),
+        SimpleNamespace(type="response.output_text.delta", delta="5678"),
+    ])
+
+    with pytest.raises(RuntimeError, match="retained-text limit exceeded"):
+        _consume_codex_event_stream(
+            events,
+            model="gpt-5-codex",
+            max_retained_chars=7,
+        )
+
+
+def test_consume_codex_stream_bounds_event_count_before_callback():
+    from agent.codex_runtime import _consume_codex_event_stream
+
+    callbacks = []
+    events = _FakeCreateStream([
+        SimpleNamespace(type="response.created"),
+        SimpleNamespace(type="response.created"),
+        SimpleNamespace(type="response.created"),
+    ])
+
+    with pytest.raises(RuntimeError, match="event limit exceeded"):
+        _consume_codex_event_stream(
+            events,
+            model="gpt-5-codex",
+            on_event=callbacks.append,
+            max_events=2,
+        )
+    assert len(callbacks) == 2
+
+
+def test_consume_codex_stream_bounds_completed_output_items():
+    from agent.codex_runtime import _consume_codex_event_stream
+
+    events = _FakeCreateStream([
+        SimpleNamespace(
+            type="response.output_item.done",
+            item=SimpleNamespace(type="function_call", name="one"),
+        ),
+        SimpleNamespace(
+            type="response.output_item.done",
+            item=SimpleNamespace(type="function_call", name="two"),
+        ),
+    ])
+
+    with pytest.raises(RuntimeError, match="output-item limit exceeded"):
+        _consume_codex_event_stream(
+            events,
+            model="gpt-5-codex",
+            max_output_items=1,
+        )
+
+
+def test_consume_codex_stream_bounds_completed_output_item_bytes():
+    from agent.codex_runtime import _consume_codex_event_stream
+
+    events = _FakeCreateStream([
+        SimpleNamespace(
+            type="response.output_item.done",
+            item=SimpleNamespace(type="message", content="x" * 512),
+        ),
+    ])
+
+    with pytest.raises(RuntimeError, match="output-item byte limit exceeded"):
+        _consume_codex_event_stream(
+            events,
+            model="gpt-5-codex",
+            max_output_item_bytes=128,
+        )
+
+
 def test_run_codex_stream_delivers_redacted_commentary_once(monkeypatch):
     from agent.codex_responses_adapter import _normalize_codex_response
 
