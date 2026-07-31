@@ -585,6 +585,27 @@ def _output_text_of(item: Any) -> str:
     ).strip()
 
 
+# A malformed or replaying SSE producer must never be able to grow the consumer
+# process without bound. The auxiliary compression path uses this same consumer
+# and can otherwise retain every output-text delta until a terminal frame
+# arrives. A wall-clock timeout is not sufficient protection: under swap thrash
+# its timer thread may not run promptly. These ceilings sit far above any
+# legitimate Hermes response while still failing closed before a bad stream can
+# threaten the host.
+_CODEX_STREAM_MAX_EVENTS = 250_000
+_CODEX_STREAM_MAX_RETAINED_CHARS = 16 * 1024 * 1024
+
+
+def _codex_stream_event_text_size(event: Any) -> int:
+    """Characters this event contributes to retained stream text (0 when none)."""
+    total = 0
+    for field in ("delta", "text", "arguments"):
+        value = getattr(event, field, None)
+        if isinstance(value, str):
+            total += len(value)
+    return total
+
+
 class _CodexResponseAssembler:
     """Assemble a Response-shaped ``SimpleNamespace`` from raw Responses SSE events.
 
@@ -783,6 +804,8 @@ class _CodexResponseAssembler:
 def _consume_codex_event_stream(
     event_iter: Any, *, model: str, on_text_delta=None, on_reasoning_delta=None, on_commentary_message=None,
     on_first_delta=None, on_event=None, interrupt_check=None,
+    max_events: int = _CODEX_STREAM_MAX_EVENTS,
+    max_retained_chars: int = _CODEX_STREAM_MAX_RETAINED_CHARS,
 ) -> SimpleNamespace:
     """Consume a Codex Responses SSE stream into a Response-shaped ``SimpleNamespace`` (see
     :class:`_CodexResponseAssembler`; ``status`` is ``completed`` when the stream ended with content but no
@@ -796,7 +819,18 @@ def _consume_codex_event_stream(
     must not become a partial final response."""
     assembler = _CodexResponseAssembler(model=model, on_text_delta=on_text_delta, on_reasoning_delta=on_reasoning_delta,
                                         on_commentary_message=on_commentary_message, on_first_delta=on_first_delta)
+    event_count = 0
+    retained_chars = 0
     for event in event_iter:
+        event_count += 1
+        retained_chars += _codex_stream_event_text_size(event)
+        if event_count > max_events or retained_chars > max_retained_chars:
+            # Fail CLOSED rather than return a silently truncated response: a
+            # partial body presented as complete is worse than a hard error.
+            raise RuntimeError(
+                "Codex stream exceeded its retention budget "
+                f"(events={event_count}/{max_events}, chars={retained_chars}/{max_retained_chars})"
+            )
         if on_event is not None:
             try:
                 on_event(event)
