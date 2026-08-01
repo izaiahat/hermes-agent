@@ -109,8 +109,33 @@ def _summarize_cron_failure_for_delivery(job: dict, error: str | None) -> str:
     text = (error or "unknown error").strip()
     lower = text.lower()
 
-    # Provider/API failures are the common noisy path. Keep these short.
-    if "429" in text or "rate limit" in lower or "usage limit" in lower:
+    def _http_status_has_failure_context(code: int, labels: tuple[str, ...]) -> bool:
+        """Reject bare business numbers such as sheet row 403 or record 429."""
+        token = str(code)
+        prefix = (
+            rf"(?:http(?:/\d(?:\.\d)?)?|status(?:[_\s-]*code)?|"
+            rf"response(?:[._\s-]*status)?|error[_\s-]*code)"
+            rf"\s*[:=]?\s*['\"]?{token}\b"
+        )
+        if re.search(prefix, lower):
+            return True
+        if not labels:
+            return False
+        label_pattern = "|".join(re.escape(label) for label in labels)
+        return bool(
+            re.search(rf"\b{token}\b[^\n]{{0,40}}\b(?:{label_pattern})\b", lower)
+            or re.search(rf"\b(?:{label_pattern})\b[^\n]{{0,40}}\b{token}\b", lower)
+        )
+
+    # Provider/API failures are the common noisy path. Keep these short, but
+    # require semantic context before treating a bare number as an HTTP code.
+    rate_limit_text = re.search(
+        r"\b(?:rate[- ]?limit(?:ed|ing)?|usage limit|quota (?:limit|exceeded)|too many requests)\b",
+        lower,
+    )
+    if rate_limit_text or _http_status_has_failure_context(
+        429, ("rate limit", "rate limited", "too many requests"),
+    ):
         reason = "rate limit"
         if "weekly usage limit" in lower:
             reason = "weekly usage limit"
@@ -129,21 +154,42 @@ def _summarize_cron_failure_for_delivery(job: dict, error: str | None) -> str:
             "Full details saved in cron output."
         )
 
-    # Match authentication/authorization wording at a word boundary and the
-    # 401/403 status codes as whole tokens, so "oauth", "4015" and similar do
-    # not trip a misleading auth message.
-    if re.search(r"authenticat|authoriz", lower) or re.search(r"\b(401|403)\b", text):
+    auth_failure_text = re.search(
+        r"\b(?:authentication|authorization)\s+"
+        r"(?:error|failed|failure|required|denied|rejected|invalid|missing|expired)\b"
+        r"|\b(?:authentication|authorization)(?:error|failure)\b"
+        r"|\b(?:unauthorized|unauthenticated|forbidden|not authorized)\b"
+        r"|\b(?:invalid|expired|revoked|missing)\s+"
+        r"(?:api[- ]?key|access[- ]?token|refresh[- ]?token|credentials?)\b"
+        r"|\b(?:api[- ]?key|access[- ]?token|refresh[- ]?token|credentials?)\s+"
+        r"(?:invalid|expired|revoked|missing)\b",
+        lower,
+    )
+    auth_status = any(
+        _http_status_has_failure_context(code, ("unauthorized", "forbidden"))
+        for code in (401, 403)
+    )
+    if auth_failure_text or auth_status:
         return (
             f"⚠️ Cron '{job_name}' failed: provider authentication error. "
             "Full details saved in cron output."
         )
 
-    # Strip common exception wrappers and collapse provider payloads. Bound
-    # the input first so a multi-KB provider blob cannot slow the
-    # substitutions.
+    # For a traceback, the final exception line carries the actual cause. Use
+    # it instead of truncating the traceback header and hiding the useful tail.
+    candidate = text
+    if "Traceback (most recent call last)" in text:
+        for line in reversed(text.splitlines()):
+            stripped = line.strip()
+            if re.match(r"^[\w.]+(?:Error|Exception):\s*", stripped):
+                candidate = stripped
+                break
+
+    # Strip common exception wrappers and collapse payloads. Bound the input
+    # first so a multi-KB blob cannot slow the substitutions.
     cleaned = re.sub(
         r"^(RuntimeError|Exception|ValueError|HTTPStatusError):\s*",
-        "", text[:2000],
+        "", candidate[:2000],
     )
     cleaned = re.sub(r"\s+", " ", cleaned).strip()
     if len(cleaned) > 180:
