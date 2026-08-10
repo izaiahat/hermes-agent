@@ -2,7 +2,7 @@
 
 import os
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 import yaml
@@ -1301,37 +1301,57 @@ class TestDelegationCapUnificationMigration:
 
 
 class TestDelegationAdmissionSplitMigration:
-    """v33 → v34: separate batch, background-batch, and tree budgets."""
+    """v34 → v35: separate batch, background-batch, and tree budgets."""
 
     @staticmethod
     def _write(tmp_path, content):
         (tmp_path / "config.yaml").write_text(content, encoding="utf-8")
 
-    def test_v33_adds_safe_background_and_tree_defaults(self, tmp_path):
-        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
-            self._write(
-                tmp_path,
-                "_config_version: 33\ndelegation:\n  max_concurrent_children: 5\n",
-            )
-            migrate_config(interactive=False, quiet=True)
-            effective = load_config()
-        assert effective["delegation"]["max_concurrent_children"] == 5
-        assert effective["delegation"]["max_background_batches"] == 1
-        assert effective["delegation"]["max_total_descendants"] == 5
+    def test_v34_adds_safe_background_and_tree_defaults(self):
+        from hermes_cli.config_migrations import _migrate_to_35
 
-    def test_v33_preserves_explicit_new_caps(self, tmp_path):
-        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
-            self._write(
-                tmp_path,
-                "_config_version: 33\ndelegation:\n"
-                "  max_concurrent_children: 5\n"
-                "  max_background_batches: 2\n"
-                "  max_total_descendants: 7\n",
-            )
-            migrate_config(interactive=False, quiet=True)
-            raw = yaml.safe_load((tmp_path / "config.yaml").read_text())
-        assert raw["delegation"]["max_background_batches"] == 2
-        assert raw["delegation"]["max_total_descendants"] == 7
+        config = {"delegation": {"max_concurrent_children": 5}}
+        cfg = MagicMock()
+        cfg.read_raw_config.return_value = config
+        with patch("hermes_cli.config_migrations._cfg", return_value=cfg):
+            _migrate_to_35({"config_added": []}, quiet=True)
+
+        assert config["delegation"]["max_concurrent_children"] == 5
+        assert config["delegation"]["max_background_batches"] == 1
+        assert config["delegation"]["max_total_descendants"] == 5
+        cfg._persist_migration.assert_called_once_with(config)
+
+    def test_v34_preserves_explicit_new_caps(self):
+        from hermes_cli.config_migrations import _migrate_to_35
+
+        config = {
+            "delegation": {
+                "max_concurrent_children": 5,
+                "max_background_batches": 2,
+                "max_total_descendants": 7,
+            }
+        }
+        cfg = MagicMock()
+        cfg.read_raw_config.return_value = config
+        with patch("hermes_cli.config_migrations._cfg", return_value=cfg):
+            _migrate_to_35({"config_added": []}, quiet=True)
+
+        assert config["delegation"]["max_background_batches"] == 2
+        assert config["delegation"]["max_total_descendants"] == 7
+        cfg._persist_migration.assert_not_called()
+
+    def test_v34_invalid_width_falls_back_to_five(self):
+        from hermes_cli.config_migrations import _migrate_to_35
+
+        config = {"delegation": {"max_concurrent_children": "invalid"}}
+        cfg = MagicMock()
+        cfg.read_raw_config.return_value = config
+        with patch("hermes_cli.config_migrations._cfg", return_value=cfg):
+            _migrate_to_35({"config_added": []}, quiet=True)
+
+        assert config["delegation"]["max_background_batches"] == 1
+        assert config["delegation"]["max_total_descendants"] == 5
+        cfg._persist_migration.assert_called_once_with(config)
 
 
 class TestConfigNormalizationDoesNotOverwriteUserValues:

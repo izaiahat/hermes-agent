@@ -1050,11 +1050,10 @@ Two shapes:
 Roles:
 
 - `role="leaf"` (default) — focused worker. Cannot call `delegate_task`,
-  `clarify`, `memory`, `send_message`, `cronjob`. Retains `execute_code`
-  (programmatic tool calling).
+  `clarify`, `memory`, `send_message`, `cronjob`, or `execute_code`.
 - `role="orchestrator"` — retains `delegate_task` so it can spawn its
   own workers. Gated by `delegation.orchestrator_enabled` (default true)
-  and bounded by `delegation.max_spawn_depth` (default 2).
+  and bounded by `delegation.max_spawn_depth` (default 1, maximum 4).
 
 Key config knobs (under `delegation:` in `config.yaml`):
 `max_concurrent_children` (per-batch width, hard cap 5),

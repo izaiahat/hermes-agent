@@ -184,6 +184,7 @@ def test_compaction_admission_rejection_preserves_session_and_bookkeeping():
     assert agent._codex_session.closed is False
     assert agent.context_compressor.compression_count == 0
     assert any("admission rejected" in warning for warning in agent.warnings)
+    assert not any(kind == "compacted" for kind, _text in agent.status_events)
 
 
 

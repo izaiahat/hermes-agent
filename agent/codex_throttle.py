@@ -49,8 +49,8 @@ TUI, slash-worker, auxiliary, app-server, compaction, and delegated launch paths
 on one policy even when a shell wrapper did not source the file:
 
   HERMES_CODEX_GATE_DISABLED                   set truthy to disable the gate entirely
-  HERMES_CODEX_MAX_CONCURRENCY                 box-wide request ceiling (default and hard cap 7)
-  HERMES_CODEX_MAX_DELEGATES                   box-wide live Codex delegate ceiling (default and hard cap 7)
+  HERMES_CODEX_MAX_CONCURRENCY                 box-wide request ceiling (default and hard cap 5)
+  HERMES_CODEX_MAX_DELEGATES                   box-wide live Codex delegate ceiling (default and hard cap 5)
   HERMES_CODEX_MIN_CONCURRENCY                 floor the adaptive permit never drops below (default 1)
   HERMES_CODEX_CONCURRENCY_START               permit value on fresh state (default = MAX)
   HERMES_CODEX_ADAPTIVE_CONCURRENCY            enable the AIMD permit (default on; moot when MAX==MIN)
@@ -174,8 +174,8 @@ _LOADED_THROTTLE_ENV_FILE = _load_throttle_env()
 # Only the explicit operator switch disables admission. Missing POSIX locking is
 # an unavailable-gate error, never an implicit bypass.
 _DISABLED = _env_bool("HERMES_CODEX_GATE_DISABLED", False)
-_MAX_CONCURRENCY = min(7, max(1, _env_int("HERMES_CODEX_MAX_CONCURRENCY", 7)))
-_MAX_DELEGATES = min(7, max(1, _env_int("HERMES_CODEX_MAX_DELEGATES", 7)))
+_MAX_CONCURRENCY = min(5, max(1, _env_int("HERMES_CODEX_MAX_CONCURRENCY", 5)))
+_MAX_DELEGATES = min(5, max(1, _env_int("HERMES_CODEX_MAX_DELEGATES", 5)))
 # AIMD adaptive concurrency: the gate keeps a shared "permit" in [MIN, MAX] that grows
 # additively while healthy and shrinks multiplicatively on a 429/503.  When MAX == MIN
 # (e.g. both 1) the permit is fixed and the gate behaves like the old static semaphore.

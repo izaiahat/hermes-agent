@@ -1678,7 +1678,11 @@ def _build_child_agent(
         if delegation_effort or delegation_effort is False:
             from hermes_constants import parse_reasoning_effort
 
-            parsed = parse_reasoning_effort(delegation_effort)
+            parsed = parse_reasoning_effort(
+                delegation_effort,
+                provider=effective_provider,
+                model=effective_model,
+            )
             if parsed is not None:
                 child_reasoning = parsed
             else:
@@ -1686,6 +1690,32 @@ def _build_child_agent(
                     "Unknown delegation.reasoning_effort '%s', inheriting parent level",
                     delegation_effort,
                 )
+        elif parent_reasoning is not None:
+            # Parent reasoning is valid for the parent's route, not necessarily
+            # for an overridden child provider/model. Re-clamp only the effort
+            # while preserving any additional reasoning options.
+            from hermes_constants import parse_reasoning_effort
+
+            if isinstance(parent_reasoning, dict):
+                if parent_reasoning.get("enabled") is False:
+                    child_reasoning = dict(parent_reasoning)
+                else:
+                    inherited_effort = parent_reasoning.get("effort")
+                    parsed = parse_reasoning_effort(
+                        inherited_effort,
+                        provider=effective_provider,
+                        model=effective_model,
+                    )
+                    if parsed is not None:
+                        child_reasoning = {**parent_reasoning, **parsed}
+            else:
+                parsed = parse_reasoning_effort(
+                    parent_reasoning,
+                    provider=effective_provider,
+                    model=effective_model,
+                )
+                if parsed is not None:
+                    child_reasoning = parsed
     except Exception as exc:
         logger.debug("Could not load delegation reasoning_effort: %s", exc)
 
@@ -1734,6 +1764,16 @@ def _build_child_agent(
     if isinstance(child_max_tokens, int):
         child_optional_kwargs["max_tokens"] = child_max_tokens
 
+    child_request_overrides = (
+        dict(override_request_overrides or {})
+        if override_provider
+        else dict(getattr(parent_agent, "request_overrides", {}) or {})
+    )
+    # Delegated/background Sol lanes are always standard/non-fast. Do not let a
+    # parent's priority body override leak into an otherwise standard child.
+    child_request_overrides.pop("service_tier", None)
+    child_request_overrides.pop("speed", None)
+
     from agent.delegation_context import delegated_child_context
 
     with delegated_child_context():
@@ -1743,6 +1783,7 @@ def _build_child_agent(
             model=effective_model,
             provider=effective_provider,
             api_mode=effective_api_mode,
+            service_tier="standard",
             acp_command=effective_acp_command,
             acp_args=effective_acp_args,
             max_iterations=max_iterations,
@@ -1769,11 +1810,7 @@ def _build_child_agent(
             provider_sort=child_provider_sort,
             provider_require_parameters=child_provider_require_parameters,
             provider_data_collection=child_provider_data_collection,
-            request_overrides=(
-                dict(override_request_overrides or {})
-                if override_provider
-                else dict(getattr(parent_agent, "request_overrides", {}) or {})
-            ),
+            request_overrides=child_request_overrides,
             openrouter_min_coding_score=child_openrouter_min_coding_score,
             tool_progress_callback=child_progress_cb,
             iteration_budget=None,  # fresh budget per subagent
@@ -3458,13 +3495,48 @@ def delegate_task(
         _capture_gateway_steer_authority(_origin_ui_session_id)
     )
 
+    def _detach_and_close(entries) -> None:
+        """Remove and close child agents that never completed a run."""
+        active_list = getattr(parent_agent, "_active_children", None)
+        active_lock = getattr(parent_agent, "_active_children_lock", None)
+        for _, _, child in entries:
+            if active_list is not None:
+                try:
+                    if active_lock:
+                        with active_lock:
+                            active_list.remove(child)
+                    else:
+                        active_list.remove(child)
+                except (ValueError, AttributeError):
+                    pass
+            try:
+                if hasattr(child, "close"):
+                    child.close()
+            except Exception:
+                logger.debug("Failed to close unstarted delegated child", exc_info=True)
+
+    # Reserve the complete batch atomically before constructing or running any
+    # child. A capacity rejection therefore has no child side effects.
+    use_global_codex_gate = _delegation_uses_codex(parent_agent)
+    descendant_leases, active_before, descendant_limit = _try_reserve_descendants(
+        n_tasks,
+        use_global_codex_gate=use_global_codex_gate,
+    )
+    if descendant_leases is None:
+        scope = "host-wide Codex" if use_global_codex_gate else "process-local"
+        return tool_error(
+            f"Delegation descendant capacity reached ({scope} gate): "
+            f"{active_before} active + {n_tasks} requested exceeds "
+            f"the enforced limit={descendant_limit}. Wait for active children "
+            "to finish; no child ran."
+        )
+
     # Build all child agents on the main thread (thread-safe construction).
     # _build_child_preserving_parent_tools saves/restores the parent's
     # resolved tool names around each construction under a lock, so child
     # toolset resolution never leaks into the parent (shared with the plugin
     # subagent-lifecycle API).
-    children = []
-    for i, t in enumerate(task_list):
+    def _build_child_entry(i, t):
         # Per-task role beats top-level; normalise again so unknown
         # per-task values warn and degrade to leaf uniformly.
         effective_role = _normalize_role(t.get("role") or top_role)
@@ -3515,42 +3587,18 @@ def delegate_task(
                 getattr(child, "tool_progress_callback", None), _writer
             )
             child._live_transcript_path = str(_writer.path)
-        children.append((i, t, child))
+        return (i, t, child)
 
-    def _detach_and_close(entries) -> None:
-        """Remove and close child agents that never completed a run."""
-        active_list = getattr(parent_agent, "_active_children", None)
-        active_lock = getattr(parent_agent, "_active_children_lock", None)
-        for _, _, child in entries:
-            if active_list is not None:
-                try:
-                    if active_lock:
-                        with active_lock:
-                            active_list.remove(child)
-                    else:
-                        active_list.remove(child)
-                except (ValueError, AttributeError):
-                    pass
-            try:
-                if hasattr(child, "close"):
-                    child.close()
-            except Exception:
-                logger.debug("Failed to close unstarted delegated child", exc_info=True)
-
-    use_global_codex_gate = _delegation_uses_codex(parent_agent)
-    descendant_leases, active_before, descendant_limit = _try_reserve_descendants(
-        n_tasks,
-        use_global_codex_gate=use_global_codex_gate,
-    )
-    if descendant_leases is None:
+    children = []
+    try:
+        for i, t in enumerate(task_list):
+            children.append(_build_child_entry(i, t))
+    except Exception:
         _detach_and_close(children)
-        scope = "host-wide Codex" if use_global_codex_gate else "process-local"
-        return tool_error(
-            f"Delegation descendant capacity reached ({scope} gate): "
-            f"{active_before} active + {n_tasks} requested exceeds "
-            f"the enforced limit={descendant_limit}. Wait for active children "
-            "to finish; no child ran."
-        )
+        for lease in descendant_leases:
+            lease.release()
+        raise
+
     leases_by_index = {i: lease for i, lease in enumerate(descendant_leases)}
 
     def _release_leases() -> None:

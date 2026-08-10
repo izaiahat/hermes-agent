@@ -3807,7 +3807,6 @@ def _compress_context_via_codex_app_server(
     except CodexGateAdmissionError as exc:
         if _activity_heartbeat is not None:
             _activity_heartbeat.stop("context compression admission rejected")
-        _complete_compaction_lifecycle()
         try:
             agent._emit_warning(f"⚠ Codex compaction admission rejected: {exc}")
         except Exception:

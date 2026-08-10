@@ -1771,8 +1771,8 @@ DEFAULT_CONFIG = {
         "max_background_batches": 1,   # hard-capped detached batch units per process
         "max_total_descendants": 5,    # hard-capped direct+nested active children
         # Orchestrator role controls (see tools/delegate_tool.py:_get_max_spawn_depth
-        # and _get_orchestrator_enabled).  Floored at 1, no upper ceiling —
-        # raise deliberately, each level multiplies API cost.
+        # and _get_orchestrator_enabled). Clamped to 1..4; raise deliberately,
+        # because each level multiplies API cost.
         "max_spawn_depth": 1,        # depth (1 = flat [default], 2 = orchestrator→leaf, 3+ = deeper)
         "orchestrator_enabled": True,  # kill switch for role="orchestrator"
         # When a subagent hits a dangerous-command approval prompt, the parent's
@@ -3230,7 +3230,7 @@ DEFAULT_CONFIG = {
     },
 
     # Config schema version - bump this when adding new required fields
-    "_config_version": 34,
+    "_config_version": 35,
 }
 
 # Optional environment variables that enhance functionality

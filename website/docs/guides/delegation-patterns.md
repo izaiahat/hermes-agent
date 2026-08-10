@@ -194,7 +194,7 @@ This is often the most efficient pattern: `execute_code` handles the 10+ sequent
 
 ## Inherited Tool Access
 
-Subagents inherit the parent's enabled toolsets. `delegate_task` does not accept a model-facing `toolsets` parameter, so delegated work cannot grant itself capabilities that the parent does not have. Configure the parent's tools before starting the conversation when a delegated task needs web, terminal, file, or other access. Hermes still strips child-blocked tools such as `clarify`, `memory`, and `send_message`; children keep `execute_code` for programmatic tool calling.
+Subagents inherit the parent's enabled toolsets. `delegate_task` does not accept a model-facing `toolsets` parameter, so delegated work cannot grant itself capabilities that the parent does not have. Configure the parent's tools before starting the conversation when a delegated task needs web, terminal, file, or other access. Hermes strips child-blocked tools such as `clarify`, `memory`, `send_message`, and `execute_code`.
 
 ---
 
@@ -203,7 +203,7 @@ Subagents inherit the parent's enabled toolsets. `delegate_task` does not accept
 - **Default and hard batch width 5**: each `delegate_task` call is capped by `delegation.max_concurrent_children`.
 - **One detached batch**: `delegation.max_background_batches` independently caps background batch units per process at the hard ceiling of 1. Raising batch width cannot raise the detached-batch count.
 - **Five-descendant tree budget**: `delegation.max_total_descendants` caps all active direct and nested descendants in a process/tree at 5. A rejected batch does not run synchronously as a bypass.
-- **Nested delegation is opt-in**: leaf subagents (default) cannot call `delegate_task`, `clarify`, `memory`, or `execute_code`. Orchestrator subagents (`role="orchestrator"`) retain `delegate_task` for further delegation, but only when `delegation.max_spawn_depth` is raised above the default of 1 (floor 1, no ceiling); the other three remain blocked. Disable globally via `delegation.orchestrator_enabled: false`.
+- **Nested delegation is opt-in**: leaf subagents (default) cannot call `delegate_task`, `clarify`, `memory`, or `execute_code`. Orchestrator subagents (`role="orchestrator"`) retain `delegate_task` for further delegation, but only when `delegation.max_spawn_depth` is raised above the default of 1 (range 1–4); the other blocked tools remain blocked. Disable globally via `delegation.orchestrator_enabled: false`.
 
 ### Tuning Concurrency and Depth
 
@@ -212,7 +212,7 @@ Subagents inherit the parent's enabled toolsets. `delegate_task` does not accept
 | `max_concurrent_children` | 5 | 1–5 | Parallel batch width per `delegate_task` call |
 | `max_background_batches` | 1 | 1 | Detached top-level batch units per process |
 | `max_total_descendants` | 5 | 1–5 | Active direct+nested descendants per process/tree |
-| `max_spawn_depth` | 1 | >=1 | How many delegation levels can spawn further |
+| `max_spawn_depth` | 1 | 1–4 | How many delegation levels can spawn further |
 
 Safe five-wide flat configuration:
 

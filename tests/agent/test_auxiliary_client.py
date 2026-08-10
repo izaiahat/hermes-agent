@@ -2859,7 +2859,9 @@ class TestCodexAdapterReasoningTranslation:
             patch("agent.codex_throttle.note_success") as note_success,
         ):
             adapter.create(messages=[{"role": "user", "content": "hi"}])
-        gate_fn.assert_called_once_with()
+        gate_fn.assert_called_once()
+        assert callable(gate_fn.call_args.kwargs["interrupt_check"])
+        assert callable(gate_fn.call_args.kwargs["touch"])
         gate.__enter__.assert_called_once()
         gate.__exit__.assert_called_once()
         note_success.assert_called_once_with()
@@ -2869,6 +2871,41 @@ class TestCodexAdapterReasoningTranslation:
         with patch("agent.codex_throttle.codex_request_gate") as gate_fn:
             adapter.create(messages=[{"role": "user", "content": "hi"}])
         gate_fn.assert_not_called()
+
+    def test_timeout_while_waiting_for_gate_does_not_close_shared_client(self):
+        from agent.codex_throttle import CodexGateAdmissionError
+
+        adapter, captured = self._build_adapter("https://chatgpt.com/backend-api/codex")
+        client = getattr(adapter, "_client")
+
+        def _gate_factory(*, interrupt_check=None, touch=None, **_kwargs):
+            class _BlockedGate:
+                def __enter__(self):
+                    deadline = time.monotonic() + 2.0
+                    while time.monotonic() < deadline:
+                        if interrupt_check and interrupt_check():
+                            raise CodexGateAdmissionError(
+                                "interrupted", "interrupted while waiting"
+                            )
+                        if touch:
+                            touch("waiting")
+                        time.sleep(0.005)
+                    raise AssertionError("gate wait did not observe timeout")
+
+                def __exit__(self, *_args):
+                    return False
+
+            return _BlockedGate()
+
+        with patch("agent.codex_throttle.codex_request_gate", side_effect=_gate_factory):
+            with pytest.raises(TimeoutError):
+                adapter.create(
+                    messages=[{"role": "user", "content": "hi"}],
+                    timeout=0.05,
+                )
+
+        assert captured == {}
+        client.close.assert_not_called()
 
 
 

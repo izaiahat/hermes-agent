@@ -1524,6 +1524,9 @@ class _CodexCompletionsAdapter:
         total_timeout = timeout if isinstance(timeout, (int, float)) and timeout > 0 else None
         deadline = time.monotonic() + float(total_timeout) if total_timeout else None
         timed_out = threading.Event()
+        request_started = threading.Event()
+        request_start_lock = threading.Lock()
+        gate_cancel_error: list[BaseException] = []
         timeout_timer: Optional[threading.Timer] = None
         # A protected provider call may outlive its owning compression attempt:
         # the owner returns promptly on hard cancellation while this adapter is
@@ -1556,6 +1559,11 @@ class _CodexCompletionsAdapter:
             # Publish transport timeout only after the attempt-local decision is
             # fixed, so owner polling cannot observe completion in between.
             timed_out.set()
+            with request_start_lock:
+                if not request_started.is_set():
+                    # Admission has not started a provider request. Closing the
+                    # process-shared client here would poison unrelated sessions.
+                    return
             if not timeout_won:
                 # The request owner already hard-cancelled this attempt. The
                 # OpenAI client is process-shared, so closing/evicting it here
@@ -1615,6 +1623,16 @@ class _CodexCompletionsAdapter:
                 # new failure mode for auxiliary calls.
                 pass
 
+        def _gate_interrupt_requested() -> bool:
+            """Translate auxiliary cancellation into the gate's bool contract."""
+            try:
+                _check_cancelled()
+            except BaseException as exc:
+                if not gate_cancel_error:
+                    gate_cancel_error.append(exc)
+                return True
+            return False
+
         try:
             if total_timeout:
                 timeout_timer = threading.Timer(float(total_timeout), _close_client_on_timeout)
@@ -1652,9 +1670,17 @@ class _CodexCompletionsAdapter:
             if is_subscription_codex:
                 from agent.codex_throttle import codex_request_gate
 
-                gate_cm = codex_request_gate()
+                gate_cm = codex_request_gate(
+                    interrupt_check=_gate_interrupt_requested,
+                    touch=lambda _msg: _notify_aux_progress(),
+                )
 
             with gate_cm:
+                _check_cancelled()
+                with request_start_lock:
+                    if timed_out.is_set():
+                        raise TimeoutError(_timeout_message())
+                    request_started.set()
                 event_stream = self._client.responses.create(**stream_kwargs)
                 with attempt_stream_lock:
                     attempt_stream.append(event_stream)
@@ -1742,6 +1768,8 @@ class _CodexCompletionsAdapter:
                 from agent.codex_throttle import note_success
                 note_success()
         except Exception as exc:
+            if gate_cancel_error:
+                raise gate_cancel_error[0] from exc
             if is_subscription_codex:
                 from agent.codex_throttle import note_rate_limited_from_error
                 note_rate_limited_from_error(exc)

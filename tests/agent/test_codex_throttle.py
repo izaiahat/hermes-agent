@@ -276,8 +276,8 @@ def test_policy_cannot_raise_hard_ceiling_above_seven(monkeypatch, tmp_path):
         "HERMES_CODEX_MAX_CONCURRENCY=99\nHERMES_CODEX_MAX_DELEGATES=99\n",
     )
     snapshot = throttle.runtime_config()
-    assert snapshot["max_concurrency"] == 7
-    assert snapshot["max_delegates"] == 7
+    assert snapshot["max_concurrency"] == 5
+    assert snapshot["max_delegates"] == 5
 
 
 def test_box_wide_gate_is_shared_across_processes(monkeypatch, tmp_path):
@@ -324,16 +324,16 @@ def test_box_wide_gate_is_shared_across_processes(monkeypatch, tmp_path):
     assert all(process.exitcode == 0 for process in processes)
 
 
-def test_box_wide_delegate_gate_admits_seven_and_denies_eighth(monkeypatch, tmp_path):
+def test_box_wide_delegate_gate_admits_five_and_denies_sixth(monkeypatch, tmp_path):
     root = tmp_path / "isolated-hermes-root"
     root.mkdir()
     policy = tmp_path / "delegate-policy.env"
     policy.write_text(
         "\n".join([
-            "HERMES_CODEX_MAX_CONCURRENCY=7",
+            "HERMES_CODEX_MAX_CONCURRENCY=5",
             "HERMES_CODEX_MIN_CONCURRENCY=1",
-            "HERMES_CODEX_CONCURRENCY_START=7",
-            "HERMES_CODEX_MAX_DELEGATES=7",
+            "HERMES_CODEX_CONCURRENCY_START=5",
+            "HERMES_CODEX_MAX_DELEGATES=5",
         ]),
         encoding="utf-8",
     )
@@ -347,25 +347,25 @@ def test_box_wide_delegate_gate_admits_seven_and_denies_eighth(monkeypatch, tmp_
     result_queue = ctx.Queue()
     holders = [
         ctx.Process(target=_delegate_gate_process_worker, args=(i, release, result_queue))
-        for i in range(7)
+        for i in range(5)
     ]
     for process in holders:
         process.start()
     acquired = [result_queue.get(timeout=10) for _ in holders]
     assert all(row[0] == "acquired" for row in acquired)
 
-    eighth = ctx.Process(
+    sixth = ctx.Process(
         target=_delegate_gate_process_worker,
-        args=(7, release, result_queue),
+        args=(5, release, result_queue),
     )
-    eighth.start()
+    sixth.start()
     denied = result_queue.get(timeout=10)
     assert denied[0] == "denied"
-    assert denied[2:] == (7, 7)
-    assert throttle.codex_delegate_runtime_snapshot()["active_delegates"] == 7
+    assert denied[2:] == (5, 5)
+    assert throttle.codex_delegate_runtime_snapshot()["active_delegates"] == 5
 
     release.set()
-    for process in holders + [eighth]:
+    for process in holders + [sixth]:
         process.join(timeout=10)
-    assert all(process.exitcode == 0 for process in holders + [eighth])
+    assert all(process.exitcode == 0 for process in holders + [sixth])
     assert throttle.codex_delegate_runtime_snapshot()["active_delegates"] == 0

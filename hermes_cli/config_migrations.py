@@ -639,8 +639,7 @@ def _migrate_to_33(results: Dict[str, Any], quiet: bool) -> None:
         if not quiet:
             print(
                 "  ✓ Removed deprecated delegation.max_async_children — "
-                "delegation.max_concurrent_children now caps background "
-                "delegations too."
+                "background concurrency now uses a dedicated admission cap."
             )
 
 
@@ -718,6 +717,39 @@ def _migrate_to_34(results: Dict[str, Any], quiet: bool) -> None:
                 )
 
 
+def _migrate_to_35(results: Dict[str, Any], quiet: bool) -> None:
+    """Split direct width from background-batch and tree-wide admission caps."""
+    _c = _cfg()
+    config = _c.read_raw_config()
+    raw_deleg = config.get("delegation")
+    if not isinstance(raw_deleg, dict):
+        return
+
+    touched = False
+    added: list[str] = []
+    if "max_background_batches" not in raw_deleg:
+        raw_deleg["max_background_batches"] = 1
+        touched = True
+        added.append("delegation.max_background_batches=1")
+    if "max_total_descendants" not in raw_deleg:
+        try:
+            width = int(raw_deleg.get("max_concurrent_children", 5) or 5)
+        except (TypeError, ValueError):
+            width = 5
+        total = min(5, max(1, width))
+        raw_deleg["max_total_descendants"] = total
+        touched = True
+        added.append(f"delegation.max_total_descendants={total}")
+
+    if not touched:
+        return
+    config["delegation"] = raw_deleg
+    _c._persist_migration(config)
+    results["config_added"].extend(added)
+    if not quiet:
+        print("  ✓ Added bounded delegation background/tree admission defaults.")
+
+
 #: Registry of (target_version, migration_fn), strictly ascending. The driver
 #: applies every entry whose target version is greater than the on-disk
 #: version captured before the ladder started. Order matters: later steps may
@@ -740,6 +772,7 @@ MIGRATIONS: Tuple[Tuple[int, Callable[[Dict[str, Any], bool], None]], ...] = (
     (32, _migrate_to_32),
     (33, _migrate_to_33),
     (34, _migrate_to_34),
+    (35, _migrate_to_35),
 )
 
 

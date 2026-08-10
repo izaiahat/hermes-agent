@@ -1326,12 +1326,62 @@ class TestDelegationReasoningEffort(unittest.TestCase):
 
     @patch("tools.delegate_tool._load_config")
     @patch("run_agent.AIAgent")
+    def test_override_reasoning_clamps_to_effective_child_route(self, MockAgent, mock_cfg):
+        mock_cfg.return_value = {"max_iterations": 50, "reasoning_effort": "max"}
+        MockAgent.return_value = MagicMock()
+        parent = _make_mock_parent()
+
+        _build_child_agent(
+            task_index=0,
+            goal="test",
+            context=None,
+            toolsets=None,
+            model="gpt-5.5",
+            max_iterations=50,
+            parent_agent=parent,
+            task_count=1,
+            override_provider="openai-codex",
+        )
+
+        self.assertEqual(
+            MockAgent.call_args[1]["reasoning_config"],
+            {"enabled": True, "effort": "xhigh"},
+        )
+
+    @patch("tools.delegate_tool._load_config")
+    @patch("run_agent.AIAgent")
+    def test_inherited_reasoning_reclamps_for_overridden_route(self, MockAgent, mock_cfg):
+        mock_cfg.return_value = {"max_iterations": 50, "reasoning_effort": ""}
+        MockAgent.return_value = MagicMock()
+        parent = _make_mock_parent()
+        parent.reasoning_config = {"enabled": True, "effort": "max", "summary": "auto"}
+
+        _build_child_agent(
+            task_index=0,
+            goal="test",
+            context=None,
+            toolsets=None,
+            model="gpt-5.5",
+            max_iterations=50,
+            parent_agent=parent,
+            task_count=1,
+            override_provider="openai-codex",
+        )
+
+        self.assertEqual(
+            MockAgent.call_args[1]["reasoning_config"],
+            {"enabled": True, "effort": "xhigh", "summary": "auto"},
+        )
+
+    @patch("tools.delegate_tool._load_config")
+    @patch("run_agent.AIAgent")
     def test_child_does_not_inherit_parent_priority_service_tier(self, MockAgent, mock_cfg):
         """Delegated/background children stay on the standard non-fast tier."""
         mock_cfg.return_value = {"max_iterations": 50, "reasoning_effort": ""}
         MockAgent.return_value = MagicMock()
         parent = _make_mock_parent()
         parent.service_tier = "priority"
+        parent.request_overrides = {"service_tier": "priority", "speed": "fast"}
 
         _build_child_agent(
             task_index=0, goal="test", context=None, toolsets=None,
@@ -1339,7 +1389,10 @@ class TestDelegationReasoningEffort(unittest.TestCase):
             task_count=1,
         )
 
-        self.assertNotIn("service_tier", MockAgent.call_args[1])
+        call_kwargs = MockAgent.call_args[1]
+        self.assertEqual(call_kwargs["service_tier"], "standard")
+        self.assertNotIn("service_tier", call_kwargs["request_overrides"])
+        self.assertNotIn("speed", call_kwargs["request_overrides"])
 
 # =========================================================================
 # Dispatch helper, progress events, concurrency
@@ -1549,6 +1602,52 @@ class TestDescendantAdmissionBudget(unittest.TestCase):
         assert replacement is not None
         replacement[0].release()
         self.assertEqual(active_descendant_count(), 0)
+
+    @patch("tools.delegate_tool._build_child_preserving_parent_tools")
+    @patch("tools.delegate_tool._try_reserve_descendants")
+    def test_capacity_rejection_happens_before_child_construction(
+        self, mock_reserve, mock_build
+    ):
+        mock_reserve.return_value = (None, 5, 5)
+        parent = _make_mock_parent()
+
+        result = json.loads(delegate_task(goal="bounded task", parent_agent=parent))
+
+        self.assertIn("error", result)
+        self.assertIn("no child ran", result["error"].lower())
+        mock_build.assert_not_called()
+
+    @patch("tools.delegate_tool._try_reserve_descendants")
+    @patch("tools.delegate_tool._build_child_preserving_parent_tools")
+    def test_partial_child_construction_releases_all_leases_and_parent_tracking(
+        self, mock_build, mock_reserve
+    ):
+        leases = [MagicMock(), MagicMock()]
+        mock_reserve.return_value = (leases, 0, 5)
+        parent = _make_mock_parent()
+        child = MagicMock()
+
+        def _build(*_args, **_kwargs):
+            if mock_build.call_count == 1:
+                parent._active_children.append(child)
+                return child
+            raise RuntimeError("construction failed")
+
+        mock_build.side_effect = _build
+        with patch("tools.delegate_tool._get_max_concurrent_children", return_value=5):
+            with self.assertRaises(RuntimeError):
+                delegate_task(
+                    tasks=[
+                        {"goal": "Build the first bounded child fixture"},
+                        {"goal": "Build the second bounded child fixture"},
+                    ],
+                    parent_agent=parent,
+                )
+
+        self.assertNotIn(child, parent._active_children)
+        child.close.assert_called_once()
+        for lease in leases:
+            lease.release.assert_called_once()
 
     @patch("agent.codex_throttle.try_acquire_codex_delegate_slots")
     @patch("agent.codex_throttle.is_enabled", return_value=True)

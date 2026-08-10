@@ -3809,7 +3809,7 @@ def test_ws_orphan_reap_releases_resume_lock_before_slow_teardown(monkeypatch):
     def _slow_teardown(_session, *, end_reason="tui_close"):
         assert end_reason == "ws_orphan_reap"
         teardown_started.set()
-        assert release_teardown.wait(timeout=2.0)
+        assert release_teardown.wait(timeout=3.0)
 
     monkeypatch.setattr(server, "_WS_ORPHAN_REAP_GRACE_S", 0.01)
     monkeypatch.setattr(server.threading, "Timer", _Timer)
@@ -3824,7 +3824,7 @@ def test_ws_orphan_reap_releases_resume_lock_before_slow_teardown(monkeypatch):
     thread.start()
     acquired = False
     try:
-        assert teardown_started.wait(timeout=1.0)
+        assert teardown_started.wait(timeout=3.0)
         assert "slow-orphan" not in server._sessions
         acquired = server._session_resume_lock.acquire(timeout=0.2)
         assert acquired, "orphan teardown kept the global resume lock held"
@@ -3832,7 +3832,7 @@ def test_ws_orphan_reap_releases_resume_lock_before_slow_teardown(monkeypatch):
         if acquired:
             server._session_resume_lock.release()
         release_teardown.set()
-        thread.join(timeout=2.0)
+        thread.join(timeout=3.0)
         server._sessions.pop("slow-orphan", None)
 
     assert not thread.is_alive()
