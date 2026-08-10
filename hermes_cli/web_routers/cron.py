@@ -162,7 +162,9 @@ def _update_cron_job_sync(job_id: str, body: CronJobUpdate, profile: Optional[st
 
 
 def _pause_cron_job_sync(job_id: str, profile: Optional[str] = None):
-    return _found(_mutate_cron_for_profile(_job_profile(job_id, profile), "pause_job", job_id))
+    # pause_job requires a durable reason; the dashboard names itself.
+    return _found(_mutate_cron_for_profile(
+        _job_profile(job_id, profile), "pause_job", job_id, reason="paused from dashboard"))
 
 
 def _resume_cron_job_sync(job_id: str, profile: Optional[str] = None):

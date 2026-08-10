@@ -233,6 +233,10 @@ def _build_child_agent(
         request_overrides = dict(override_request_overrides)
     else:
         request_overrides = {} if override_provider else dict(getattr(parent_agent, "request_overrides", {}) or {})
+        # A parent on a priority/fast tier must not silently bill every child at
+        # that tier: those are per-turn operator choices, not inheritable routing.
+        request_overrides.pop("service_tier", None)
+        request_overrides.pop("speed", None)
     parent_sid = getattr(parent_agent, "session_id", None)
     child_session_db = _open_child_session_db(parent_agent)
     with delegated_child_context():

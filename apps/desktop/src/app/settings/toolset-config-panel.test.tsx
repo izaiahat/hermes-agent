@@ -315,12 +315,12 @@ describe('ToolsetConfigPanel', () => {
     // Let the initial provider-selection effect settle before clicking. Without
     // this gate, its Edge TTS update can race and overwrite the test's click.
     const edge = await screen.findByRole('button', { name: /Microsoft Edge TTS/ })
-    await waitFor(() => expect(edge.getAttribute('aria-pressed')).toBe('true'))
+    await waitFor(() => expect(edge.getAttribute('aria-expanded')).toBe('true'))
 
     // Select the keyed provider so its env vars render.
     const elevenlabs = await screen.findByRole('button', { name: /ElevenLabs/ })
     fireEvent.click(elevenlabs)
-    await waitFor(() => expect(elevenlabs.getAttribute('aria-pressed')).toBe('true'))
+    await waitFor(() => expect(elevenlabs.getAttribute('aria-expanded')).toBe('true'))
 
     // Open the credential actions menu (Radix opens on pointerdown), then "Set".
     const trigger = await screen.findByRole('button', { name: /^Actions$/ })

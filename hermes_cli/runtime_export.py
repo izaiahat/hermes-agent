@@ -279,7 +279,15 @@ def _can_assign_gid(expected_gid: int) -> bool:
 
 
 def _run_checked(command: List[str], *, context: str) -> None:
-    proc = subprocess.run(command, capture_output=True, text=True, timeout=120, check=False)
+    proc = subprocess.run(
+        command,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=120,
+        check=False,
+    )
     if proc.returncode != 0:
         detail = (proc.stderr or proc.stdout or "").strip()
         raise ExporterError(f"{context} failed: {detail or f'returncode={proc.returncode}'}")
@@ -718,7 +726,15 @@ def _collect_resources() -> Dict[str, Any]:
 
 def _run_command(argv: List[str]) -> Dict[str, Any]:
     try:
-        proc = subprocess.run(argv, capture_output=True, text=True, timeout=30, check=False)
+        proc = subprocess.run(
+            argv,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=30,
+            check=False,
+        )
         return {
             "returncode": int(proc.returncode),
             "stdout": proc.stdout,

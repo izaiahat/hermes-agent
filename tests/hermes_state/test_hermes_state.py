@@ -286,7 +286,7 @@ class TestConnectionLifecycle:
 
         assert not any("wal_checkpoint" in sql.lower() for sql in executed)
 
-    def test_writable_close_uses_passive_checkpoint(self, tmp_path):
+    def test_writable_close_uses_nonblocking_passive_checkpoint(self, tmp_path):
         db_path = tmp_path / "state.db"
         writable = SessionDB(db_path=db_path)
         executed = []
