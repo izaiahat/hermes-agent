@@ -620,6 +620,13 @@ class ResponsesApiTransport(ProviderTransport):
         if params.get("request_overrides"):
             kwargs.update(params["request_overrides"])
 
+        if is_codex_backend:
+            # _sanitize_astra_request_kwargs only covers the official OpenAI
+            # Responses route; the chatgpt.com/backend-api/codex route rejects
+            # prompt_cache_retention too, and request_overrides can reintroduce
+            # it after any earlier strip.
+            kwargs.pop("prompt_cache_retention", None)
+
         _sanitize_astra_request_kwargs(kwargs, model, params.get("base_url"))
 
         _bound_prompt_cache_key_field(kwargs)

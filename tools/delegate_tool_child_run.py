@@ -504,6 +504,9 @@ def _build_result_entry(
     # Result entry contract: see the _run_single_child docstring.
     entry: Dict[str, Any] = {
         "task_index": task_index,
+        # Without the child's session id a parent cannot reopen the child's own
+        # transcript to inspect what it actually did.
+        "session_id": str(getattr(child, "session_id", "") or "") or None,
         "status": status,
         "summary": summary,
         "api_calls": result.get("api_calls", 0),
@@ -777,6 +780,7 @@ class _ChildRun:
         status = "timeout" if is_timeout else "error"
         _error_entry = {
             "task_index": task_index, "status": status, "summary": None, "error": _err, "exit_reason": status,
+            "session_id": str(getattr(child, "session_id", "") or "") or None,
             "api_calls": child_api_calls, "duration_seconds": duration,
             "timeout_seconds": child_timeout if is_timeout else None,
             "timed_out_after_seconds": duration if is_timeout else None,
