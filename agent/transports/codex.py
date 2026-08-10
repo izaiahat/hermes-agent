@@ -451,6 +451,13 @@ class ResponsesApiTransport(ProviderTransport):
         if request_overrides:
             kwargs.update(request_overrides)
 
+        # ChatGPT's Codex backend rejects prompt_cache_retention for models
+        # such as gpt-5.6-sol. The normal helper above only emits retention
+        # for Bedrock Mantle, but a late request override must not bypass the
+        # endpoint contract.
+        if is_codex_backend:
+            kwargs.pop("prompt_cache_retention", None)
+
         if "prompt_cache_key" in kwargs:
             bounded_cache_key = _bounded_prompt_cache_key(kwargs["prompt_cache_key"])
             if bounded_cache_key:

@@ -588,6 +588,8 @@ def _format_job(job: Dict[str, Any]) -> Dict[str, Any]:
         result["monitor_url"] = job["monitor_url"]
     if job.get("monitor_state"):
         result["monitor_state"] = job["monitor_state"]
+    if job.get("script_sha256"):
+        result["script_sha256"] = job["script_sha256"]
     if job.get("script_timeout_seconds") is not None:
         result["script_timeout_seconds"] = job.get("script_timeout_seconds")
     if job.get("no_agent"):
@@ -1055,6 +1057,7 @@ def cronjob(
     attach_to_session: Optional[bool] = None,
     monitor_script: Optional[str] = None,
     monitor_url: Optional[str] = None,
+    initially_enabled: bool = True,
     task_id: str = None,
     session_id: Optional[str] = None,
 ) -> str:
@@ -1144,6 +1147,7 @@ def cronjob(
                     attach_to_session=attach_to_session,
                     monitor_script=_normalize_optional_job_value(monitor_script),
                     monitor_url=_normalize_optional_job_value(monitor_url),
+                    initially_enabled=initially_enabled,
                 )
             except CronSchedulerRegistrationError as exc:
                 _partial = exc.to_dict()
@@ -1505,6 +1509,11 @@ Important safety rule: cron-run sessions should not recursively schedule more cr
                 "type": "integer",
                 "description": "Optional repeat count. Omit for defaults (once for one-shot, forever for recurring)."
             },
+            "initially_enabled": {
+                "type": "boolean",
+                "default": True,
+                "description": "Create the job disabled/paused when false. Use for two-phase control-plane binding before a one-shot may dispatch. Create-only."
+            },
             "deliver": {
                 "type": "string",
                 "description": "Omit this parameter to auto-deliver back to the current chat and topic (recommended). Auto-detection preserves thread/topic context. Only set explicitly when the user asks to deliver somewhere OTHER than the current conversation. Values: 'origin' (same as omitting), 'local' (no delivery, save only), 'all' (fan out to every connected home channel), or platform:chat_id:thread_id for a specific destination. Combine with comma: 'origin,all' delivers to the origin plus every other connected channel. Examples: 'telegram:-1001234567890:17585', 'discord:#engineering', 'sms:+15551234567', 'all'. WARNING: 'platform:chat_id' without :thread_id loses topic targeting. 'all' resolves at fire time, so a job created before a channel was wired up will pick it up automatically once connected."
@@ -1627,12 +1636,14 @@ registry.register(
         # Programmatic callers of cronjob() itself retain the parameters.
         reason=args.get("reason"),
         script=args.get("script"),
+        script_timeout_seconds=args.get("script_timeout_seconds"),
         context_from=args.get("context_from"),
         enabled_toolsets=args.get("enabled_toolsets"),
         workdir=args.get("workdir"),
         no_agent=args.get("no_agent"),
         monitor_script=args.get("monitor_script"),
         monitor_url=args.get("monitor_url"),
+        initially_enabled=args.get("initially_enabled", True),
         task_id=kw.get("task_id"),
         session_id=kw.get("session_id"),
     ),

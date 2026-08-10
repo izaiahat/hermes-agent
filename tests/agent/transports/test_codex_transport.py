@@ -207,6 +207,18 @@ class TestCodexBuildKwargs:
         )
         assert "prompt_cache_retention" not in kw
 
+    def test_codex_backend_strips_prompt_cache_retention_after_request_overrides(self, transport):
+        kw = transport.build_kwargs(
+            model="gpt-5.6-sol",
+            messages=[{"role": "user", "content": "Hi"}],
+            tools=[],
+            session_id="test-session",
+            base_url="https://chatgpt.com/backend-api/codex",
+            is_codex_backend=True,
+            request_overrides={"prompt_cache_retention": "24h"},
+        )
+        assert "prompt_cache_retention" not in kw
+
     def test_xai_responses_sends_cache_key_via_extra_body(self, transport):
         """xAI's Responses API documents ``prompt_cache_key`` as the
         body-level cache-routing key (the ``x-grok-conv-id`` header is

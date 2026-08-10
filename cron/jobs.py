@@ -9,6 +9,7 @@ import contextlib
 import copy
 from contextvars import ContextVar
 from dataclasses import dataclass
+import hashlib
 import json
 import logging
 import shutil
@@ -1587,6 +1588,7 @@ def create_job(
     attach_to_session: Optional[bool] = None,
     monitor_script: Optional[str] = None,
     monitor_url: Optional[str] = None,
+    initially_enabled: bool = True,
 ) -> Dict[str, Any]:
     """
     Create a new cron job.
@@ -1690,6 +1692,21 @@ def create_job(
     normalized_monitor_script = normalized_monitor_script or None
     normalized_monitor_url = str(monitor_url).strip() if isinstance(monitor_url, str) else None
     normalized_monitor_url = normalized_monitor_url or None
+    normalized_enabled = bool(initially_enabled)
+
+    def _current_script_hash(script_value: Optional[str]) -> Optional[str]:
+        if not script_value:
+            return None
+        raw = Path(script_value).expanduser()
+        candidate = raw if raw.is_absolute() else get_hermes_home() / "scripts" / raw
+        try:
+            if candidate.is_symlink() or not candidate.is_file():
+                return None
+            return hashlib.sha256(candidate.read_bytes()).hexdigest()
+        except OSError:
+            return None
+
+    normalized_script_sha256 = _current_script_hash(normalized_script)
 
     # Monitor-mode validation: exactly one source, and monitor mode only
     # makes sense when there IS an agent to suppress/wake.
@@ -1761,6 +1778,7 @@ def create_job(
         "base_url": normalized_base_url,
         "script": normalized_script,
         "script_timeout_seconds": normalized_script_timeout,
+        "script_sha256": normalized_script_sha256,
         "no_agent": normalized_no_agent,
         "monitor_script": normalized_monitor_script,
         "monitor_url": normalized_monitor_url,
@@ -1774,10 +1792,10 @@ def create_job(
             "times": repeat,  # None = forever
             "completed": 0
         },
-        "enabled": True,
-        "state": "scheduled",
-        "paused_at": None,
-        "paused_reason": None,
+        "enabled": normalized_enabled,
+        "state": "scheduled" if normalized_enabled else "paused",
+        "paused_at": None if normalized_enabled else now,
+        "paused_reason": None if normalized_enabled else "initial control-plane binding",
         "created_at": now,
         "next_run_at": next_run_at,
         "last_run_at": None,
@@ -1935,6 +1953,19 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
                 normalized_skills = _normalize_skill_list(updated.get("skill"), updated.get("skills"))
                 updated["skills"] = normalized_skills
                 updated["skill"] = normalized_skills[0] if normalized_skills else None
+
+            if "script" in updates:
+                script_value = updated.get("script")
+                if script_value:
+                    raw = Path(str(script_value)).expanduser()
+                    candidate = raw if raw.is_absolute() else get_hermes_home() / "scripts" / raw
+                    updated["script_sha256"] = (
+                        hashlib.sha256(candidate.read_bytes()).hexdigest()
+                        if not candidate.is_symlink() and candidate.is_file()
+                        else None
+                    )
+                else:
+                    updated["script_sha256"] = None
 
             if schedule_changed:
                 updated_schedule = updated["schedule"]

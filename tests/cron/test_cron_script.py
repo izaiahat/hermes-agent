@@ -7,6 +7,7 @@ Tests cover:
 - Path resolution (absolute, relative to HERMES_HOME/scripts/)
 """
 
+import hashlib
 import json
 import os
 import sys
@@ -196,7 +197,9 @@ class TestRunJobScript:
 
         assert success is True
         assert output == "ok"
-        assert captured["argv"] == [sys.executable, str(script.resolve())]
+        assert captured["argv"][0] == sys.executable
+        assert captured["argv"][1].startswith("/proc/self/fd/")
+        assert captured["kwargs"]["pass_fds"]
         assert captured["kwargs"]["text"] is True
         assert "creationflags" not in captured["kwargs"]
         assert "encoding" not in captured["kwargs"]
@@ -246,6 +249,39 @@ class TestRunJobScript:
         assert isinstance(success, bool)
         assert isinstance(output, str)
         assert output  # a message is always produced, never a silent drop
+
+    def test_pinned_script_hash_mismatch_blocks_before_subprocess(self, cron_env, monkeypatch):
+        from cron import scheduler as sched_mod
+        from cron.scheduler import _run_job_script
+
+        script = cron_env / "scripts" / "pinned.py"
+        script.write_text("print('trusted')\n")
+        called = []
+        monkeypatch.setattr(sched_mod.subprocess, "run", lambda *args, **kwargs: called.append(True))
+        success, output = _run_job_script(str(script), job={"script_sha256": "0" * 64})
+        assert success is False
+        assert "cron_script_hash_mismatch" in output
+        assert called == []
+
+    def test_executes_same_open_descriptor_that_was_hashed(self, cron_env, monkeypatch):
+        from cron import scheduler as sched_mod
+        from cron.scheduler import _run_job_script
+
+        script = cron_env / "scripts" / "descriptor.py"
+        trusted = b"print('trusted')\n"
+        script.write_bytes(trusted)
+        expected = hashlib.sha256(trusted).hexdigest()
+
+        def fake_run(argv, **kwargs):
+            script.write_text("print('swapped')\n")
+            with open(argv[1], "rb") as descriptor_view:
+                executed = descriptor_view.read()
+            return SimpleNamespace(returncode=0, stdout=executed.decode(), stderr="")
+
+        monkeypatch.setattr(sched_mod.subprocess, "run", fake_run)
+        success, output = _run_job_script(str(script), job={"script_sha256": expected})
+        assert success is True
+        assert output == trusted.decode().strip()
 
     def test_per_job_script_timeout_reaches_subprocess(self, cron_env, monkeypatch):
         from cron import scheduler as sched_mod

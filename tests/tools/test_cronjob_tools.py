@@ -10,6 +10,32 @@ from tools.cronjob_tools import (
 )
 
 
+def test_registered_handler_forwards_script_timeout_seconds(monkeypatch):
+    """The public registry path must not drop the per-job timeout on update."""
+    from tools import cronjob_tools
+    from tools.registry import registry
+
+    captured = {}
+
+    def fake_cronjob(**kwargs):
+        captured.update(kwargs)
+        return json.dumps({"success": True})
+
+    monkeypatch.setattr(cronjob_tools, "cronjob", fake_cronjob)
+    raw = registry.dispatch("cronjob", {
+        "action": "update",
+        "job_id": "job-1",
+        "script_timeout_seconds": 2400,
+    })
+    assert isinstance(raw, str)
+    result = json.loads(raw)
+
+    assert result["success"] is True
+    assert captured["action"] == "update"
+    assert captured["job_id"] == "job-1"
+    assert captured["script_timeout_seconds"] == 2400
+
+
 # =========================================================================
 # Cron prompt scanning
 # =========================================================================
@@ -245,6 +271,19 @@ class TestUnifiedCronjobTool:
         assert listing["count"] == 1
         assert listing["jobs"][0]["name"] == "Server Check"
         assert listing["jobs"][0]["state"] == "scheduled"
+
+    def test_create_can_start_disabled_for_two_phase_activation(self):
+        created = json.loads(cronjob(
+            action="create",
+            prompt="Check server status",
+            schedule="every 1h",
+            name="Disabled until bound",
+            initially_enabled=False,
+        ))
+        assert created["success"] is True
+        assert created["job"]["enabled"] is False
+        assert created["job"]["state"] == "paused"
+        assert created["job"]["paused_reason"] == "initial control-plane binding"
 
     def test_list_handles_partial_legacy_job_records(self):
         from cron.jobs import save_jobs

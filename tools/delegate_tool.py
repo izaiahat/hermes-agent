@@ -2213,6 +2213,14 @@ def _run_single_child(
     Returns a structured result dict.
     """
     child_start = time.monotonic()
+    # Capture the durable Hermes session identity before the child can be
+    # closed. Delegated children run in threads, so exporting a per-child
+    # HERMES_SESSION_ID through process-global os.environ would race in batch
+    # fan-out. The structured result is the authoritative, concurrency-safe
+    # provenance channel instead.
+    child_session_id = getattr(child, "session_id", None)
+    if not isinstance(child_session_id, str) or not child_session_id:
+        child_session_id = None
 
     # Get the progress callback from the child agent
     child_progress_cb = getattr(child, "tool_progress_callback", None)
@@ -2563,6 +2571,7 @@ def _run_single_child(
 
             _error_entry = {
                 "task_index": task_index,
+                "session_id": child_session_id,
                 "status": "timeout" if is_timeout else "error",
                 "summary": None,
                 "error": _err,
@@ -2751,6 +2760,7 @@ def _run_single_child(
 
         entry: Dict[str, Any] = {
             "task_index": task_index,
+            "session_id": child_session_id,
             "status": status,
             "summary": summary,
             "api_calls": api_calls,

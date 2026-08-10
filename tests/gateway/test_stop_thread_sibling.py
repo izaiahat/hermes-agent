@@ -96,7 +96,9 @@ async def test_stop_does_not_interrupt_sibling_when_unauthorized(monkeypatch):
     result = await runner._handle_stop_command(event)
 
     assert interrupted == []
-    assert "no active" in str(getattr(result, "text", result)).lower()
+    result_text = str(getattr(result, "text", result)).lower()
+    assert "no active task is running in this session" in result_text
+    assert "/agents" in result_text
 
 
 # ---------------------------------------------------------------------------
@@ -136,4 +138,6 @@ async def test_stop_no_active_agent_survives_status_clear_failure():
     )
     result = await runner._handle_stop_command(event)
 
-    assert "no active" in str(getattr(result, "text", result)).lower()
+    result_text = str(getattr(result, "text", result)).lower()
+    assert "no active task is running in this session" in result_text
+    assert "/agents" in result_text

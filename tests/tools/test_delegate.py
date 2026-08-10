@@ -982,6 +982,7 @@ class TestChildCredentialLeasing(unittest.TestCase):
         leased_entry.id = "cred-b"
 
         child = MagicMock()
+        child.session_id = "20260728_100000_delegatepass"
         child._credential_pool = MagicMock()
         child._credential_pool.acquire_lease.return_value = "cred-b"
         child._credential_pool.current.return_value = leased_entry
@@ -1001,6 +1002,7 @@ class TestChildCredentialLeasing(unittest.TestCase):
         )
 
         self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["session_id"], "20260728_100000_delegatepass")
         child._credential_pool.acquire_lease.assert_called_once_with()
         child._swap_credential.assert_called_once_with(leased_entry)
         child._credential_pool.release_lease.assert_called_once_with("cred-b")
@@ -1009,6 +1011,7 @@ class TestChildCredentialLeasing(unittest.TestCase):
         from tools.delegate_tool import _run_single_child
 
         child = MagicMock()
+        child.session_id = "20260728_100001_delegatefail"
         child._credential_pool = MagicMock()
         child._credential_pool.acquire_lease.return_value = "cred-a"
         child._credential_pool.current.return_value = MagicMock(id="cred-a")
@@ -1022,6 +1025,7 @@ class TestChildCredentialLeasing(unittest.TestCase):
         )
 
         self.assertEqual(result["status"], "error")
+        self.assertEqual(result["session_id"], "20260728_100001_delegatefail")
         child._credential_pool.release_lease.assert_called_once_with("cred-a")
 
 

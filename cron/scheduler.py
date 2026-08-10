@@ -12,11 +12,13 @@ import asyncio
 import atexit
 import concurrent.futures
 import contextvars
+import hashlib
 import json
 import logging
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import threading
@@ -2465,13 +2467,10 @@ def _run_job_script(
     try:
         raw = Path(script_path).expanduser()
     except (ValueError, RuntimeError, OSError):
-        # Same ingestion contract as cron.lifecycle_guard: a NUL-bearing
-        # value (ValueError) or an unexpandable ``~`` (RuntimeError with no
-        # resolvable HOME) can never name a real script. The creation-time
-        # guard tolerates such values as "nothing to scan", so they can
-        # reach fire time — fail the run with a report instead of crashing
-        # the scheduler with an unhandled exception.
         return False, f"Blocked: script path is not a valid filesystem path: {script_path!r}"
+    candidate = raw if raw.is_absolute() else scripts_dir / raw
+    if candidate.is_symlink():
+        return False, f"Blocked: cron script must not be a symlink: {candidate}"
     if raw.is_absolute():
         path = raw.resolve()
     else:
@@ -2514,11 +2513,94 @@ def _run_job_script(
                 "On Windows, install Git for Windows (which ships Git Bash) "
                 "or rewrite the script as Python (.py)."
         )
-        argv = [_bash, str(path)]
+        interpreter = _bash
         env_overlay: dict[str, str] = {}
     else:
         python_exe, env_overlay = _windows_cron_python_invocation(sys.executable)
-        argv = [python_exe, str(path)]
+        interpreter = python_exe
+
+    script_fd: Optional[int] = None
+    execution_path = str(path)
+    pass_fds: tuple[int, ...] = ()
+    expected_script_sha256 = str((job or {}).get("script_sha256") or "")
+    if sys.platform != "win32" and os.name == "posix" and Path("/proc/self/fd").is_dir():
+        try:
+            script_fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+            opened = os.fstat(script_fd)
+            if not stat.S_ISREG(opened.st_mode):
+                raise RuntimeError("cron_script_regular_file_required")
+            digest = hashlib.sha256()
+            verified_bytes = bytearray()
+            while True:
+                chunk = os.read(script_fd, 1024 * 1024)
+                if not chunk:
+                    break
+                digest.update(chunk)
+                verified_bytes.extend(chunk)
+            if expected_script_sha256 and digest.hexdigest() != expected_script_sha256:
+                raise RuntimeError("cron_script_hash_mismatch")
+            snapshot_factory = getattr(os, "memfd_create", None)
+            if snapshot_factory is None:
+                try:
+                    import ctypes
+
+                    libc_memfd_create = ctypes.CDLL(None, use_errno=True).memfd_create
+                    libc_memfd_create.argtypes = (ctypes.c_char_p, ctypes.c_uint)
+                    libc_memfd_create.restype = ctypes.c_int
+
+                    def _libc_snapshot_factory(name: str, flags: int) -> int:
+                        descriptor = int(libc_memfd_create(name.encode("utf-8"), flags))
+                        if descriptor < 0:
+                            error_number = ctypes.get_errno()
+                            raise OSError(error_number, os.strerror(error_number))
+                        return descriptor
+                    snapshot_factory = _libc_snapshot_factory
+                except (AttributeError, OSError):
+                    snapshot_factory = None
+            if snapshot_factory is not None:
+                import fcntl
+
+                memfd = snapshot_factory(
+                    f"hermes-cron-{path.name}",
+                    getattr(os, "MFD_ALLOW_SEALING", 0x0002),
+                )
+                try:
+                    view = memoryview(verified_bytes)
+                    while view:
+                        written = os.write(memfd, view)
+                        view = view[written:]
+                    os.lseek(memfd, 0, os.SEEK_SET)
+                    fcntl.fcntl(
+                        memfd,
+                        getattr(fcntl, "F_ADD_SEALS", 1033),
+                        getattr(fcntl, "F_SEAL_WRITE", 0x0008)
+                        | getattr(fcntl, "F_SEAL_GROW", 0x0004)
+                        | getattr(fcntl, "F_SEAL_SHRINK", 0x0002)
+                        | getattr(fcntl, "F_SEAL_SEAL", 0x0001),
+                    )
+                except Exception:
+                    os.close(memfd)
+                    raise
+                os.close(script_fd)
+                script_fd = memfd
+            else:
+                os.lseek(script_fd, 0, os.SEEK_SET)
+            assert script_fd is not None
+            os.set_inheritable(script_fd, True)
+            execution_path = f"/proc/self/fd/{script_fd}"
+            pass_fds = (script_fd,)
+        except Exception as exc:
+            if script_fd is not None:
+                os.close(script_fd)
+                script_fd = None
+            return False, f"Blocked: cron script failed descriptor-bound verification: {exc}"
+    elif expected_script_sha256:
+        try:
+            if hashlib.sha256(path.read_bytes()).hexdigest() != expected_script_sha256:
+                return False, f"Blocked: cron script hash mismatch: {path}"
+        except OSError as exc:
+            return False, f"Blocked: cron script could not be hashed: {exc}"
+    argv = [interpreter, execution_path]
 
     try:
         from tools.environments.local import build_subprocess_env
@@ -2537,15 +2619,22 @@ def _run_job_script(
         # NEVER mutate the Python process cwd — that would leak into
         # concurrent gateway sessions (#69396).
         _script_cwd = workdir or str(path.parent)
-        result = subprocess.run(
-            argv,
-            capture_output=True,
-            text=True,
-            timeout=script_timeout,
-            cwd=_script_cwd,
-            env=env,
-            **popen_kwargs,
-        )
+        if pass_fds and sys.platform != "win32":
+            popen_kwargs["pass_fds"] = pass_fds
+        try:
+            result = subprocess.run(
+                argv,
+                capture_output=True,
+                text=True,
+                timeout=script_timeout,
+                cwd=_script_cwd,
+                env=env,
+                **popen_kwargs,
+            )
+        finally:
+            if script_fd is not None:
+                os.close(script_fd)
+                script_fd = None
         stdout = (result.stdout or "").strip()
         stderr = (result.stderr or "").strip()
 
