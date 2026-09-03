@@ -114,6 +114,14 @@ HARDLINE_PATTERNS = [
     # Kill every process on the system — anchor the command-name token so `echo "kill -1 sends SIGHUP to
     # everything"` doesn't trip (#93392).
     (_CMDPOS + r'kill\s+(-[^\s]+\s+)*-1\b', "kill all processes"),
+    # A negative PID is a process-GROUP target. Raw group signalling can kill a
+    # registered job plus every descendant it owns, bypassing the process
+    # registry's ownership checks and interrupting durable writes. The tracked
+    # process(action="kill") path stays available for jobs this session started.
+    (_CMDPOS + r'kill\s+(?:(?:-[A-Za-z]+|-\d+|-s\s+\S+|-n\s+\d+|'
+     r'--signal(?:=|\s+)\S+)\s+(?:--\s+)?|--\s+)'
+     r'(?:\d+\s+)*-(?:[2-9]|\d{2,})\b',
+     "kill a whole process group by negative PID"),
     (_CMDPOS + r'(shutdown|reboot|halt|poweroff)\b', "system shutdown/reboot"),
     (_CMDPOS + r'init\s+[06]\b', "init 0/6 (shutdown/reboot)"),
     (_CMDPOS + r'systemctl\s+(poweroff|reboot|halt|kexec)\b', "systemctl poweroff/reboot"),

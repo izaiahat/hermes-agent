@@ -1080,7 +1080,11 @@ class TestDelegationCredentialResolution(unittest.TestCase):
         self.assertEqual(creds["provider"], "openai-codex")
         self.assertEqual(creds["api_key"], "explicit-token")
         self.assertEqual(creds["api_mode"], "codex_responses")
-        mock_resolve.assert_not_called()
+        # The explicit endpoint and key still win.  Provider resolution is
+        # intentionally consulted for provider-specific request overrides.
+        mock_resolve.assert_called_once_with(
+            requested="openai-codex", target_model="gpt-5.6-sol"
+        )
 
 
     @patch("hermes_cli.runtime_provider.resolve_runtime_provider")

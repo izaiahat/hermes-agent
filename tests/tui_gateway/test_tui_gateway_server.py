@@ -16574,6 +16574,11 @@ def test_model_options_preserves_canonical_custom_row_after_agent_init(monkeypat
         "hermes_cli.auth.is_provider_explicitly_configured",
         lambda _slug: False,
     )
+    # Keep this test independent of the host's real Anthropic OAuth state.
+    monkeypatch.setattr(
+        "hermes_cli.inventory._anthropic_oauth_credentials_present",
+        lambda: False,
+    )
     monkeypatch.setattr("hermes_cli.inventory._apply_pricing", lambda *_args, **_kwargs: None)
     monkeypatch.setattr("hermes_cli.inventory._apply_capabilities", lambda *_args, **_kwargs: None)
 
@@ -18119,6 +18124,7 @@ def test_reload_env_rpc_surfaces_errors(monkeypatch):
 
 
 def _setup_make_agent_mocks(monkeypatch, cfg):
+    monkeypatch.delenv("HERMES_TUI_MAX_TURNS", raising=False)
     monkeypatch.setattr(server, "_load_cfg", lambda: cfg)
     monkeypatch.setattr(
         server, "_resolve_startup_runtime", lambda: ("test-model", None)
@@ -18262,6 +18268,7 @@ class _FakeAgentForBackground:
 
 
 def test_background_agent_kwargs_reads_nested_max_turns(monkeypatch):
+    monkeypatch.delenv("HERMES_TUI_MAX_TURNS", raising=False)
     monkeypatch.setattr(server, "_load_cfg", lambda: {"agent": {"max_turns": 300}})
 
     kwargs = server._background_agent_kwargs(_FakeAgentForBackground(), "task_1")
@@ -18270,6 +18277,7 @@ def test_background_agent_kwargs_reads_nested_max_turns(monkeypatch):
 
 
 def test_background_agent_kwargs_prefers_agent_max_iterations(monkeypatch):
+    monkeypatch.delenv("HERMES_TUI_MAX_TURNS", raising=False)
     monkeypatch.setattr(server, "_load_cfg", lambda: {"agent": {"max_turns": 300}})
     agent = _FakeAgentForBackground()
     agent.max_iterations = 2200
@@ -18280,6 +18288,7 @@ def test_background_agent_kwargs_prefers_agent_max_iterations(monkeypatch):
 
 
 def test_background_agent_kwargs_falls_back_to_root_max_turns(monkeypatch):
+    monkeypatch.delenv("HERMES_TUI_MAX_TURNS", raising=False)
     monkeypatch.setattr(server, "_load_cfg", lambda: {"max_turns": 50})
 
     kwargs = server._background_agent_kwargs(_FakeAgentForBackground(), "task_1")
@@ -18288,6 +18297,7 @@ def test_background_agent_kwargs_falls_back_to_root_max_turns(monkeypatch):
 
 
 def test_background_agent_kwargs_defaults_to_25(monkeypatch):
+    monkeypatch.delenv("HERMES_TUI_MAX_TURNS", raising=False)
     monkeypatch.setattr(server, "_load_cfg", lambda: {})
 
     kwargs = server._background_agent_kwargs(_FakeAgentForBackground(), "task_1")
@@ -18296,6 +18306,7 @@ def test_background_agent_kwargs_defaults_to_25(monkeypatch):
 
 
 def test_background_agent_kwargs_handles_null_agent_config(monkeypatch):
+    monkeypatch.delenv("HERMES_TUI_MAX_TURNS", raising=False)
     monkeypatch.setattr(server, "_load_cfg", lambda: {"agent": None, "max_turns": 40})
 
     kwargs = server._background_agent_kwargs(_FakeAgentForBackground(), "task_1")
@@ -18304,6 +18315,7 @@ def test_background_agent_kwargs_handles_null_agent_config(monkeypatch):
 
 
 def test_config_show_displays_nested_max_turns(monkeypatch):
+    monkeypatch.delenv("HERMES_TUI_MAX_TURNS", raising=False)
     monkeypatch.setattr(
         server,
         "_load_cfg",

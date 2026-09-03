@@ -183,6 +183,41 @@ def _run_and_exit_oneshot(
         _exit_after_oneshot(rc)
 
 
+
+def _run_and_exit_noninteractive_chat(args: object) -> None:
+    """Run ``hermes chat -q/--query-file`` without unsafe interpreter teardown.
+
+    Programmatic chat mode persists a session id, unlike ``-z``, but otherwise
+    has the same native-finalizer exposure after the response has printed.  A
+    late SIGABRT turns a completed model result into subprocess return code -6.
+    Reuse the one-shot hard-exit boundary after ``cmd_chat`` has performed its
+    own agent/session cleanup so callers receive the truthful exit code.
+    """
+    try:
+        cmd_chat(args)
+        rc = 0
+    except KeyboardInterrupt:
+        rc = 130
+    except SystemExit as exc:
+        if exc.code is not None and not isinstance(exc.code, int):
+            print(exc.code, file=sys.stderr)
+            rc = 1
+        else:
+            rc = exc.code
+    except BaseException:
+        import traceback
+
+        try:
+            traceback.print_exc()
+        except Exception:
+            pass
+        rc = 1
+    try:
+        _cleanup_oneshot_runtime()
+    finally:
+        _exit_after_oneshot(rc)
+
+
 def _set_process_title() -> None:
     """Cosmetic: show 'hermes' instead of 'python3.xx' in ps/top/htop.
 
@@ -3444,6 +3479,16 @@ def main():
         return
 
     # A handler's int return code becomes the exit code (None = success).
+    # A programmatic chat run has already printed its result; falling into
+    # interpreter finalization after that is where the native SIGABRT turns a
+    # completed model response into return code -6. Reuse the one-shot hard-exit
+    # boundary, which runs AFTER cmd_chat's own agent/session cleanup.
+    if getattr(args, "command", None) == "chat" and (
+        getattr(args, "query", None) or getattr(args, "query_file", None)
+    ):
+        if not _resolve_use_tui(args):
+            _run_and_exit_noninteractive_chat(args)
+
     if hasattr(args, "func"):
         rc = args.func(args)
         if isinstance(rc, int) and rc != 0:
