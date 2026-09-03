@@ -93,6 +93,18 @@ _HARDLINE_BLOCK = [
     # System-wide kill
     "kill -9 -1",
     "kill -1",
+    # Negative PIDs target whole process groups. This exact family previously
+    # let one agent terminate a registered bridge job owned by another lane.
+    "kill -TERM -1672466",
+    "kill -15 -1672466",
+    "kill -s TERM -1672466",
+    "kill --signal TERM -1672466",
+    "kill --signal=TERM -1672466",
+    "kill -TERM -- -1672466",
+    "kill -- -1672466",
+    "kill -TERM 12345 -1672466",
+    "sudo kill -TERM -1672466",
+    "true && kill -TERM -1672466",
     # Shutdown / reboot / halt
     "shutdown -h now",
     "shutdown -r now",
@@ -193,6 +205,10 @@ _HARDLINE_ALLOW = [
     # targeted kill
     "kill -9 12345",
     "kill -HUP 1234",
+    "kill -TERM 1672466",
+    "kill -15 1672466",
+    "kill -s TERM 1672466",
+    "kill --signal TERM 1672466",
     "pkill python",
     # Ordinary ops
     "git status",

@@ -132,6 +132,30 @@ def test_oneshot_subprocess_exits_without_teardown_abort():
     assert b"Traceback" not in result.stderr
 
 
+def test_noninteractive_chat_subprocess_exits_without_teardown_abort():
+    program = textwrap.dedent(
+        """
+        import types
+        import hermes_cli.main as main
+
+        main.cmd_chat = lambda _args: print("ok")
+        main._run_and_exit_noninteractive_chat(types.SimpleNamespace())
+        """
+    )
+
+    result = subprocess.run(
+        [sys.executable, "-c", program],
+        cwd=Path(__file__).resolve().parents[2],
+        capture_output=True,
+        timeout=10,
+        check=False,
+    )
+
+    assert result.returncode == 0
+    assert result.stdout == b"ok\n"
+    assert b"Traceback" not in result.stderr
+
+
 
 
 

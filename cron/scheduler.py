@@ -345,6 +345,7 @@ from cron.executions import create_execution, finish_execution, mark_execution_r
 # response with this marker to suppress delivery.  Output is still saved
 # locally for audit.
 SILENT_MARKER = "[SILENT]"
+CRON_BLOCKED_MARKER = "[CRON_BLOCKED]"
 
 # Canonical silence tokens recognized in cron output.  Cron's contract is
 # intentionally looser than the gateway's exact-whole-response rule: the cron
@@ -373,6 +374,22 @@ def _is_cron_silence_response(text: str) -> bool:
     from gateway.response_filters import is_autonomous_silence_response
 
     return is_autonomous_silence_response(text)
+
+
+def _extract_cron_blocked_report(text: str) -> tuple[bool, str]:
+    """Detect and strip the exact leading domain-block marker.
+
+    Only an autonomous agent job (``no_agent=false``) may apply this contract;
+    the caller enforces that scope. A quoted/mid-body marker is ordinary report
+    text, and a token with a suffix is not the exact marker.
+    """
+    stripped = str(text or "").lstrip()
+    if not stripped.startswith(CRON_BLOCKED_MARKER):
+        return False, str(text or "")
+    remainder = stripped[len(CRON_BLOCKED_MARKER):]
+    if remainder and not remainder[0].isspace():
+        return False, str(text or "")
+    return True, remainder.lstrip()
 
 # ---------------------------------------------------------------------------
 # Persistent thread pool for parallel cron jobs.
@@ -2304,6 +2321,40 @@ _DEFAULT_SCRIPT_TIMEOUT = 3600  # seconds (1 hour)
 # Backward-compatible module override used by tests and emergency monkeypatches.
 _SCRIPT_TIMEOUT = _DEFAULT_SCRIPT_TIMEOUT
 _RUN_CLAIM_HEARTBEAT_SECONDS = 60.0
+_F13_RETENTION_JOB_ID = "69a28f878ce3"
+_F13_RETENTION_SCRIPT_NAME = "f13_growth_retention.py"
+# Registration hashes are refusal gates only for lanes whose wrapper can spend,
+# send/apply at a provider, deploy a release, or delete data. Internal workers,
+# reports, sensors, and Sheet reconciliation run their current on-disk code.
+_SCRIPT_HASH_ENFORCED_JOBS = {
+    "69a28f878ce3": "f13_growth_retention.py",              # archive/delete
+    "f3d2db07d83f": "f12_generator_archiver.py",           # archive/delete
+    "e7499917b657": "hermes_state_db_prune.sh",             # delete/vacuum
+    "2dd6ae1a4db9": "affiliate_auto_apply_daily.sh",        # provider applications
+    "52e2014a9579": "affiliate_portal_apply_daily.sh",      # provider applications
+    "7a269c665b12": "awin_auth_liveness_preflight.sh",       # provider auth repair
+    "5a2cba16e057": "affiliate_multi_network_portal_apply_daily.sh",  # provider applications
+    "dc3649d3c84c": "glp_relationship_hygiene_daily.sh",    # provider withdrawals
+    "f0c6a95a371c": "glp_affiliate_reconciliation_honesty.sh",  # sealed release/deploy
+    "567f20134cc2": "glp_price_index_weekly.sh",            # release/deploy
+}
+_F13_INTERPRETER_PATH = Path(
+    "/home/ubuntu/.hermes/hermes-agent/.hermes-runtime/python/"
+    "generation-1785217502-1419311-18b71f39/cpython-3.11.15-linux-x86_64-gnu/"
+    "bin/python3.11"
+)
+_F13_INTERPRETER_SHA256 = "8deffe5dd9ebcf98a062917a4e73bb8fbb7d5846f83dec01fb7506fd5d41c54e"
+_F13_INTERPRETER_UID = 1000
+_F13_INTERPRETER_GID = 1000
+_F13_INTERPRETER_MODE = 0o755
+_F13_INTERPRETER_NLINK = 1
+_F13_INTERPRETER_MAX_BYTES = 64 * 1024 * 1024
+_F13_PYTHON_STARTUP_ENV_KEYS = (
+    "PYTHONPATH",
+    "PYTHONHOME",
+    "PYTHONSTARTUP",
+    "PYTHONUSERBASE",
+)
 
 
 def _get_script_timeout(job: Optional[dict] = None) -> int:
@@ -2417,6 +2468,88 @@ def _windows_cron_python_invocation(python_exe: str) -> tuple[str, dict[str, str
     return str(interpreter), env_overlay
 
 
+def _open_f13_interpreter_descriptor() -> int:
+    """Descriptor/hash/metadata-pin the sole interpreter allowed for F13."""
+
+    path = _F13_INTERPRETER_PATH
+    if not path.is_absolute() or Path(os.path.normpath(str(path))) != path:
+        raise RuntimeError("f13_interpreter_path_noncanonical")
+    current = Path(path.anchor)
+    value: Optional[os.stat_result] = None
+    for component in path.parts[1:]:
+        current /= component
+        value = current.lstat()
+        if stat.S_ISLNK(value.st_mode):
+            raise RuntimeError("f13_interpreter_symlink_component")
+        if current != path and not stat.S_ISDIR(value.st_mode):
+            raise RuntimeError("f13_interpreter_parent_not_directory")
+    if value is None or not stat.S_ISREG(value.st_mode):
+        raise RuntimeError("f13_interpreter_regular_file_required")
+    expected_identity = (
+        value.st_dev,
+        value.st_ino,
+        value.st_uid,
+        value.st_gid,
+        stat.S_IMODE(value.st_mode),
+        value.st_nlink,
+        value.st_size,
+        value.st_mtime_ns,
+    )
+    if (
+        value.st_uid != _F13_INTERPRETER_UID
+        or value.st_gid != _F13_INTERPRETER_GID
+        or stat.S_IMODE(value.st_mode) != _F13_INTERPRETER_MODE
+        or value.st_nlink != _F13_INTERPRETER_NLINK
+        or value.st_size > _F13_INTERPRETER_MAX_BYTES
+        or not (stat.S_IMODE(value.st_mode) & 0o111)
+    ):
+        raise RuntimeError("f13_interpreter_owner_mode_link_or_size_invalid")
+    descriptor = os.open(
+        path,
+        os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+    )
+    try:
+        opened = os.fstat(descriptor)
+        opened_identity = (
+            opened.st_dev,
+            opened.st_ino,
+            opened.st_uid,
+            opened.st_gid,
+            stat.S_IMODE(opened.st_mode),
+            opened.st_nlink,
+            opened.st_size,
+            opened.st_mtime_ns,
+        )
+        digest = hashlib.sha256()
+        offset = 0
+        while offset < opened.st_size:
+            chunk = os.pread(descriptor, min(1024 * 1024, opened.st_size - offset), offset)
+            if not chunk:
+                raise RuntimeError("f13_interpreter_short_read")
+            digest.update(chunk)
+            offset += len(chunk)
+        after = path.lstat()
+        after_identity = (
+            after.st_dev,
+            after.st_ino,
+            after.st_uid,
+            after.st_gid,
+            stat.S_IMODE(after.st_mode),
+            after.st_nlink,
+            after.st_size,
+            after.st_mtime_ns,
+        )
+        if opened_identity != expected_identity or after_identity != expected_identity:
+            raise RuntimeError("f13_interpreter_descriptor_path_identity_drift")
+        if digest.hexdigest() != _F13_INTERPRETER_SHA256:
+            raise RuntimeError("f13_interpreter_hash_mismatch")
+        os.set_inheritable(descriptor, True)
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
 def _run_job_script(
     script_path: str,
     workdir: Optional[str] = None,
@@ -2434,7 +2567,9 @@ def _run_job_script(
     * ``.sh`` / ``.bash`` — run with ``/bin/bash``
     * anything else — run with the current Python interpreter
       (``sys.executable``), preserving the original behaviour for
-      Python-based pre-check and data-collection scripts.
+      Python-based pre-check and data-collection scripts. The exact F13
+      retention job is the sole exception and uses its descriptor/hash-pinned
+      dedicated CPython runtime.
 
     Shell support lets ``no_agent=True`` jobs ship classic bash watchdogs
     (the `memory-watchdog.sh` pattern) without wrapping them in Python.
@@ -2523,6 +2658,8 @@ def _run_job_script(
     execution_path = str(path)
     pass_fds: tuple[int, ...] = ()
     expected_script_sha256 = str((job or {}).get("script_sha256") or "")
+    job_id = str((job or {}).get("id") or "")
+    enforce_script_sha256 = _SCRIPT_HASH_ENFORCED_JOBS.get(job_id) == path.name
     if sys.platform != "win32" and os.name == "posix" and Path("/proc/self/fd").is_dir():
         try:
             script_fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
@@ -2537,8 +2674,17 @@ def _run_job_script(
                     break
                 digest.update(chunk)
                 verified_bytes.extend(chunk)
-            if expected_script_sha256 and digest.hexdigest() != expected_script_sha256:
-                raise RuntimeError("cron_script_hash_mismatch")
+            actual_script_sha256 = digest.hexdigest()
+            if expected_script_sha256 and actual_script_sha256 != expected_script_sha256:
+                if enforce_script_sha256:
+                    raise RuntimeError("cron_script_hash_mismatch")
+                logger.warning(
+                    "Cron script registration drift for %s: registered %s, current %s; "
+                    "running the current on-disk bytes",
+                    path.name,
+                    expected_script_sha256[:16],
+                    actual_script_sha256[:16],
+                )
             snapshot_factory = getattr(os, "memfd_create", None)
             if snapshot_factory is None:
                 try:
@@ -2596,11 +2742,50 @@ def _run_job_script(
             return False, f"Blocked: cron script failed descriptor-bound verification: {exc}"
     elif expected_script_sha256:
         try:
-            if hashlib.sha256(path.read_bytes()).hexdigest() != expected_script_sha256:
-                return False, f"Blocked: cron script hash mismatch: {path}"
+            actual_script_sha256 = hashlib.sha256(path.read_bytes()).hexdigest()
+            if actual_script_sha256 != expected_script_sha256:
+                if enforce_script_sha256:
+                    return False, f"Blocked: cron script hash mismatch: {path}"
+                logger.warning(
+                    "Cron script registration drift for %s: registered %s, current %s; "
+                    "running the current on-disk bytes",
+                    path.name,
+                    expected_script_sha256[:16],
+                    actual_script_sha256[:16],
+                )
         except OSError as exc:
             return False, f"Blocked: cron script could not be hashed: {exc}"
-    argv = [interpreter, execution_path]
+
+    interpreter_fd: Optional[int] = None
+    f13_retention_lane = (
+        str((job or {}).get("id") or "") == _F13_RETENTION_JOB_ID
+        and path.name == _F13_RETENTION_SCRIPT_NAME
+        and suffix == ".py"
+    )
+    if f13_retention_lane:
+        if sys.platform == "win32" or os.name != "posix" or not Path("/proc/self/fd").is_dir():
+            if script_fd is not None:
+                os.close(script_fd)
+            return False, "Blocked: F13 descriptor-bound interpreter runtime unavailable"
+        try:
+            if not re.fullmatch(r"[0-9a-f]{64}", expected_script_sha256):
+                raise RuntimeError("f13_exact_script_sha256_required")
+            if script_fd is None or not execution_path.startswith("/proc/self/fd/"):
+                raise RuntimeError("f13_script_descriptor_runtime_required")
+            interpreter_fd = _open_f13_interpreter_descriptor()
+            interpreter = f"/proc/self/fd/{interpreter_fd}"
+            pass_fds = (*pass_fds, interpreter_fd)
+            env_overlay = {}
+        except Exception as exc:
+            if script_fd is not None:
+                os.close(script_fd)
+                script_fd = None
+            return False, f"Blocked: F13 interpreter integrity verification failed: {exc}"
+    argv = (
+        [interpreter, "-I", "-S", execution_path]
+        if f13_retention_lane
+        else [interpreter, execution_path]
+    )
 
     try:
         from tools.environments.local import build_subprocess_env
@@ -2614,6 +2799,9 @@ def _run_job_script(
             }
         env = build_subprocess_env()
         env.update(env_overlay)
+        if f13_retention_lane:
+            for key in _F13_PYTHON_STARTUP_ENV_KEYS:
+                env.pop(key, None)
         # Use the job's workdir as the subprocess cwd when configured,
         # otherwise default to the scripts-dir parent (back-compat).
         # NEVER mutate the Python process cwd — that would leak into
@@ -2621,9 +2809,58 @@ def _run_job_script(
         _script_cwd = workdir or str(path.parent)
         if pass_fds and sys.platform != "win32":
             popen_kwargs["pass_fds"] = pass_fds
+        run_argv = argv
+        glp_awin_recurring_lane = (
+            str((job or {}).get("id") or "") == "52e2014a9579"
+            and path.name == "affiliate_portal_apply_daily.sh"
+            and script_timeout == 1800
+        )
+        if glp_awin_recurring_lane:
+            systemd_run = Path("/usr/bin/systemd-run")
+            expected_systemd_run_sha256 = "dbc8b988a849d5c9d7ef2de7068a6f107021bc6c11e0d7864c73f373eef726a7"
+            if (
+                not sys.platform.startswith("linux")
+                or not systemd_run.is_file()
+                or hashlib.sha256(systemd_run.read_bytes()).hexdigest()
+                != expected_systemd_run_sha256
+            ):
+                for descriptor_name in ("script_fd", "interpreter_fd"):
+                    descriptor = locals().get(descriptor_name)
+                    if descriptor is not None:
+                        os.close(descriptor)
+                        if descriptor_name == "script_fd":
+                            script_fd = None
+                        else:
+                            interpreter_fd = None
+                return False, "Blocked: GLP Awin descendant-safe systemd runtime unavailable or drifted"
+            # A process-group timeout cannot contain setsid()/double-fork escapes.
+            # Put the complete cron script tree in one transient user cgroup:
+            # KillMode=control-group kills escaped sessions on timeout *and* on
+            # normal main-process exit. RuntimeMaxSec leaves a bounded stop/reap
+            # margin inside the public script_timeout_seconds deadline.
+            unit = f"hermes-cron-script-{os.getpid()}-{threading.get_ident()}-{time.time_ns()}"
+            runtime_max = max(1, script_timeout - 10)
+            env["HERMES_CRON_CGROUP_CONTAINED"] = "1"
+            service_argv = list(argv)
+            if pass_fds and len(service_argv) > 1 and service_argv[1].startswith("/proc/self/fd/"):
+                descriptor = int(service_argv[1].rsplit("/", 1)[1])
+                if descriptor not in pass_fds:
+                    raise RuntimeError("cron_script_descriptor_not_in_pass_fds")
+                # Transient services do not inherit systemd-run's arbitrary
+                # descriptors. Keep the scheduler-held, hash-verified memfd open
+                # through --wait and let bash open that exact descriptor via procfs.
+                service_argv[1] = f"/proc/{os.getpid()}/fd/{descriptor}"
+            run_argv = [
+                str(systemd_run),
+                "--user", "--pipe", "--wait", "--collect", "--quiet",
+                "--service-type=exec", f"--unit={unit}",
+                "-p", "KillMode=control-group", "-p", "SendSIGKILL=yes",
+                "-p", "TimeoutStopSec=5s", "-p", f"RuntimeMaxSec={runtime_max}s",
+                "--", *service_argv,
+            ]
         try:
             result = subprocess.run(
-                argv,
+                run_argv,
                 capture_output=True,
                 text=True,
                 timeout=script_timeout,
@@ -2635,6 +2872,9 @@ def _run_job_script(
             if script_fd is not None:
                 os.close(script_fd)
                 script_fd = None
+            if interpreter_fd is not None:
+                os.close(interpreter_fd)
+                interpreter_fd = None
         stdout = (result.stdout or "").strip()
         stderr = (result.stderr or "").strip()
 
@@ -2661,6 +2901,12 @@ def _run_job_script(
     except subprocess.TimeoutExpired:
         return False, f"Script timed out after {script_timeout}s: {path}"
     except Exception as exc:
+        if script_fd is not None:
+            os.close(script_fd)
+            script_fd = None
+        if interpreter_fd is not None:
+            os.close(interpreter_fd)
+            interpreter_fd = None
         return False, f"Script execution failed: {exc}"
 
 
@@ -4709,8 +4955,9 @@ def run_one_job(
     under the file lock before dispatch; an external provider claims via the
     store CAS). This function only fires the given job once.
 
-    Returns True if the job was processed (even if the job itself failed —
-    failure is recorded via ``mark_job_run``), False only if processing raised.
+    Returns ``False`` for processing exceptions and for a leading
+    ``[CRON_BLOCKED]`` domain report (whose blocked state is already recorded).
+    Other completed attempts retain the historical processed-result ``True``.
     """
     execution_id = job.get("execution_id")
     if not execution_id:
@@ -4788,6 +5035,7 @@ def run_one_job(
         # swallow the error and leak the agent's subprocesses/clients (#10200).
         delivery_error = None
         blocked_config = False
+        domain_blocked = False
         try:
             output_file = save_job_output(job["id"], output)
             if verbose:
@@ -4807,6 +5055,21 @@ def run_one_job(
                     "(tool subprocess was killed mid-flight)."
                 )
 
+            # Generic domain-failure contract for agent jobs only. The leading
+            # marker is control metadata, not report content: strip it for
+            # delivery, preserve the domain-authored body, and make the run
+            # unsuccessful/blocked without routing through provider heuristics.
+            # no_agent scripts retain their existing exit-code semantics.
+            if success and not bool(job.get("no_agent", False)):
+                domain_blocked, final_response = _extract_cron_blocked_report(final_response)
+                if domain_blocked:
+                    success = False
+                    error = (
+                        "Agent reported a blocked domain outcome"
+                        if final_response.strip()
+                        else "Agent returned [CRON_BLOCKED] without a domain report"
+                    )
+
             # Deliver the final response to the origin/target chat.
             # If the agent responded with [SILENT], skip delivery (but
             # output is already saved above).  Failed jobs always deliver.
@@ -4822,7 +5085,12 @@ def run_one_job(
             blocked_config = blocked_config_silent or (
                 bool(error) and BLOCKED_CONFIG_MARKER in str(error)
             )
-            if blocked_config and not success:
+            if domain_blocked:
+                # Preserve the truthful domain report and bypass the generic
+                # provider-failure summarizer. Marker-only remains a failed,
+                # non-delivered run rather than an empty success.
+                deliver_content = final_response
+            elif blocked_config and not success:
                 # Blocked-config alert: bypass the generic failure summarizer
                 # (whose auth/timeout heuristics would mislabel this as a
                 # provider runtime failure) — say plainly that config
@@ -4881,7 +5149,12 @@ def run_one_job(
             error = "Agent completed but produced empty response (model error, timeout, or misconfiguration)"
 
         if not _consume_interrupted_flag(job["id"]):
-            if blocked_config:
+            if domain_blocked:
+                mark_job_run(
+                    job["id"], False, error,
+                    delivery_error=delivery_error, status="blocked",
+                )
+            elif blocked_config:
                 mark_job_run(
                     job["id"], success, error, delivery_error=delivery_error,
                     status="blocked_config",
@@ -4903,7 +5176,7 @@ def run_one_job(
             error=error,
             delivery_outcome=delivery_outcome,
         )
-        return True
+        return False if domain_blocked else True
 
     except BaseException as e:  # noqa: BLE001 — deliberate: see below
         # BaseException, not Exception (#73973): the inner run_job handler
@@ -5121,14 +5394,25 @@ def tick(
             body."""
             return run_one_job(job, adapters=adapters, loop=loop, verbose=verbose)
 
-        # Partition due jobs: those with a per-job workdir mutate
+        # Partition due jobs: AGENT jobs with a per-job workdir mutate
         # os.environ["TERMINAL_CWD"] inside run_job, which is process-global, so
         # they queue on the single-thread sequential pool to run one at a time.
         # That alone only keeps workdir jobs from overlapping EACH OTHER;
         # run_job's _terminal_cwd_lock is what additionally stops a concurrently
         # firing workdir-less parallel-pool job from observing the override.
-        sequential_jobs = [j for j in due_jobs if (j.get("workdir") or "").strip()]
-        parallel_jobs = [j for j in due_jobs if not (j.get("workdir") or "").strip()]
+        #
+        # 2026-08-13 starvation fix (bridge): no_agent SCRIPT jobs never touch
+        # TERMINAL_CWD — their workdir is passed straight to the subprocess as
+        # cwd= (#69396) — yet they were classified sequential purely for having
+        # a workdir. With 34 business script jobs sharing ONE thread, a single
+        # multi-hour job starved every 5/15-minute poller behind it (payments
+        # poller went "blind" -> urgent-alert storms). Only agent-mode workdir
+        # jobs need the sequential writer path.
+        def _mutates_terminal_cwd(j: dict) -> bool:
+            return bool((j.get("workdir") or "").strip()) and not j.get("no_agent")
+
+        sequential_jobs = [j for j in due_jobs if _mutates_terminal_cwd(j)]
+        parallel_jobs = [j for j in due_jobs if not _mutates_terminal_cwd(j)]
 
         _results: list = []
         _all_futures: list = []

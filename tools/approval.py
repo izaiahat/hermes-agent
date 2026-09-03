@@ -460,6 +460,15 @@ HARDLINE_PATTERNS = [
     (r':\(\)\s*\{\s*:\s*\|\s*:\s*&\s*\}\s*;\s*:', "fork bomb"),
     # Kill every process on the system
     (r'\bkill\s+(-[^\s]+\s+)*-1\b', "kill all processes"),
+    # A negative PID is a process-group target. Raw group signalling can kill
+    # a registered job plus every descendant it owns, bypassing the terminal
+    # process registry's ownership checks and interrupting durable writes. The
+    # tracked ``process(action="kill")`` path remains available for jobs that
+    # this session actually started.
+    (_CMDPOS + r'kill\s+(?:(?:-[A-Za-z]+|-\d+|-s\s+\S+|-n\s+\d+|'
+     r'--signal(?:=|\s+)\S+)\s+(?:--\s+)?|--\s+)'
+     r'(?:\d+\s+)*-(?:[2-9]|\d{2,})\b',
+     "signal process group by negative PID (use the tracked process tool)"),
     # System shutdown / reboot — anchor to command position (start of line,
     # after a command separator, or after sudo/env wrappers) so we don't
     # false-positive on "echo reboot" or "grep 'shutdown' logs".

@@ -10,8 +10,10 @@ Tests cover:
 import hashlib
 import json
 import os
+import subprocess
 import sys
 import textwrap
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -250,15 +252,76 @@ class TestRunJobScript:
         assert isinstance(output, str)
         assert output  # a message is always produced, never a silent drop
 
-    def test_pinned_script_hash_mismatch_blocks_before_subprocess(self, cron_env, monkeypatch):
+    def test_legitimate_self_edit_runs_current_script_despite_stale_registration(
+        self, cron_env, monkeypatch, caplog
+    ):
         from cron import scheduler as sched_mod
         from cron.scheduler import _run_job_script
 
         script = cron_env / "scripts" / "pinned.py"
-        script.write_text("print('trusted')\n")
-        called = []
-        monkeypatch.setattr(sched_mod.subprocess, "run", lambda *args, **kwargs: called.append(True))
+        script.write_text("print('current-self-edit')\n")
+
+        def fake_run(argv, **kwargs):
+            with open(argv[1], "rb") as descriptor_view:
+                current = descriptor_view.read().decode()
+            return SimpleNamespace(returncode=0, stdout=current, stderr="")
+
+        monkeypatch.setattr(sched_mod.subprocess, "run", fake_run)
+        with caplog.at_level("WARNING", logger="cron.scheduler"):
+            success, output = _run_job_script(
+                str(script), job={"script_sha256": "0" * 64}
+            )
+        assert success is True
+        assert output == "print('current-self-edit')"
+        assert "Cron script registration drift" in caplog.text
+        assert "running the current on-disk bytes" in caplog.text
+
+    def test_stale_registration_keeps_real_script_crash_honest(self, cron_env):
+        from cron.scheduler import _run_job_script
+
+        script = cron_env / "scripts" / "crash.py"
+        script.write_text("raise RuntimeError('real-crash-marker')\n")
         success, output = _run_job_script(str(script), job={"script_sha256": "0" * 64})
+        assert success is False
+        assert "real-crash-marker" in output
+        assert "success" not in output.lower()
+
+    def test_external_effect_wrapper_still_refuses_stale_registration(
+        self, cron_env, monkeypatch
+    ):
+        from cron import scheduler as sched_mod
+        from cron.scheduler import _run_job_script
+
+        script = cron_env / "scripts" / "affiliate_auto_apply_daily.sh"
+        script.write_text("#!/usr/bin/env bash\nprintf 'must-not-run\\n'\n")
+        called = []
+        monkeypatch.setattr(
+            sched_mod.subprocess, "run", lambda *args, **kwargs: called.append(True)
+        )
+        success, output = _run_job_script(
+            str(script),
+            job={"id": "2dd6ae1a4db9", "script_sha256": "0" * 64},
+        )
+        assert success is False
+        assert "cron_script_hash_mismatch" in output
+        assert called == []
+
+    def test_awin_auth_repair_wrapper_refuses_stale_registration(
+        self, cron_env, monkeypatch
+    ):
+        from cron import scheduler as sched_mod
+        from cron.scheduler import _run_job_script
+
+        script = cron_env / "scripts" / "awin_auth_liveness_preflight.sh"
+        script.write_text("#!/usr/bin/env bash\nprintf 'must-not-run\\n'\n")
+        called = []
+        monkeypatch.setattr(
+            sched_mod.subprocess, "run", lambda *args, **kwargs: called.append(True)
+        )
+        success, output = _run_job_script(
+            str(script),
+            job={"id": "7a269c665b12", "script_sha256": "0" * 64},
+        )
         assert success is False
         assert "cron_script_hash_mismatch" in output
         assert called == []
@@ -305,6 +368,102 @@ class TestRunJobScript:
         assert success is True
         assert output == "ok"
         assert captured["timeout"] == 17
+
+    def test_glp_awin_recurring_script_uses_descendant_safe_user_cgroup(
+        self, cron_env, monkeypatch
+    ):
+        from cron import scheduler as sched_mod
+        from cron.scheduler import _run_job_script
+
+        script = cron_env / "scripts" / "affiliate_portal_apply_daily.sh"
+        script.write_text("#!/usr/bin/env bash\nprintf 'ok\\n'\n")
+        digest = hashlib.sha256(script.read_bytes()).hexdigest()
+        captured = {}
+
+        def fake_run(argv, **kwargs):
+            captured["argv"] = argv
+            captured["kwargs"] = kwargs
+            return SimpleNamespace(returncode=0, stdout="ok\n", stderr="")
+
+        monkeypatch.setattr(sched_mod.subprocess, "run", fake_run)
+        success, output = _run_job_script(
+            str(script),
+            job={
+                "id": "52e2014a9579",
+                "script_timeout_seconds": 1800,
+                "script_sha256": digest,
+            },
+        )
+        assert success is True and output == "ok"
+        argv = captured["argv"]
+        assert argv[:7] == [
+            "/usr/bin/systemd-run", "--user", "--pipe", "--wait", "--collect",
+            "--quiet", "--service-type=exec",
+        ]
+        assert "KillMode=control-group" in argv
+        assert "RuntimeMaxSec=1790s" in argv
+        assert captured["kwargs"]["env"]["HERMES_CRON_CGROUP_CONTAINED"] == "1"
+        assert captured["kwargs"]["timeout"] == 1800
+
+    def test_glp_awin_cgroup_executes_the_scheduler_held_verified_descriptor(
+        self, cron_env, monkeypatch
+    ):
+        from cron import scheduler as sched_mod
+        from cron.scheduler import _run_job_script
+
+        script = cron_env / "scripts" / "affiliate_portal_apply_daily.sh"
+        trusted = b"#!/usr/bin/env bash\nprintf 'trusted\\n'\n"
+        script.write_bytes(trusted)
+        digest = hashlib.sha256(trusted).hexdigest()
+        captured = {}
+
+        def fake_run(argv, **kwargs):
+            captured["argv"] = argv
+            descriptor_path = next(value for value in argv if value.startswith("/proc/") and "/fd/" in value)
+            script.write_text("#!/usr/bin/env bash\nprintf 'swapped\\n'\n")
+            with open(descriptor_path, "rb") as descriptor_view:
+                executed = descriptor_view.read()
+            return SimpleNamespace(returncode=0, stdout=executed.decode(), stderr="")
+
+        monkeypatch.setattr(sched_mod.subprocess, "run", fake_run)
+        success, output = _run_job_script(
+            str(script),
+            job={
+                "id": "52e2014a9579",
+                "script_timeout_seconds": 1800,
+                "script_sha256": digest,
+            },
+        )
+        assert success is True
+        assert output == trusted.decode().strip()
+
+    @pytest.mark.parametrize("normal_parent_exit", [False, True])
+    def test_real_systemd_run_command_contains_escaped_session_descendants(
+        self, tmp_path, normal_parent_exit
+    ):
+        marker = tmp_path / f"scheduler-outer-{'normal' if normal_parent_exit else 'timeout'}"
+        grandchild = (
+            "import pathlib,time;time.sleep(.5);"
+            f"pathlib.Path({str(marker)!r}).write_text('alive');time.sleep(60)"
+        )
+        child = (
+            "import subprocess,sys,time;"
+            f"subprocess.Popen([sys.executable,'-c',{grandchild!r}],start_new_session=True,"
+            "stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL);"
+            f"time.sleep({0 if normal_parent_exit else 60})"
+        )
+        unit = f"hermes-cron-script-pytest-{os.getpid()}-{time.time_ns()}"
+        completed = subprocess.run([
+            "/usr/bin/systemd-run", "--user", "--pipe", "--wait", "--collect", "--quiet",
+            "--service-type=exec", f"--unit={unit}",
+            "-p", "KillMode=control-group", "-p", "SendSIGKILL=yes",
+            "-p", "TimeoutStopSec=.1s", "-p", "RuntimeMaxSec=.2s",
+            "--", sys.executable, "-c", child,
+        ], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+           check=False, timeout=10)
+        assert completed.returncode == (0 if normal_parent_exit else 1)
+        time.sleep(.7)
+        assert not marker.exists()
 
 
 class TestBuildJobPromptWithScript:
@@ -554,3 +713,261 @@ class TestRunJobEnvVarCleanup:
         assert os.environ.get("HERMES_SESSION_PLATFORM") is None
         assert os.environ.get("HERMES_SESSION_CHAT_ID") is None
         assert os.environ.get("HERMES_SESSION_CHAT_NAME") is None
+
+
+class TestF13InterpreterAuthority:
+    def test_production_interpreter_pin_matches_exact_current_bytes(self):
+        from cron import scheduler
+
+        path = scheduler._F13_INTERPRETER_PATH
+        assert path.is_file()
+        value = path.lstat()
+        assert not path.is_symlink()
+        assert hashlib.sha256(path.read_bytes()).hexdigest() == scheduler._F13_INTERPRETER_SHA256
+        assert value.st_uid == scheduler._F13_INTERPRETER_UID
+        assert value.st_gid == scheduler._F13_INTERPRETER_GID
+        assert value.st_mode & 0o777 == scheduler._F13_INTERPRETER_MODE
+        assert value.st_nlink == scheduler._F13_INTERPRETER_NLINK
+        current = Path(path.anchor)
+        for component in path.parts[1:]:
+            current /= component
+            assert not current.is_symlink()
+
+    @staticmethod
+    def _configure_interpreter(scheduler, tmp_path, monkeypatch):
+        interpreter = tmp_path / "f13-python3.11"
+        interpreter.write_bytes(b"fixture-interpreter-bytes")
+        interpreter.chmod(0o700)
+        monkeypatch.setattr(scheduler, "_F13_INTERPRETER_PATH", interpreter)
+        monkeypatch.setattr(
+            scheduler,
+            "_F13_INTERPRETER_SHA256",
+            hashlib.sha256(interpreter.read_bytes()).hexdigest(),
+        )
+        monkeypatch.setattr(scheduler, "_F13_INTERPRETER_UID", os.geteuid())
+        monkeypatch.setattr(scheduler, "_F13_INTERPRETER_GID", os.getegid())
+        monkeypatch.setattr(scheduler, "_F13_INTERPRETER_MODE", 0o700)
+        monkeypatch.setattr(scheduler, "_F13_INTERPRETER_NLINK", 1)
+        return interpreter
+
+    def test_f13_uses_only_retained_hash_verified_interpreter_descriptor(
+        self, cron_env, tmp_path, monkeypatch
+    ):
+        from cron import scheduler
+
+        interpreter = self._configure_interpreter(scheduler, tmp_path, monkeypatch)
+        script = cron_env / "scripts" / "f13_growth_retention.py"
+        script.write_text("print('fixture')\n", encoding="utf-8")
+        seen = []
+
+        def fake_run(argv, **kwargs):
+            seen.append((argv, kwargs))
+            assert argv[0].startswith("/proc/self/fd/")
+            assert Path(argv[0]).read_bytes() == interpreter.read_bytes()
+            assert argv[1:3] == ["-I", "-S"]
+            assert argv[3].startswith("/proc/self/fd/")
+            descriptor = int(argv[0].rsplit("/", 1)[1])
+            assert descriptor in kwargs["pass_fds"]
+            assert len(kwargs["pass_fds"]) == 2
+            script_descriptor = int(argv[3].rsplit("/", 1)[1])
+            assert script_descriptor in kwargs["pass_fds"]
+            assert Path(argv[3]).read_text(encoding="utf-8") == "print('fixture')\n"
+            for key in scheduler._F13_PYTHON_STARTUP_ENV_KEYS:
+                assert key not in kwargs["env"]
+            return subprocess.CompletedProcess(argv, 0, stdout="ok\n", stderr="")
+
+        monkeypatch.setattr(scheduler.subprocess, "run", fake_run)
+        ok, output = scheduler._run_job_script(
+            str(script),
+            job={
+                "id": scheduler._F13_RETENTION_JOB_ID,
+                "script_sha256": hashlib.sha256(script.read_bytes()).hexdigest(),
+            },
+        )
+        assert ok is True
+        assert output == "ok"
+        assert seen
+
+    def test_f13_requires_exact_script_hash_before_subprocess(
+        self, cron_env, monkeypatch
+    ):
+        from cron import scheduler
+
+        script = cron_env / "scripts" / scheduler._F13_RETENTION_SCRIPT_NAME
+        script.write_text("print('must-not-run')\n", encoding="utf-8")
+        effects = []
+        monkeypatch.setattr(
+            scheduler.subprocess,
+            "run",
+            lambda *_args, **_kwargs: effects.append("subprocess"),
+        )
+
+        ok, output = scheduler._run_job_script(
+            str(script), job={"id": scheduler._F13_RETENTION_JOB_ID}
+        )
+
+        assert ok is False
+        assert "f13_exact_script_sha256_required" in output
+        assert effects == []
+
+    def test_f13_stale_script_registration_still_refuses_external_retention_run(
+        self, cron_env, monkeypatch
+    ):
+        from cron import scheduler
+
+        script = cron_env / "scripts" / scheduler._F13_RETENTION_SCRIPT_NAME
+        script.write_text("print('must-not-run')\n", encoding="utf-8")
+        effects = []
+        monkeypatch.setattr(
+            scheduler.subprocess,
+            "run",
+            lambda *_args, **_kwargs: effects.append("subprocess"),
+        )
+
+        ok, output = scheduler._run_job_script(
+            str(script),
+            job={
+                "id": scheduler._F13_RETENTION_JOB_ID,
+                "script_sha256": "0" * 64,
+            },
+        )
+
+        assert ok is False
+        assert "cron_script_hash_mismatch" in output
+        assert effects == []
+
+    def test_f13_real_hostile_sitecustomize_cannot_mark_or_emit_and_wrapper_runs(
+        self, cron_env, tmp_path, monkeypatch
+    ):
+        from cron import scheduler
+
+        hostile_dir = tmp_path / "hostile-pythonpath"
+        hostile_dir.mkdir()
+        marker = tmp_path / "hostile-sitecustomize-marker"
+        (hostile_dir / "sitecustomize.py").write_text(
+            "from pathlib import Path\n"
+            f"Path({str(marker)!r}).write_text('executed', encoding='utf-8')\n"
+            "print('HOSTILE_SITECUSTOMIZE_EXECUTED')\n",
+            encoding="utf-8",
+        )
+        for key in scheduler._F13_PYTHON_STARTUP_ENV_KEYS:
+            monkeypatch.setenv(key, str(hostile_dir))
+        script = cron_env / "scripts" / scheduler._F13_RETENTION_SCRIPT_NAME
+        script.write_text("print('BENIGN_F13_WRAPPER_EXECUTED')\n", encoding="utf-8")
+
+        ok, output = scheduler._run_job_script(
+            str(script),
+            job={
+                "id": scheduler._F13_RETENTION_JOB_ID,
+                "script_sha256": hashlib.sha256(script.read_bytes()).hexdigest(),
+            },
+        )
+
+        assert ok is True
+        assert output == "BENIGN_F13_WRAPPER_EXECUTED"
+        assert "HOSTILE_SITECUSTOMIZE_EXECUTED" not in output
+        assert not marker.exists()
+
+    def test_non_f13_same_basename_preserves_existing_python_invocation_semantics(
+        self, cron_env, monkeypatch
+    ):
+        from cron import scheduler
+
+        script = cron_env / "scripts" / scheduler._F13_RETENTION_SCRIPT_NAME
+        script.write_text("print('unrelated')\n", encoding="utf-8")
+        captured = {}
+
+        def fake_run(argv, **kwargs):
+            captured["argv"] = argv
+            return subprocess.CompletedProcess(argv, 0, stdout="unrelated\n", stderr="")
+
+        monkeypatch.setattr(scheduler.subprocess, "run", fake_run)
+        ok, output = scheduler._run_job_script(
+            str(script),
+            job={
+                "id": "unrelated-job",
+                "script_sha256": hashlib.sha256(script.read_bytes()).hexdigest(),
+            },
+        )
+
+        assert ok is True
+        assert output == "unrelated"
+        assert captured["argv"][0] == sys.executable
+        assert captured["argv"][1].startswith("/proc/self/fd/")
+        assert captured["argv"][1:3] != ["-I", "-S"]
+
+    @pytest.mark.parametrize("mutation", ["hash", "mode", "hardlink", "symlink"])
+    def test_f13_interpreter_drift_blocks_before_subprocess(
+        self, cron_env, tmp_path, monkeypatch, mutation
+    ):
+        from cron import scheduler
+
+        interpreter = self._configure_interpreter(scheduler, tmp_path, monkeypatch)
+        if mutation == "hash":
+            monkeypatch.setattr(scheduler, "_F13_INTERPRETER_SHA256", "0" * 64)
+        elif mutation == "mode":
+            interpreter.chmod(0o722)
+        elif mutation == "hardlink":
+            os.link(interpreter, tmp_path / "interpreter-second-link")
+        else:
+            target = tmp_path / "interpreter-real"
+            target.write_bytes(interpreter.read_bytes())
+            target.chmod(0o700)
+            interpreter.unlink()
+            interpreter.symlink_to(target.name)
+        script = cron_env / "scripts" / "f13_growth_retention.py"
+        script.write_text("print('must-not-run')\n", encoding="utf-8")
+        effects = []
+        monkeypatch.setattr(
+            scheduler.subprocess,
+            "run",
+            lambda *_args, **_kwargs: effects.append("subprocess"),
+        )
+        ok, output = scheduler._run_job_script(
+            str(script),
+            job={
+                "id": scheduler._F13_RETENTION_JOB_ID,
+                "script_sha256": hashlib.sha256(script.read_bytes()).hexdigest(),
+            },
+        )
+        assert ok is False
+        assert "interpreter integrity" in output
+        assert effects == []
+
+    def test_f13_interpreter_path_swap_between_lstat_and_open_blocks(
+        self, cron_env, tmp_path, monkeypatch
+    ):
+        from cron import scheduler
+
+        interpreter = self._configure_interpreter(scheduler, tmp_path, monkeypatch)
+        replacement = tmp_path / "f13-python-replacement"
+        replacement.write_bytes(interpreter.read_bytes())
+        replacement.chmod(0o700)
+        script = cron_env / "scripts" / "f13_growth_retention.py"
+        script.write_text("print('must-not-run')\n", encoding="utf-8")
+        real_open = scheduler.os.open
+        swapped = {"value": False}
+
+        def hostile_open(path, flags, *args, **kwargs):
+            if Path(path) == interpreter and not swapped["value"]:
+                swapped["value"] = True
+                os.replace(replacement, interpreter)
+            return real_open(path, flags, *args, **kwargs)
+
+        effects = []
+        monkeypatch.setattr(scheduler.os, "open", hostile_open)
+        monkeypatch.setattr(
+            scheduler.subprocess,
+            "run",
+            lambda *_args, **_kwargs: effects.append("subprocess"),
+        )
+        ok, output = scheduler._run_job_script(
+            str(script),
+            job={
+                "id": scheduler._F13_RETENTION_JOB_ID,
+                "script_sha256": hashlib.sha256(script.read_bytes()).hexdigest(),
+            },
+        )
+        assert ok is False
+        assert "identity_drift" in output
+        assert effects == []
