@@ -8,7 +8,7 @@ resolution-markers = [
 ]
 
 [options]
-exclude-newer = "0001-01-01T00:00:00Z" # This has no effect and is included for backwards compatibility when using relative exclude-newer values.
+exclude-newer = "2026-08-21T03:18:16.763479978Z"
 exclude-newer-span = "P14D"
 
 [options.exclude-newer-package]
@@ -113,7 +113,7 @@ dingtalk-stream = false
 
 [manifest]
 overrides = [
-    { name = "cryptography", specifier = ">=50,<51" },
+    { name = "cryptography", specifier = "==50.0.0" },
     { name = "pynacl", specifier = ">=1.6,<1.7" },
 ]
 

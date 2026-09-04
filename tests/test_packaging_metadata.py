@@ -46,6 +46,25 @@ def test_packaging_declared_as_core_dependency():
     )
 
 
+def test_uv_overrides_do_not_broaden_exact_core_pins():
+    """An override must not make an exact direct pin internally inconsistent."""
+    data = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    exact_core = {}
+    for requirement in data["project"]["dependencies"]:
+        match = re.match(r"^([A-Za-z0-9_.-]+)(?:\[[^]]+\])?==([^,;\s]+)", requirement)
+        if match:
+            exact_core[match.group(1).lower().replace("_", "-")] = match.group(2)
+
+    for override in data.get("tool", {}).get("uv", {}).get("override-dependencies", []):
+        name = _distribution_name(override).replace("_", "-")
+        if name not in exact_core:
+            continue
+        assert override.split(";", 1)[0].strip().endswith(f"=={exact_core[name]}"), (
+            f"uv override {override!r} broadens/conflicts with the exact core pin "
+            f"{name}=={exact_core[name]}; this can make `uv pip check` reject Hermes itself"
+        )
+
+
 def test_faster_whisper_is_not_a_base_dependency():
     data = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
     deps = data["project"]["dependencies"]
