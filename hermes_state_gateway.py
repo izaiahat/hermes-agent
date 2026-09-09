@@ -578,12 +578,16 @@ class SessionGatewayMixin:
         if not backend_id:
             return
         ts = time.time() if last_heartbeat is None else float(last_heartbeat)
+        # A heartbeat is activity, not durable transcript state: it must wait the
+        # short activity patience, not the default 20s write patience, or a busy
+        # writer turns a liveness ping into a multi-second stall.
         self._write_sql(
             "INSERT INTO gateway_heartbeats (backend_id, pid, started_at, last_heartbeat, profile, host)"
             " VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(backend_id) DO UPDATE SET pid = excluded.pid,"
             " started_at = excluded.started_at, last_heartbeat = excluded.last_heartbeat,"
             " profile = excluded.profile, host = excluded.host",
-            (str(backend_id), int(pid), float(started_at), ts, str(profile), str(host)))
+            (str(backend_id), int(pid), float(started_at), ts, str(profile), str(host)),
+            patience_s=self._ACTIVITY_WRITE_PATIENCE_S)
 
     def clear_backend_heartbeat(self, backend_id: str) -> bool:
         """Remove this backend's heartbeat row (from ``atexit``); True if removed. A crashed

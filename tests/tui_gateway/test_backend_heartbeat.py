@@ -33,6 +33,25 @@ def db(tmp_path):
 
 
 class TestBackendHeartbeatRefresher:
+    def test_registration_uses_activity_write_patience(self, db, monkeypatch):
+        original = db._execute_write
+        budgets = []
+
+        def capture(fn, **kwargs):
+            budgets.append(kwargs.get("patience_s"))
+            return original(fn, **kwargs)
+
+        monkeypatch.setattr(db, "_execute_write", capture)
+        for stamp in (100.0, 280.0):
+            db.register_backend_heartbeat(
+                backend_id="patience-fixture", pid=42, started_at=100.0,
+                last_heartbeat=stamp,
+            )
+        assert budgets == [db._ACTIVITY_WRITE_PATIENCE_S] * 2
+        rows = db.list_backend_heartbeats()
+        assert len(rows) == 1
+        assert rows[0]["last_heartbeat"] == 280.0
+
     def test_first_call_registers_row_in_db(self, db, monkeypatch, tmp_path):
         from tui_gateway import server
 
