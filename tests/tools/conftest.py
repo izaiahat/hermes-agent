@@ -35,6 +35,29 @@ def _no_host_browser_use_cli():
         yield
 
 
+def write_healthy_proc_root(root) -> str:
+    """Write a /proc-shaped directory the capacity gate reads as a healthy host.
+
+    ``HERMES_PROC_ROOT`` is tools/delegation_admission.py's documented TEST SEAM
+    (a path, never a bypass flag). A test that spawns a SUBPROCESS cannot use the
+    autouse stub below, and must not depend on this machine's live swap/load —
+    so it points the child at a fixed healthy sample instead.
+    """
+    from pathlib import Path as _Path
+
+    root = _Path(root)
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "meminfo").write_text("MemTotal: 65000000 kB\nMemAvailable: 33554432 kB\n", encoding="utf-8")
+    (root / "loadavg").write_text("1.00 1.00 1.00 1/100 1\n", encoding="utf-8")
+    (root / "vmstat").write_text("pswpin 0\npswpout 0\n", encoding="utf-8")
+    pressure = root / "pressure"
+    pressure.mkdir(exist_ok=True)
+    (pressure / "memory").write_text(
+        "some avg10=0.00 avg60=0.00 avg300=0.00 total=0\n"
+        "full avg10=0.00 avg60=0.00 avg300=0.00 total=0\n", encoding="utf-8")
+    return str(root)
+
+
 @pytest.fixture(autouse=True)
 def _neutral_capacity_admission(request):
     """Keep the host's live capacity gate out of unit tests.

@@ -948,13 +948,17 @@ class SessionDB(
                         body_finished - lock_acquired,
                         committed - body_finished,
                     )
-                # Success — periodic best-effort checkpoint. FTS5's persistent
-                # automerge policy does bounded incremental maintenance on the
-                # database-global write stream, so this hot path never runs an
-                # explicit merge (and never a full optimize).
+                # Success — periodic best-effort checkpoint plus a BOUNDED merge.
+                # FTS5's persistent automerge policy does most incremental
+                # maintenance on the database-global write stream; this cadence
+                # keeps a short, page-bounded pass (never a full optimize) so a
+                # single-writer box still makes progress, and its failures stay
+                # isolated from the already-committed write.
                 self._write_count += 1
                 if self._write_count % self._CHECKPOINT_EVERY_N_WRITES == 0:
                     self._try_wal_checkpoint()
+                if self._write_count % self._FTS_MERGE_EVERY_N_WRITES == 0:
+                    self._try_incremental_merge_fts()
                 return result
             except SessionCompressionInProgressError:
                 # Transient (see _COMPRESSION_BUSY_WAIT_S): a steer landing mid-compression must not abort.

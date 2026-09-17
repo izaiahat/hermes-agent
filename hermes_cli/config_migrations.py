@@ -548,6 +548,44 @@ def _migrate_to_41(results: Dict[str, Any], quiet: bool) -> None:
 #: configs already AT v12 still get every step below; only configs BELOW 12 are refused by the
 #: floor gate in run_migrations()'s caller. Versions absent here (15, 18-20, 22, 24, 26-28, 30)
 #: only added a schema default that runtime merging supplies without a write.
+
+def _migrate_to_45(results: Dict[str, Any], quiet: bool) -> None:
+    """Split direct width from background-batch and tree-wide admission caps.
+
+    Slot 40 (this change's original number) is taken upstream by the
+    model_catalog ttl rewrite, so the same migration lands at 45.
+    """
+    _c = _cfg()
+    config = _c.read_raw_config()
+    raw_deleg = config.get("delegation")
+    if not isinstance(raw_deleg, dict):
+        return
+
+    touched = False
+    added: list[str] = []
+    if "max_background_batches" not in raw_deleg:
+        raw_deleg["max_background_batches"] = 1
+        touched = True
+        added.append("delegation.max_background_batches=1")
+    if "max_total_descendants" not in raw_deleg:
+        try:
+            width = int(raw_deleg.get("max_concurrent_children", 5) or 5)
+        except (TypeError, ValueError):
+            width = 5
+        total = min(5, max(1, width))
+        raw_deleg["max_total_descendants"] = total
+        touched = True
+        added.append(f"delegation.max_total_descendants={total}")
+
+    if not touched:
+        return
+    config["delegation"] = raw_deleg
+    _c._persist_migration(config)
+    results["config_added"].extend(added)
+    if not quiet:
+        print("  ✓ Added bounded delegation background/tree admission defaults.")
+
+
 MIGRATIONS: Tuple[Tuple[int, Callable[[Dict[str, Any], bool], None]], ...] = (
     (12, _migrate_to_12),
     (13, _migrate_to_13),
@@ -660,6 +698,7 @@ MIGRATIONS: Tuple[Tuple[int, Callable[[Dict[str, Any], bool], None]], ...] = (
         message=(
             "  ✓ curator.archive_after_days 90→30 — skills unused for a month are archived to "
             "skills/.archive/ (recoverable with `hermes curator restore`). Set it back to 90 to keep the old window."))),
+    (45, _migrate_to_45),
 )
 
 

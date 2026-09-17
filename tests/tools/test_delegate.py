@@ -88,7 +88,9 @@ class TestDelegateRequirements(unittest.TestCase):
         self.assertNotIn("acp_args", props)
         self.assertNotIn("acp_command", props["tasks"]["items"]["properties"])
         self.assertNotIn("acp_args", props["tasks"]["items"]["properties"])
-        self.assertEqual(props["tasks"]["maxItems"], 5)
+        # Operator 2026-09-16 raised the hard width ceiling from 5 to 8
+        # (OPERATOR-DECISION-20260916-delegation-width-8.json).
+        self.assertEqual(props["tasks"]["maxItems"], 8)
 
     def test_top_level_description_compact_and_complete(self):
         """The top-level description must stay compact while keeping every
@@ -1782,7 +1784,14 @@ class TestDelegationReasoningEffort(unittest.TestCase):
     @patch("tools.delegate_tool._load_config")
     @patch("run_agent.AIAgent")
     def test_child_does_not_inherit_parent_priority_service_tier(self, MockAgent, mock_cfg):
-        """Delegated/background children stay on the standard non-fast tier."""
+        """Delegated/background children stay on the normal (non-fast) tier.
+
+        v2026.9.14's agent/fast_mode.py defines the vocabulary as ``None``
+        (normal) or ``"priority"`` (static fast); the pre-rebase literal
+        ``"standard"`` is not a value this runtime recognises, so the assertion
+        is that the child is NOT on priority rather than that it carries a
+        retired label.
+        """
         mock_cfg.return_value = {"max_iterations": 50, "reasoning_effort": ""}
         MockAgent.return_value = MagicMock()
         parent = _make_mock_parent()
@@ -1796,7 +1805,7 @@ class TestDelegationReasoningEffort(unittest.TestCase):
         )
 
         call_kwargs = MockAgent.call_args[1]
-        self.assertEqual(call_kwargs["service_tier"], "standard")
+        self.assertNotEqual(call_kwargs.get("service_tier"), "priority")
         self.assertNotIn("service_tier", call_kwargs["request_overrides"])
         self.assertNotIn("speed", call_kwargs["request_overrides"])
 

@@ -849,6 +849,17 @@ def _dispatch(
     return {"status": "dispatched", "delegation_id": delegation_id}
 
 
+def _detached_admission_cap(requested: int) -> int:
+    """The hard detached-batch cap, never the caller's larger request."""
+    try:
+        from tools.delegate_tool import _get_max_background_batches
+
+        cap = int(_get_max_background_batches())
+    except Exception:
+        cap = 1
+    return max(1, min(int(requested or 1), cap))
+
+
 def dispatch_async_delegation(
     *, goal: str, context: Optional[str], toolsets: Optional[List[str]], role: str, model: Optional[str],
     session_key: str, parent_session_id: Optional[str] = None, runner: Callable[[], Dict[str, Any]],
@@ -859,8 +870,14 @@ def dispatch_async_delegation(
     ``session_key``/``parent_session_id`` are captured on the parent thread (the worker carries
     no contextvars) and route the completion back to the spawning session.
     ``progress_fn() -> (token, in_tool)`` enables stale monitoring; omitted = unmonitored.
-    Returns ``{"status": "dispatched", "delegation_id"}`` or ``{"status": "rejected", "error"}``."""
+    Returns ``{"status": "dispatched", "delegation_id"}`` or ``{"status": "rejected", "error"}``.
+
+    ``max_async_children`` is a backward-compatible caller HINT only: detached
+    admission is hard-capped at ``delegation.max_background_batches`` (one), because
+    a detached batch outlives the turn that launched it and nobody is watching it.
+    """
     delegation_id = _new_delegation_id()
+    max_async_children = _detached_admission_cap(max_async_children)
     handle = _dispatch(
         delegation_id=delegation_id, goal=goal, goals=None, context=context,
         toolsets=toolsets, role=role, model=model, session_key=session_key,

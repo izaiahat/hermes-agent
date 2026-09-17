@@ -1496,6 +1496,15 @@ def _parse_compression_config(agent, _agent_cfg) -> CompressionSettings:
         codex_responses_native=responses_native,
         codex_responses_compact_threshold=compact_threshold,
         idle_compact_after_seconds=idle_compact_after_seconds,
+        # Tool-output retention: archive substantial OLD tool payloads to disk
+        # (leaving a readable pointer) before a lossy compaction is needed.
+        tool_output_retention_enabled=is_truthy_value(cfg.get("tool_output_retention_enabled", True)),
+        tool_output_retention_turns=_parse_config_int(cfg.get("tool_output_retention_turns"), 10),
+        tool_output_retention_min_chars=_parse_config_int(cfg.get("tool_output_retention_min_chars"), 200),
+        tool_output_retention_max_inline_chars=_parse_config_int(
+            cfg.get("tool_output_retention_max_inline_chars"), 200_000),
+        tool_output_retention_min_inline_results=_parse_config_int(
+            cfg.get("tool_output_retention_min_inline_results"), 5),
     )
 
 
@@ -1881,6 +1890,11 @@ def _build_context_engine(agent, _agent_cfg, cs, _custom_providers, _effective_c
     )
     agent.max_compression_attempts = cs.max_attempts
     agent.compression_idle_compact_after_seconds = cs.idle_compact_after_seconds
+    agent._tool_output_retention_enabled = cs.tool_output_retention_enabled
+    agent._tool_output_retention_turns = cs.tool_output_retention_turns
+    agent._tool_output_retention_min_chars = cs.tool_output_retention_min_chars
+    agent._tool_output_retention_max_inline_chars = cs.tool_output_retention_max_inline_chars
+    agent._tool_output_retention_min_inline_results = cs.tool_output_retention_min_inline_results
 
 
 def _enforce_minimum_context(agent):

@@ -949,7 +949,10 @@ class TestConfigSupportFloor:
         "agent": {"verify_on_stop": False},
         "auxiliary": {"compression": {"model": "gpt-x"}},
         "compression": {},
-        "delegation": {"max_concurrent_children": 8},
+        # The v45 admission-split migration materialises the tree-wide descendant
+        # cap. max_background_batches is NOT listed: the migration writes 1, which
+        # equals the shipped default, so normalisation keeps it out of the raw file.
+        "delegation": {"max_concurrent_children": 8, "max_total_descendants": 5},
         "display": {
             "platforms": {"telegram": {"tool_progress": "verbose"}},
             "tool_progress_overrides": {"telegram": "verbose"},
@@ -1738,6 +1741,9 @@ class TestBackgroundNotificationsConciseMigration:
         assert DEFAULT_CONFIG["display"]["background_process_notifications"] == "concise"
 
 class TestDelegationAdmissionSplitMigration:
+    """Slot 40 is taken upstream by the model_catalog ttl rewrite, so this
+    fork migration lands at 45; the behaviour it asserts is unchanged."""
+
     """v39 → v40: separate batch, background-batch, and tree budgets."""
 
     @staticmethod
@@ -1745,13 +1751,13 @@ class TestDelegationAdmissionSplitMigration:
         (tmp_path / "config.yaml").write_text(content, encoding="utf-8")
 
     def test_v39_adds_safe_background_and_tree_defaults(self):
-        from hermes_cli.config_migrations import _migrate_to_40
+        from hermes_cli.config_migrations import _migrate_to_45
 
         config = {"delegation": {"max_concurrent_children": 5}}
         cfg = MagicMock()
         cfg.read_raw_config.return_value = config
         with patch("hermes_cli.config_migrations._cfg", return_value=cfg):
-            _migrate_to_40({"config_added": []}, quiet=True)
+            _migrate_to_45({"config_added": []}, quiet=True)
 
         assert config["delegation"]["max_concurrent_children"] == 5
         assert config["delegation"]["max_background_batches"] == 1
@@ -1759,7 +1765,7 @@ class TestDelegationAdmissionSplitMigration:
         cfg._persist_migration.assert_called_once_with(config)
 
     def test_v39_preserves_explicit_new_caps(self):
-        from hermes_cli.config_migrations import _migrate_to_40
+        from hermes_cli.config_migrations import _migrate_to_45
 
         config = {
             "delegation": {
@@ -1771,20 +1777,20 @@ class TestDelegationAdmissionSplitMigration:
         cfg = MagicMock()
         cfg.read_raw_config.return_value = config
         with patch("hermes_cli.config_migrations._cfg", return_value=cfg):
-            _migrate_to_40({"config_added": []}, quiet=True)
+            _migrate_to_45({"config_added": []}, quiet=True)
 
         assert config["delegation"]["max_background_batches"] == 2
         assert config["delegation"]["max_total_descendants"] == 7
         cfg._persist_migration.assert_not_called()
 
     def test_v39_invalid_width_falls_back_to_five(self):
-        from hermes_cli.config_migrations import _migrate_to_40
+        from hermes_cli.config_migrations import _migrate_to_45
 
         config = {"delegation": {"max_concurrent_children": "invalid"}}
         cfg = MagicMock()
         cfg.read_raw_config.return_value = config
         with patch("hermes_cli.config_migrations._cfg", return_value=cfg):
-            _migrate_to_40({"config_added": []}, quiet=True)
+            _migrate_to_45({"config_added": []}, quiet=True)
 
         assert config["delegation"]["max_background_batches"] == 1
         assert config["delegation"]["max_total_descendants"] == 5

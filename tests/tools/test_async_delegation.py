@@ -528,7 +528,12 @@ def test_in_tool_stall_uses_higher_threshold(monkeypatch):
 def test_real_process_restart_restores_owned_completion_once(tmp_path):
     """Real-import E2E: a fresh interpreter restores a prior process's result."""
     repo = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
-    env = {**os.environ, "HERMES_HOME": str(tmp_path), "PYTHONPATH": repo}
+    from tests.tools.conftest import write_healthy_proc_root
+
+    # The gate is live inside a spawned child; pin it to a healthy /proc sample so
+    # this machine's real swap/load cannot fail an unrelated assertion.
+    env = {**os.environ, "HERMES_HOME": str(tmp_path), "PYTHONPATH": repo,
+           "HERMES_PROC_ROOT": write_healthy_proc_root(tmp_path / "proc")}
     producer = r'''
 import time
 from tools import async_delegation as ad
@@ -781,8 +786,10 @@ def test_unsupported_or_failed_async_delivery_runs_synchronously(
     monkeypatch.setattr(
         dt,
         "_run_single_child",
+        # v2026.9.14's dispatcher calls _run_single_child with KEYWORDS
+        # (task_index=..., goal=..., child=...), so read the index from either.
         lambda *args, **kwargs: {
-            "task_index": args[0],
+            "task_index": kwargs.get("task_index", args[0] if args else 0),
             "status": "completed",
             "summary": "sync fallback completed",
             "api_calls": 1,
@@ -1159,7 +1166,12 @@ def test_child_finished_before_crash_is_recovered_with_its_result(tmp_path):
     """Real-import E2E: a 2-task group unit whose owner dies mid-run replays the finished child's real result
     and marks only the unfinished sibling unknown — a crash costs the stragglers, never the finished work."""
     repo = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
-    env = {**os.environ, "HERMES_HOME": str(tmp_path), "PYTHONPATH": repo}
+    from tests.tools.conftest import write_healthy_proc_root
+
+    # The gate is live inside a spawned child; pin it to a healthy /proc sample so
+    # this machine's real swap/load cannot fail an unrelated assertion.
+    env = {**os.environ, "HERMES_HOME": str(tmp_path), "PYTHONPATH": repo,
+           "HERMES_PROC_ROOT": write_healthy_proc_root(tmp_path / "proc")}
     producer = r'''
 import os, sys, time
 from unittest.mock import MagicMock

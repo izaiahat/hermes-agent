@@ -493,7 +493,8 @@ class SessionMessagesMixin:
         return inserted, tool_calls_total
 
     def replace_messages(self, session_id: str, messages: List[Dict[str, Any]], active_only: bool = False,
-        archive_dropped: bool = False, reject_active_turn_lease: bool = False) -> None:
+        archive_dropped: bool = False, reject_active_turn_lease: bool = False,
+        expected_active_revision: Optional[Tuple[int, int]] = None) -> bool:
         """Atomically replace a session's messages (/retry, /undo, /compress). DESTRUCTIVE by default (rows
         DELETEd, leave FTS). ``active_only`` spares soft-archived rows (needed with in-place compaction).
         ``archive_dropped`` SOFT-archives live rows rewind-style: what rewind/edit/regenerate must use, since
@@ -511,6 +512,15 @@ class SessionMessagesMixin:
         """
         from hermes_state_errors import CompressionSessionClosedError
         def _do(conn):
+            if expected_active_revision is not None:
+                # CAS: refuse a destructive rewrite of a transcript that moved since
+                # the caller loaded it. Returning False (not raising) lets the caller
+                # simply skip the optimisation rather than fail the turn.
+                row = conn.execute(
+                    "SELECT COUNT(*) AS n, COALESCE(MAX(id), 0) AS max_id "
+                    "FROM messages WHERE session_id = ? AND active = 1", (session_id,)).fetchone()
+                if (int(row["n"]), int(row["max_id"])) != tuple(expected_active_revision):
+                    return False
             if reject_active_turn_lease:
                 self._check_transcript_write_guards(
                     conn, session_id, None, reject_active_turn_lease=True, reject_active_compression_lock=True)
@@ -524,7 +534,8 @@ class SessionMessagesMixin:
             conn.execute(_RESET_COUNTERS_SQL, (session_id,))
             total_messages, total_tool_calls = self._insert_message_rows(conn, session_id, messages)
             conn.execute(f"{_SET_COUNTERS_SQL} WHERE id = ?", (total_messages, total_tool_calls, session_id))
-        self._execute_write(_do)
+            return True
+        return bool(self._execute_write(_do))
 
     def has_archived_messages(self, session_id: str) -> bool:
         """True if the session has any soft-archived (``active = 0``) rows (tests/diagnostics).
@@ -535,6 +546,43 @@ class SessionMessagesMixin:
         """
         return self._read_one(
             "SELECT 1 FROM messages WHERE session_id = ? AND active = 0 LIMIT 1", (session_id,)) is not None
+
+    def get_active_message_revision(self, session_id: str) -> Tuple[int, int]:
+        """A cheap CAS revision for the live transcript.
+
+        ``(active_row_count, max_active_row_id)`` changes on append, rewind or
+        replacement. Tool-output retention uses it to prove the transcript it
+        loaded is still current before a destructive rewrite.
+        """
+        row = self._read_one(
+            "SELECT COUNT(*), COALESCE(MAX(id), 0) FROM messages WHERE session_id = ? AND active = 1",
+            (session_id,))
+        return (int(row[0]), int(row[1])) if row else (0, 0)
+
+
+    def get_messages_as_conversation_snapshot(
+        self,
+        session_id: str,
+        *,
+        max_attempts: int = 3,
+    ) -> Tuple[List[Dict[str, Any]], Tuple[int, int]]:
+        """Load a stable active transcript plus its compare-and-swap revision.
+
+        The revision-before/load/revision-after loop avoids holding a read
+        transaction across the relatively expensive replay conversion while
+        still detecting cross-process appends or rewrites. A continuously busy
+        session fails closed instead of returning a stale snapshot.
+        """
+        attempts = max(1, int(max_attempts))
+        for _ in range(attempts):
+            before = self.get_active_message_revision(session_id)
+            messages = self.get_messages_as_conversation(session_id)
+            after = self.get_active_message_revision(session_id)
+            if before == after:
+                return messages, after
+        raise RuntimeError(
+            f"active transcript changed while loading session {session_id}"
+        )
 
     def get_active_message_watermark(self, session_id: str) -> int:
         """MAX(id) of the active rows (0 if none), captured at compression START: every active row above it

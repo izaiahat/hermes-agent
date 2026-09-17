@@ -11,7 +11,9 @@ import sqlite3
 import re
 import time
 import uuid
+import os
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from agent.auxiliary_client import (
@@ -955,6 +957,214 @@ def _collect_protected_skill_names(messages: List[Dict[str, Any]], prune_boundar
     }
 
 
+# Gateway/turn retention defaults. Independent of the compression tail budget:
+# old tool payloads should leave live context BEFORE they can force a lossy
+# conversation compaction. Upstream's placeholder path deletes the content;
+# this archives it to disk and leaves a readable pointer instead.
+DEFAULT_TOOL_OUTPUT_RETENTION_TURNS = 10
+DEFAULT_TOOL_OUTPUT_RETENTION_MIN_CHARS = 200
+DEFAULT_TOOL_OUTPUT_RETENTION_MAX_INLINE_CHARS = 200_000
+DEFAULT_TOOL_OUTPUT_RETENTION_MIN_INLINE_RESULTS = 5
+
+
+
+def spill_old_tool_outputs(
+    messages: List[Dict[str, Any]],
+    *,
+    session_id: str,
+    spill_root: Optional[Path] = None,
+    keep_recent_turns: int = DEFAULT_TOOL_OUTPUT_RETENTION_TURNS,
+    min_chars: int = DEFAULT_TOOL_OUTPUT_RETENTION_MIN_CHARS,
+    max_inline_chars: int = DEFAULT_TOOL_OUTPUT_RETENTION_MAX_INLINE_CHARS,
+    min_inline_results: int = DEFAULT_TOOL_OUTPUT_RETENTION_MIN_INLINE_RESULTS,
+) -> tuple[List[Dict[str, Any]], int, List[str]]:
+    """Archive substantial old tool outputs and replace them with pointers.
+
+    A turn is anchored by a user-role message. Tool outputs older than
+    ``keep_recent_turns`` are archived. Recent turns are also bounded by
+    ``max_inline_chars`` so one tool-heavy operator turn cannot force another
+    lossy compaction; the newest ``min_inline_results`` substantial outputs are
+    always retained. Archived strings are written under
+    ``~/.hermes/session-spills/<session>/`` with mode 0600 and replaced by an
+    absolute path plus a one-line summary. The caller owns persistence of the
+    returned transcript.
+
+    The pass is deterministic and idempotent: pointer rows are ignored and a
+    content-addressed archive file is reused for duplicate payloads. Small
+    results remain inline because archiving them would cost more than it saves.
+    """
+    if not messages or keep_recent_turns < 0:
+        return messages, 0, []
+
+    user_indices = [
+        index for index, message in enumerate(messages)
+        if isinstance(message, dict) and message.get("role") == "user"
+    ]
+    prune_boundary = (
+        len(messages)
+        if keep_recent_turns == 0
+        else user_indices[-keep_recent_turns]
+        if len(user_indices) > keep_recent_turns
+        else 0
+    )
+
+    call_id_to_tool: Dict[str, tuple[str, str]] = {}
+    for message in messages:
+        if not isinstance(message, dict) or message.get("role") != "assistant":
+            continue
+        for tool_call in message.get("tool_calls") or []:
+            if not isinstance(tool_call, dict):
+                continue
+            function = tool_call.get("function") or {}
+            call_id_to_tool[str(tool_call.get("id") or "")] = (
+                str(function.get("name") or "unknown"),
+                str(function.get("arguments") or ""),
+            )
+
+    if spill_root is None:
+        try:
+            from hermes_constants import get_hermes_home
+
+            spill_root = Path(get_hermes_home()) / "session-spills"
+        except Exception:
+            spill_root = Path.home() / ".hermes" / "session-spills"
+
+    safe_session = re.sub(r"[^A-Za-z0-9_.-]+", "_", session_id or "unknown")[:120]
+    session_dir = Path(spill_root).expanduser() / safe_session
+    result = [message.copy() if isinstance(message, dict) else message for message in messages]
+    archived_paths: List[str] = []
+    archived_count = 0
+
+    # A single operator turn can emit hundreds of tool rows. Preserve the newest
+    # few substantial results, then keep additional recent results only while
+    # they fit in the inline character budget.
+    force_archive: set[int] = set()
+    if max_inline_chars >= 0:
+        inline_chars = 0
+        inline_results = 0
+        for index in range(len(result) - 1, -1, -1):
+            message = result[index]
+            if not isinstance(message, dict) or message.get("role") != "tool":
+                continue
+            content = message.get("content")
+            if (
+                not isinstance(content, str)
+                or len(content) <= max(0, min_chars)
+                or content.startswith("[Old tool output archived at ")
+            ):
+                continue
+            if inline_results < max(0, min_inline_results):
+                inline_results += 1
+                inline_chars += len(content)
+                continue
+            if inline_chars + len(content) > max_inline_chars:
+                force_archive.add(index)
+            else:
+                inline_results += 1
+                inline_chars += len(content)
+
+    archive_candidates = set(range(prune_boundary)) | force_archive
+    if not archive_candidates:
+        return messages, 0, []
+    for index in sorted(archive_candidates):
+        message = result[index]
+        if not isinstance(message, dict) or message.get("role") != "tool":
+            continue
+        content = message.get("content")
+        if not isinstance(content, str) or len(content) <= max(0, min_chars):
+            continue
+        if content.startswith("[Old tool output archived at "):
+            continue
+
+        call_id = str(message.get("tool_call_id") or "")
+        tool_name, tool_args = call_id_to_tool.get(call_id, ("unknown", ""))
+        digest = hashlib.sha256(content.encode("utf-8", errors="replace")).hexdigest()[:16]
+        safe_tool = re.sub(r"[^A-Za-z0-9_.-]+", "_", tool_name)[:48] or "unknown"
+        archive_path = session_dir / f"{index:05d}-{safe_tool}-{digest}.txt"
+
+        try:
+            session_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+            try:
+                os.chmod(session_dir, 0o700)
+            except OSError:
+                pass
+            if not archive_path.exists():
+                archive_path.write_text(content, encoding="utf-8")
+            try:
+                os.chmod(archive_path, 0o600)
+            except OSError:
+                pass
+        except OSError as exc:
+            logger.warning("Tool-output archive write failed for %s: %s", archive_path, exc)
+            continue
+
+        summary = _summarize_tool_result(tool_name, tool_args, content)
+        pointer = str(archive_path.resolve())
+        result[index] = {
+            **message,
+            "content": f"[Old tool output archived at {pointer}] {summary}",
+        }
+        archived_paths.append(pointer)
+        archived_count += 1
+
+    return result, archived_count, archived_paths
+
+# Hard ceiling for the deterministic summary-failure handoff.  The fallback is
+# only meant to preserve continuity anchors from the dropped window, not to
+# become another unbounded transcript copy after the LLM summarizer failed.
+_FALLBACK_SUMMARY_MAX_CHARS = 8_000
+_FALLBACK_PREVIOUS_SUMMARY_MAX_CHARS = 3_000
+_FALLBACK_TURN_MAX_CHARS = 700
+_AUTO_FOCUS_MAX_TURNS = 3
+_AUTO_FOCUS_TURN_MAX_CHARS = 260
+_AUTO_FOCUS_MAX_CHARS = 700
+_ACTIVE_TASK_MAX_CHARS = 1400
+# Keep a short run of recent messages verbatim even when the token budget is
+# already exhausted.  The public ``protect_last_n`` default is intentionally
+# high for small/light tails, but using all 20 as a hard floor here would bring
+# back the old large-tool-output case where nothing can be compacted.
+_MAX_TAIL_MESSAGE_FLOOR = 8
+
+# Pre-LLM feasibility skip (#60451): when the compressible middle is below
+# this fraction of threshold_tokens (and a prior real-usage ineffectiveness
+# strike exists), skip the LLM summary call — deterministic dropping alone
+# recovers the negligible savings such a summary could deliver.
+_FEASIBILITY_SKIP_MIDDLE_FRACTION = 0.10
+# Under context pressure (protected-tail tool bodies alone exceed the soft
+# tail budget), demote large completed tool/file outputs even inside the
+# protected region — but always keep this many trailing messages verbatim so
+# the active user ask / latest tool pair remain readable.  Issue #61932.
+_PRESSURE_KEEP_RECENT_MESSAGES = 3
+# Native vision_analyze / computer_use screenshots that sit inside the
+# protected tail cannot be demoted by pass 2, so they ride every later
+# request until anti-thrash disables compression (#92699).  Keep this many
+# newest image-bearing tool results verbatim; retire older image payloads
+# even when they fall inside ``protect_last_n``.  Matches the Anthropic
+# adapter's outbound keep-window.
+_MAX_KEEP_TOOL_IMAGES = 3
+
+# Models with context windows below this get their compression threshold
+# floored at ``_SMALL_CTX_THRESHOLD_PERCENT`` (raise-only — an explicitly
+# higher user/model threshold always wins).  At the default 50% trigger a
+# 128K-262K model compacts with only ~64-131K consumed; the incompressible
+# floor (system prompt + tool schemas + protected tail + rolling summary)
+# eats most of the reclaimed headroom, so compaction re-fires every 1-2
+# turns and the session spends most of its wall-clock summarizing.
+_SMALL_CTX_WINDOW_LIMIT = 512_000
+_SMALL_CTX_THRESHOLD_PERCENT = 0.75
+
+
+_PATH_MENTION_RE = re.compile(r"(?:/|~/?|[A-Za-z]:\\)[^\s`'\")\]}<>]+")
+
+# MEDIA delivery directives must not reach the summarizer — if one leaks into
+# the summary, the downstream model may re-emit it as an active directive on
+# the next turn, triggering bogus attachment sends (#14665).
+_MEDIA_DIRECTIVE_RE = re.compile(r"MEDIA:\S+")
+_HISTORICAL_TASK_SECTION_RE = re.compile(
+    rf"(?ms)^{re.escape(HISTORICAL_TASK_HEADING)}\s*\n.*?(?=^## |\Z)"
+)
+
+
 _CHARS_PER_TOKEN = CHARS_PER_TOKEN
 _SUMMARY_FAILURE_COOLDOWN_SECONDS = 600
 
@@ -1870,6 +2080,7 @@ class ContextCompressor(SummaryDispatchMixin, MicroCompactionMixin, ContextEngin
         # A handoff may carry role="user" only for alternation, so role alone can't prove a human turn existed.
         self._previous_summary = self._summary_has_user_turn = self._last_summary_error = None
         self._last_aux_model_failure_error = self._last_aux_model_failure_model = None
+        self._summary_force_main_model = False
         self._consecutive_timeout_failures = 0
         # Turns unrecoverably dropped by a static fallback, so callers can warn.
         self._last_summary_dropped_count = 0
@@ -3215,6 +3426,10 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
             telemetry["fallback_used"] = True
             telemetry["failure_class"] = telemetry.get("failure_class") or "aux_model_fallback"
         self.summary_model = ""  # empty = use main model
+        # Clearing summary_model is NOT enough: call_llm(task="compression") would
+        # still apply the auxiliary.compression.* provider/model config. Force the
+        # LIVE main route for the retry.
+        self._summary_force_main_model = True
         self._clear_compression_failure_cooldown()  # no cooldown — retry immediately
 
     def _call_summary_llm(self, prompt: str, prompt_started_at: float) -> str:
@@ -3233,7 +3448,17 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
             # NO max_tokens: Anthropic/NIM wires forward it and a hard cap truncates summaries
             # (thinking models burn it on reasoning). Timeout comes from call_llm config.
         }
-        if self.summary_model:
+        if getattr(self, "_summary_force_main_model", False):
+            # Bypass auxiliary.compression.* entirely and use the live main model.
+            if self.provider:
+                call_kwargs["provider"] = self.provider
+            call_kwargs["model"] = self.model
+            if (self.provider or "").startswith("custom"):
+                if self.base_url:
+                    call_kwargs["base_url"] = self.base_url
+                if self.api_key:
+                    call_kwargs["api_key"] = self.api_key
+        elif self.summary_model:
             call_kwargs["model"] = self.summary_model
         # Pinned route (stall fallback) overrides task routing so the retry leaves the stalled backend.
         call_kwargs.update(_pinned_summary_call_kwargs())
@@ -3342,6 +3567,7 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
             self._previous_summary = summary
             self._clear_compression_failure_cooldown()
             self._summary_model_fallen_back = False
+            self._summary_force_main_model = False
             self._last_summary_error = None
             for flag, _class, _msg in _TERMINAL_SUMMARY_FAILURES:
                 setattr(self, flag, False)

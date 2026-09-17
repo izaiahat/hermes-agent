@@ -136,6 +136,16 @@ def run_turn_start_compaction(
         conversation_history=conversation_history, current_turn_user_idx=current_turn_user_idx,
     )
     _idle_compaction(agent, out, system_message, user_message, effective_task_id)
+    # Archive substantial OLD tool payloads to disk (leaving a pointer) before the
+    # threshold check, so a tool-heavy turn does not force a lossy compaction.
+    try:
+        from agent.turn_context import apply_tool_output_retention
+
+        apply_tool_output_retention(agent, out.messages)
+    except (TypeError, ValueError):
+        logger.debug("tool-output retention skipped on malformed transcript", exc_info=True)
+    except Exception:
+        logger.debug("tool-output retention pass failed", exc_info=True)
     _preflight_compression(agent, out, system_message, user_message, effective_task_id)
     return out
 

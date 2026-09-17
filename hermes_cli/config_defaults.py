@@ -557,6 +557,11 @@ DEFAULT_CONFIG = {
         # `protect_last_n`. Built-in compressor only. Each committed prune rewrites sent history and
         # breaks the prompt-cache prefix — the min_reclaim gate below keeps those breaks episodic.
         "proactive_prune_tokens": 0,
+        "tool_output_retention_enabled": True,
+        "tool_output_retention_turns": 10,
+        "tool_output_retention_min_chars": 200,
+        "tool_output_retention_max_inline_chars": 200000,
+        "tool_output_retention_min_inline_results": 5,
         # Prune's summarize pass only touches tool results larger than this (chars); clamped >= 200
         # so a generated summary can't be re-summarized.
         "proactive_prune_min_result_chars": 8000,
@@ -2417,7 +2422,7 @@ DEFAULT_CONFIG = {
         # Extra ports detection probes for an external llama-server (besides 8080).
         "detect_ports": [],
     },
-    "_config_version": 44,  # Config schema version - bump this when adding new required fields
+    "_config_version": 45,  # Config schema version - bump this when adding new required fields
 }
 
 

@@ -367,6 +367,30 @@ def _run_single_child(
         run.cleanup(heartbeat=heartbeat, child_pool=child_pool, leased_cred_id=leased_cred_id, close_deferred=_child_close_deferred)
 
 
+
+def _release_partial_children(parent_agent) -> None:
+    """Close and untrack children built before a failed construction.
+
+    A half-built batch must leave no agent in ``parent._active_children``: the
+    parent would otherwise count children that can never run against its own
+    budget for the rest of the session.
+    """
+    tracked = getattr(parent_agent, "_active_children", None)
+    if not isinstance(tracked, list):
+        return
+    lock = getattr(parent_agent, "_active_children_lock", None)
+    if lock is not None:
+        with lock:
+            taken, tracked[:] = list(tracked), []
+    else:
+        taken, tracked[:] = list(tracked), []
+    for child in taken:
+        with suppress(Exception):
+            close = getattr(child, "close", None)
+            if callable(close):
+                close()
+
+
 def _build_children(
     task_list: List[Dict[str, Any]], task_schemas: List[Optional[Dict[str, Any]]], creds: Dict[str, Any], *,
     top_role: str, max_iterations: int, parent_agent, routing_cfg: Dict[str, Any],
@@ -525,36 +549,38 @@ def delegate_task(
     _announce_batch(parent_agent, len(task_list), live_deleg_id)
     origin = _capture_origin()
 
-    children, err = _build_children(
-        task_list, task_schemas, creds, top_role=top_role, max_iterations=default_max_iter, parent_agent=parent_agent,
-        routing_cfg=routing_cfg, live_deleg_id=live_deleg_id, live_writers=live_writers, task_images=task_images,
-    )
-    if err:
-        return tool_error(err)
-    # Atomic descendant admission: reserve one lease per child BEFORE any child
-    # runs, so a burst of concurrent delegate_task calls cannot each individually
-    # pass a per-call width check and jointly exceed the box's total budget.
-    # A Codex-backed child consumes a slot of the SHARED subscription, not just a
-    # process-local one, so its admission must also pass the host-wide gate.
+    # Atomic descendant admission BEFORE any child is constructed: reserve one
+    # lease per requested child so a burst of concurrent delegate_task calls
+    # cannot each pass its own per-call width check and jointly exceed the box's
+    # total budget. Rejecting here means no child ran, so nothing needs undoing.
+    # A Codex-backed child also consumes a slot of the SHARED subscription, so it
+    # must pass the host-wide gate too.
     leases, active_before, limit = _try_reserve_descendants(
         len(task_list), use_global_codex_gate=_delegation_uses_codex(parent_agent))
     if leases is None:
-        for child in children or []:
-            with suppress(Exception):
-                close = getattr(child, "close", None)
-                if callable(close):
-                    close()
         return tool_error(
             f"delegation refused: {len(task_list)} more children would exceed the active-descendant "
-            f"budget ({active_before} active, limit {limit}). Wait for running children or raise "
-            "delegation.max_total_descendants."
+            f"budget ({active_before} active, limit {limit}) — no child ran. Wait for running children "
+            "or raise delegation.max_total_descendants."
         )
     try:
+        children, err = _build_children(
+            task_list, task_schemas, creds, top_role=top_role, max_iterations=default_max_iter,
+            parent_agent=parent_agent, routing_cfg=routing_cfg, live_deleg_id=live_deleg_id,
+            live_writers=live_writers, task_images=task_images,
+        )
+        if err:
+            return tool_error(err)
         batch = _Batch(
             task_list, children, parent_agent, creds, context, top_role, max_children,
             live_deleg_id, live_writers, live_paths, *origin, overall_start,
         )
         return _run_batch(batch, background)
+    except BaseException:
+        # Construction died partway: close and untrack every child that WAS built,
+        # or the parent keeps tracking agents that will never run.
+        _release_partial_children(parent_agent)
+        raise
     finally:
         for lease in leases:
             lease.release()
@@ -673,11 +699,13 @@ DELEGATE_TASK_SCHEMA = {
         "properties": {
             # The handler also accepts the legacy single-goal shape (top-level `goal`/`context`/`output_schema`),
             # wrapped into a one-entry batch at dispatch, and a per-task `role` (legacy, ignored: capability is
-            # depth-derived). Both unadvertised on purpose (old transcripts only); do not re-add. No maxItems — the
-            # runtime limit (delegation.max_concurrent_children) is enforced with a clear error in delegate_task().
+            # depth-derived). Both unadvertised on purpose (old transcripts only); do not re-add.
+            # maxItems advertises the hard width ceiling so the model sizes its batch
+            # correctly instead of learning it from a refusal (operator 2026-09-16).
             "tasks": {
                 "type": "array",
                 "minItems": 1,
+                "maxItems": _get_max_concurrent_children(),
                 "items": {
                     "type": "object",
                     "properties": {

@@ -390,7 +390,7 @@ def _save_usage_strict(data: Dict[str, Dict[str, Any]]) -> None:
     try:
         atomic_write_text(path, json.dumps(data, indent=2, sort_keys=True, ensure_ascii=False), tmp_prefix=".usage_")
     except Exception as exc:
-        raise UsagePersistenceError(f"could not persist {path}: {exc}") from exc
+        raise UsagePersistenceError(f"failed to persist {path}: {exc}") from exc
 
 
 def save_usage(data: Dict[str, Dict[str, Any]]) -> bool:
@@ -618,6 +618,12 @@ def _relocate(src: Path, dest: Path, skill_name: str, action: str, **capture_kwa
 
 
 def archive_skill(skill_name: str) -> Tuple[bool, str]:
+    """Serialize this lifecycle transition against repair/archive in any process."""
+    with _lifecycle_lock():
+        return _archive_skill_locked(skill_name)
+
+
+def _archive_skill_locked(skill_name: str) -> Tuple[bool, str]:
     """Move a curator-eligible skill dir to ``.archive/`` (flattened; timestamp suffix on collision). Never hub;
     bundled built-ins only with ``curator.prune_builtins`` (and then suppressed from re-seeding)."""
     skill_dir = _find_skill_dir(skill_name)
@@ -679,6 +685,12 @@ def _find_archived_skill_candidates(skill_name: str) -> List[Path]:
 
 
 def restore_skill(skill_name: str) -> Tuple[bool, str]:
+    """Serialize this lifecycle transition against repair/restore in any process."""
+    with _lifecycle_lock():
+        return _restore_skill_locked(skill_name)
+
+
+def _restore_skill_locked(skill_name: str) -> Tuple[bool, str]:
     """Move an archived skill back to the flat layout (nesting NOT reconstructed). Refuses a name now colliding with
     a hub skill, or a bundled built-in unless ``curator.prune_builtins`` is on (restoring lifts a prune)."""
     if is_hub_installed(skill_name):

@@ -9,6 +9,7 @@ returns a ``TurnContext`` with only the locals the loop reads back.
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 import sys
 import threading
 import time
@@ -376,6 +377,147 @@ def _should_idle_compact(
     if last_compaction_tokens > 0:
         effective_floor = max(effective_floor, last_compaction_tokens + floor_tokens)
     return tokens > effective_floor
+
+
+
+
+def apply_tool_output_retention(agent: Any, messages: List[Dict[str, Any]]) -> int:
+    """Spill old tool results before deciding whether to compact the turn.
+
+    This is the interface-neutral L2 retention rail. Gateway sessions also run
+    the pass before constructing an agent so stale persisted prompt-token counts
+    can be cleared early; this pass covers CLI/API/direct-agent callers and is
+    idempotent when the gateway already replaced those results with pointers.
+    """
+    if not bool(getattr(agent, "_tool_output_retention_enabled", True)):
+        return 0
+
+    from agent.context_compressor import (
+        DEFAULT_TOOL_OUTPUT_RETENTION_MAX_INLINE_CHARS,
+        DEFAULT_TOOL_OUTPUT_RETENTION_MIN_CHARS,
+        DEFAULT_TOOL_OUTPUT_RETENTION_MIN_INLINE_RESULTS,
+        DEFAULT_TOOL_OUTPUT_RETENTION_TURNS,
+        spill_old_tool_outputs,
+    )
+
+    keep_turns = max(0, int(getattr(
+        agent,
+        "_tool_output_retention_turns",
+        DEFAULT_TOOL_OUTPUT_RETENTION_TURNS,
+    )))
+    min_chars = max(0, int(getattr(
+        agent,
+        "_tool_output_retention_min_chars",
+        DEFAULT_TOOL_OUTPUT_RETENTION_MIN_CHARS,
+    )))
+    max_inline_chars = int(getattr(
+        agent,
+        "_tool_output_retention_max_inline_chars",
+        DEFAULT_TOOL_OUTPUT_RETENTION_MAX_INLINE_CHARS,
+    ))
+    min_inline_results = max(0, int(getattr(
+        agent,
+        "_tool_output_retention_min_inline_results",
+        DEFAULT_TOOL_OUTPUT_RETENTION_MIN_INLINE_RESULTS,
+    )))
+    session_id = str(getattr(agent, "session_id", None) or "session")
+    session_db = getattr(agent, "_session_db", None)
+    durable_session_id = getattr(agent, "session_id", None)
+    expected_revision = None
+
+    if session_db is not None and durable_session_id:
+        try:
+            db_messages, expected_revision = (
+                session_db.get_messages_as_conversation_snapshot(durable_session_id)
+            )
+        except Exception:
+            logger.info(
+                "Tool-output retention skipped: could not load a stable DB "
+                "snapshot for session=%s",
+                session_id,
+            )
+            return 0
+
+        compare_keys = (
+            "role",
+            "content",
+            "tool_call_id",
+            "tool_calls",
+            "tool_name",
+            "message_id",
+            "observed",
+            "finish_reason",
+            "reasoning",
+            "reasoning_content",
+            "reasoning_details",
+            "codex_reasoning_items",
+            "codex_message_items",
+        )
+        live_projection = [
+            tuple(message.get(key) for key in compare_keys)
+            for message in messages
+        ]
+        db_projection = [
+            tuple(message.get(key) for key in compare_keys)
+            for message in db_messages
+        ]
+        if live_projection != db_projection:
+            logger.info(
+                "Tool-output retention skipped: live and durable transcripts "
+                "differ for session=%s",
+                session_id,
+            )
+            return 0
+
+    retained, archived_count, paths = spill_old_tool_outputs(
+        messages,
+        session_id=session_id,
+        keep_recent_turns=keep_turns,
+        min_chars=min_chars,
+        max_inline_chars=max_inline_chars,
+        min_inline_results=min_inline_results,
+    )
+    if not archived_count:
+        return 0
+
+    if session_db is not None and durable_session_id:
+        try:
+            written = session_db.replace_messages(
+                durable_session_id,
+                retained,
+                active_only=True,
+                expected_active_revision=expected_revision,
+            )
+            if written is False:
+                raise RuntimeError("active transcript revision changed")
+        except Exception:
+            for path in paths:
+                try:
+                    Path(path).unlink(missing_ok=True)
+                except OSError:
+                    logger.debug(
+                        "Could not remove uncommitted tool-output spill %s",
+                        path,
+                    )
+            logger.warning(
+                "Tool-output retention DB rewrite failed for session=%s; "
+                "keeping live history unchanged",
+                session_id,
+                exc_info=True,
+            )
+            return 0
+
+    messages[:] = retained
+    compressor = getattr(agent, "context_compressor", None)
+    if compressor is not None:
+        compressor.last_prompt_tokens = 0
+    logger.info(
+        "Tool-output retention archived %d old result(s) for session=%s; "
+        "revalidating request pressure before compression",
+        archived_count,
+        session_id or "none",
+    )
+    return archived_count
 
 
 @dataclass

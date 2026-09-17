@@ -101,7 +101,7 @@ def _get_max_concurrent_children() -> int:
     the ceiling is reintroduced here because the host admission gate is sized
     for a bounded tree, not because upstream forgot it.
     """
-    cfg = _load_config()
+    cfg = _cfg()
     val = cfg.get("max_concurrent_children")
     if val is None:
         val = os.getenv("DELEGATION_MAX_CONCURRENT_CHILDREN")
@@ -141,14 +141,17 @@ def _get_max_async_children() -> int:
     """Concurrency cap for background delegations == delegation.max_concurrent_children. At capacity a new async
     dispatch is REJECTED (not queued) so a runaway model can't pile up unbounded background work; the caller then
     runs synchronously. A leftover ``delegation.max_async_children`` key is ignored with a one-time warning."""
-    from tools.delegate_tool import _get_max_concurrent_children
+    from tools.delegate_tool import _get_max_background_batches
     if _cfg().get("max_async_children") is not None:
         _warn_once(
             "_LEGACY_MAX_ASYNC_WARNED", "delegation.max_async_children is deprecated and ignored; "
             "delegation.max_concurrent_children now caps background "
             "delegations too. Remove the stale key from config.yaml.",
         )
-    return _get_max_concurrent_children()
+    # Detached batch capacity is INDEPENDENT of the per-call child width and hard
+    # capped: a detached batch outlives the turn that launched it, so one runaway
+    # model must not be able to leave several of them running unattended.
+    return _get_max_background_batches()
 
 def _parse_timeout(raw: Any) -> Optional[float]:
     """Seconds → None (<= 0 disables) or max(30, value). Raises on non-numeric."""
@@ -488,6 +491,43 @@ def _resolve_child_fallback_chain(parent_agent, routing_cfg: Any, pinned: bool) 
     return normalized or default
 
 
+
+def _clamp_child_reasoning(reasoning: Any, provider: Any, model: Any) -> Any:
+    """Clamp a child's reasoning effort onto what its own route actually supports.
+
+    Uses the canonical ladder in ``agent.reasoning_effort`` rather than a second
+    per-provider table: a private copy of the vocabulary is exactly what went
+    three model generations stale before.
+    """
+    if not isinstance(reasoning, dict):
+        return reasoning
+    requested = reasoning.get("effort")
+    if not requested:
+        return reasoning
+    try:
+        from agent.reasoning_effort import clamp_effort, codex_supported_efforts, kimi_supported_efforts
+
+        provider_key = str(provider or "").strip().lower()
+        model_name = str(model or "")
+        if provider_key == "openai-codex":
+            supported = codex_supported_efforts(model_name)
+        elif "kimi" in model_name.lower():
+            supported = kimi_supported_efforts(model_name)
+        else:
+            return reasoning
+        clamped = clamp_effort(requested, supported)
+    except Exception as exc:
+        logger.debug("child reasoning clamp skipped: %s", exc)
+        return reasoning
+    if not clamped or clamped == requested:
+        return reasoning
+    logger.info(
+        "Child route %s/%s does not support reasoning effort %r; clamping to %r",
+        provider_key or "auto", model_name or "auto", requested, clamped,
+    )
+    return {**reasoning, "effort": clamped}
+
+
 def _resolve_child_runtime(
     parent_agent, delegation_cfg: dict, parent_api_key: Any, *, model: Optional[str], override_provider: Optional[str],
     override_base_url: Optional[str], override_api_key: Optional[str], override_api_mode: Optional[str],
@@ -559,6 +599,11 @@ def _resolve_child_runtime(
                 child_reasoning = parsed
     except Exception as exc:
         logger.debug("Could not load delegation reasoning_effort: %s", exc)
+    # Re-clamp against the CHILD's effective route, not the parent's: a child
+    # pinned to a different provider/model may not support the level the parent
+    # (or delegation.reasoning_effort) asked for, and an unsupported effort makes
+    # the provider reject every one of that child's requests.
+    child_reasoning = _clamp_child_reasoning(child_reasoning, effective_provider, effective_model)
 
     kwargs: Dict[str, Any] = {
         "base_url": effective_base_url, "api_key": override_api_key or parent_api_key, "model": effective_model,
@@ -586,7 +631,7 @@ def _resolve_child_runtime(
 
 def _get_max_background_batches() -> int:
     """Return the hard-capped detached top-level batch capacity."""
-    cfg = _load_config()
+    cfg = _cfg()
     val = cfg.get("max_background_batches")
     if val is None:
         val = os.getenv("DELEGATION_MAX_BACKGROUND_BATCHES")
@@ -615,7 +660,7 @@ def _get_max_total_descendants() -> int:
     Raised 5 -> 8 with the per-call width by operator decision 2026-09-16
     (receipt OPERATOR-DECISION-20260916-delegation-width-8.json).
     """
-    cfg = _load_config()
+    cfg = _cfg()
     val = cfg.get("max_total_descendants")
     if val is None:
         val = os.getenv("DELEGATION_MAX_TOTAL_DESCENDANTS")
@@ -721,7 +766,7 @@ def _reset_descendant_budget_for_tests() -> None:
 
 def _delegation_uses_codex(parent_agent) -> bool:
     """Resolve whether this child path uses the shared Codex subscription."""
-    cfg = _load_config()
+    cfg = _cfg()
     provider = str(
         cfg.get("provider") or getattr(parent_agent, "provider", "") or ""
     ).strip().lower()
