@@ -15,7 +15,11 @@ it('keeps the desktop toggle local across config refreshes', async () => {
       localStorage.clear()
       vi.resetModules()
       const prefs = await import('./voice-prefs')
-      const write = vi.spyOn(localStorage, 'setItem')
+      // jsdom keeps setItem on Storage.prototype, not on the localStorage
+      // instance, so an instance spy is never consulted: the real write ran,
+      // the quota branch was never exercised, and the assertion below saw the
+      // stored value instead of null. Spy where the method actually lives.
+      const write = vi.spyOn(Object.getPrototypeOf(localStorage) as Storage, 'setItem')
 
       if (fails) {
         write.mockImplementation(() => {
@@ -44,7 +48,11 @@ it('migrates the legacy preference once, not on every refresh', async () => {
       localStorage.clear()
       vi.resetModules()
       const prefs = await import('./voice-prefs')
-      const write = vi.spyOn(localStorage, 'setItem')
+      // jsdom keeps setItem on Storage.prototype, not on the localStorage
+      // instance, so an instance spy is never consulted: the real write ran,
+      // the quota branch was never exercised, and the assertion below saw the
+      // stored value instead of null. Spy where the method actually lives.
+      const write = vi.spyOn(Object.getPrototypeOf(localStorage) as Storage, 'setItem')
 
       if (fails) {
         write.mockImplementation(() => {
