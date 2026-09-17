@@ -7652,7 +7652,7 @@ def test_run_prompt_submit_requeues_foreign_completion(
         process_registry._completion_consumed.discard(event["session_id"])
 
 
-def test_run_prompt_submit_delivers_completion_observed_by_poll(monkeypatch, tmp_path):
+def test_run_prompt_submit_suppresses_terminal_completion_observed_by_poll(monkeypatch, tmp_path):
     import queue as _queue_mod
 
     from tools.process_registry import process_registry
@@ -7670,7 +7670,7 @@ def test_run_prompt_submit_delivers_completion_observed_by_poll(monkeypatch, tmp
         "session_key": "session-a",
         "command": "safe-test-command",
         "exit_code": 0,
-        "output": "observed but not consumed",
+        "output": "already returned by terminal poll",
     }
     isolated_queue: _queue_mod.Queue = _queue_mod.Queue()
     isolated_queue.put(event)
@@ -7680,11 +7680,11 @@ def test_run_prompt_submit_delivers_completion_observed_by_poll(monkeypatch, tmp
     server._sessions["sid_a"] = session
 
     try:
-        server._run_prompt_submit("rid-a", "sid_a", session, "session-a-turn")
+        server._run_prompt_submit("rid-a", "sid_a", session, "future-user-prompt")
 
-        assert turns[0] == "session-a-turn"
-        assert len(turns) == 2
-        assert "proc_polled" in turns[1]
+        # The future user prompt still runs normally, but no redundant
+        # completion turn follows it after the parent becomes idle.
+        assert turns == ["future-user-prompt"]
         assert isolated_queue.empty()
     finally:
         server._sessions.pop("sid_a", None)
@@ -18457,6 +18457,90 @@ def test_notification_poller_skips_consumed(monkeypatch):
         process_registry._completion_consumed.discard("proc_already_done")
         while not process_registry.completion_queue.empty():
             process_registry.completion_queue.get_nowait()
+
+
+def test_notification_poller_suppresses_consumed_artifact_but_delivers_unseen(
+    monkeypatch, tmp_path
+):
+    """Consumed callbacks are quiet without blocking a later useful completion."""
+    import queue as _queue_mod
+    import time
+
+    import tools.async_delegation as async_delegation
+    from tools.process_registry import process_registry
+
+    turns = []
+
+    class _Agent:
+        def run_conversation(self, prompt, conversation_history=None, stream_callback=None, **_kwargs):
+            turns.append(prompt)
+            return {"final_response": "ok", "messages": []}
+
+    class _ImmediateThread:
+        def __init__(self, target=None, daemon=None):
+            self._target = target
+
+        def start(self):
+            self._target()
+
+    session_key = "session-artifact-exact-once"
+    artifact = tmp_path / "HANDOFF.md"
+    artifact.write_text("finished", encoding="utf-8")
+    consumed_result = {
+        "status": "completed",
+        "summary": f"Wrote {artifact}",
+        "tool_trace": [{
+            "tool": "write_file",
+            "status": "ok",
+            "input_summary": {"targets": {"path": str(artifact)}},
+        }],
+    }
+    consumed_event = {
+        "type": "async_delegation",
+        "delegation_id": "deleg_consumed_artifact",
+        "session_key": session_key,
+        "status": "completed",
+        "dispatched_at": time.time() - 10,
+        "results": [consumed_result],
+    }
+    unseen_event = {
+        "type": "async_delegation",
+        "delegation_id": "deleg_unseen_answer",
+        "session_key": session_key,
+        "status": "completed",
+        "dispatched_at": time.time() - 5,
+        "results": [{"status": "completed", "summary": "A novel answer"}],
+    }
+    async_delegation.record_parent_artifact_access(
+        session_keys=[session_key],
+        tool_name="read_file",
+        args={"path": str(artifact)},
+        result='{"content": "1|done", "total_lines": 1, "truncated": false}',
+    )
+
+    isolated_queue: _queue_mod.Queue = _queue_mod.Queue()
+    isolated_queue.put(consumed_event)
+    isolated_queue.put(unseen_event)
+    monkeypatch.setattr(process_registry, "completion_queue", isolated_queue)
+    monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
+    monkeypatch.setattr(server, "_emit", lambda *a, **kw: None)
+    monkeypatch.setattr(server, "make_stream_renderer", lambda cols: None)
+    monkeypatch.setattr(server, "render_message", lambda raw, cols: None)
+
+    sess = _session(agent=_Agent(), session_key=session_key)
+    server._sessions["sid_exact_once"] = sess
+    stop = threading.Event()
+    stop.set()
+
+    try:
+        server._notification_poller_loop(stop, "sid_exact_once", sess)
+        assert len(turns) == 1
+        assert "deleg_unseen_answer" in turns[0]
+        assert "deleg_consumed_artifact" not in turns[0]
+        assert isolated_queue.empty()
+    finally:
+        server._sessions.pop("sid_exact_once", None)
+        async_delegation._artifact_observations.pop(session_key, None)
 
 
 def test_notification_poller_requeues_when_busy(monkeypatch):

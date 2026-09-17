@@ -438,8 +438,21 @@ def _notif_handle_event(sid, session, evt, emitted, registry, fmt, deferred, com
         else:
             logger.debug("Dropping unowned %s notification during shutdown drain (origin=%r key=%r)", evt_type, origin, key)
         return True
-    if evt_type == "completion" and registry.is_completion_consumed(evt.get("session_id", "")):
+    if evt_type == "completion" and getattr(
+        registry, "is_completion_consumed_or_observed", registry.is_completion_consumed
+    )(evt.get("session_id", "")):
         return True
+    if evt_type == "async_delegation":
+        try:
+            from tools.async_delegation import consume_redundant_completion
+
+            if consume_redundant_completion(
+                evt, consumer="tui-poller-redundant",
+                session_keys=[str(session.get("session_key") or ""), sid],
+            ):
+                return True
+        except Exception:
+            pass
     text = fmt(evt)
     if not text:
         return True

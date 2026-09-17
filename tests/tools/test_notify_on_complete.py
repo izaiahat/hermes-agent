@@ -231,20 +231,20 @@ class TestCompletionConsumed:
         assert registry.is_completion_consumed("proc_wait")
 
 
-    def test_poll_observed_does_not_suppress_gateway_watcher(self, registry):
-        """The gateway/tui watcher gate (is_completion_consumed) must stay False
-        after a read-only poll, so the autonomous delivery turn still fires
-        even though the CLI drain was deduped (#10156)."""
-        s = _make_session(sid="proc_gw", notify_on_complete=True, output="done")
+    def test_terminal_poll_suppresses_all_autonomous_delivery_rails(self, registry):
+        """A terminal poll already returns exit/output and must be exact-once."""
+        s = _make_session(sid="proc_gateway_result", notify_on_complete=True, output="done")
         s.exited = True
         s.exit_code = 0
         registry._finished[s.id] = s
 
-        registry.poll("proc_gw")
-        # CLI-side dedup signal present...
-        assert "proc_gw" in registry._poll_observed
-        # ...but the gateway watcher gate is untouched, so it still delivers.
-        assert not registry.is_completion_consumed("proc_gw")
+        # Prefix lookup must record the canonical id used by completion events.
+        result = registry.poll("proc_gate")
+        assert result["status"] == "exited"
+        assert "done" in result["output_preview"]
+        assert "proc_gateway_result" in registry._poll_observed
+        assert not registry.is_completion_consumed("proc_gateway_result")
+        assert registry.is_completion_consumed_or_observed("proc_gateway_result")
 
     def test_running_poll_does_not_mark_poll_observed(self, registry):
         """poll() on a still-running process must not record _poll_observed."""

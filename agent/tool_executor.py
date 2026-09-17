@@ -74,6 +74,54 @@ def _record_persisted_path_for_stub(agent, tool_call_id: str, function_result) -
         logger.debug("persisted-path record for result stub failed: %s", exc)
 
 
+
+def _record_async_artifact_access(
+    agent,
+    function_name: str,
+    function_args: dict,
+    function_result: Any,
+    *,
+    failed: bool,
+    blocked: bool,
+) -> None:
+    """Best-effort provenance for a complete result actually kept in context."""
+    if failed or blocked or function_name not in {"read_file", "write_file", "patch"}:
+        return
+    try:
+        from agent.delegation_context import is_delegated_child_context
+
+        if is_delegated_child_context():
+            return
+        from tools.approval_context import get_current_session_key
+        from tools.async_delegation import record_parent_artifact_access
+
+        record_parent_artifact_access(
+            session_keys=[
+                get_current_session_key(default=""),
+                str(getattr(agent, "session_id", "") or ""),
+            ],
+            tool_name=function_name,
+            args=function_args,
+            result=function_result,
+        )
+    except Exception as exc:
+        logger.debug("async artifact-consumption record failed: %s", exc)
+
+
+
+def _record_async_artifact_accesses(agent, candidates: list) -> None:
+    """Record candidates after result-budget and steer transformations."""
+    for function_name, function_args, failed, blocked, tool_message in candidates:
+        _record_async_artifact_access(
+            agent,
+            function_name,
+            function_args,
+            tool_message.get("content") if isinstance(tool_message, dict) else None,
+            failed=failed,
+            blocked=blocked,
+        )
+
+
 def _ensure_file_checkpoint(agent, function_name: str, function_args: dict, effective_task_id: str) -> None:
     """Checkpoint the same workspace path that the file tool will mutate, resolved the way
     file tools do (against the task's live cwd, which differs from the process cwd in Docker)."""
@@ -975,6 +1023,7 @@ def _commit_tool_result(
     error_preview: Callable[[Any], Any] = lambda result: result,
     success_log_chars: Optional[int] = None,
     verbose_text: Callable[[Any], Any] = lambda result: result,
+    candidates: Optional[list] = None,
 ):
     """Observe (``observed`` results only) and log the outcome; mark the tool done; persist/
     spill, hint, wrap and append the result; flush the session DB; project ``tool.completed``.
@@ -1032,6 +1081,11 @@ def _commit_tool_result(
     _tool_content = agent._tool_result_content_for_active_model(function_name, persisted_result)
     tool_message = make_tool_result_message(function_name, _tool_content, tool_call_id, effect_disposition=effect_disposition)
     messages.append(tool_message)
+    if candidates is not None and function_name in {"read_file", "write_file", "patch"}:
+        # Capture the SAME dict object that entered ``messages`` so a later
+        # in-place budget/steer rewrite is visible when the batch is finalised —
+        # provenance must describe what actually stayed in context.
+        candidates.append((function_name, ref.args, is_error, blocked, tool_message))
     if not _flush_session_db_after_tool_progress(agent, messages, stage=f"tool result {function_name}"):
         return None
 
@@ -1045,13 +1099,19 @@ def _commit_tool_result(
     return persisted_result, function_result, tool_message.get("_tool_output_risk")
 
 
-def _finalize_tool_batch(agent, messages: list, effective_task_id: str, num_tools: int, budget: BudgetConfig) -> None:
+def _finalize_tool_batch(agent, messages: list, effective_task_id: str, num_tools: int, budget: BudgetConfig,
+                         candidates: Optional[list] = None) -> None:
     """Per-turn aggregate budget enforcement, then /steer injection — in that order, so the
-    steer marker is never truncated/discarded when enforcement replaces a result."""
+    steer marker is never truncated/discarded when enforcement replaces a result.
+
+    Artifact provenance is recorded LAST, so it reflects the content the parent
+    actually kept rather than what the tool originally returned.
+    """
     if num_tools <= 0:
         return
     enforce_turn_budget(messages[-num_tools:], env=get_active_env(effective_task_id), config=budget)
     agent._apply_pending_steer_to_tool_results(messages, num_tools)
+    _record_async_artifact_accesses(agent, candidates or [])
 
 
 def _tool_progress_enabled(agent) -> bool:
@@ -1364,7 +1424,8 @@ def _unfinished_tool_result(agent, ref: _ToolCallRef, *, timed_out: bool, timeou
     return function_result, tool_duration, effect_disposition
 
 
-def _append_batch_results(agent, messages: list, effective_task_id: str, batch: _ConcurrentBatch, budget: BudgetConfig) -> bool:
+def _append_batch_results(agent, messages: list, effective_task_id: str, batch: _ConcurrentBatch, budget: BudgetConfig,
+                          candidates: Optional[list] = None) -> bool:
     """Append every slot's result in original call order; returns False at the first
     failed flush (the caller must stop the batch)."""
     for i, pc in enumerate(batch.parsed_calls):
@@ -1386,6 +1447,7 @@ def _append_batch_results(agent, messages: list, effective_task_id: str, batch: 
             budget=budget, tool_duration=tool_duration, is_error=is_error, blocked=blocked,
             effect_disposition=effect_disposition, observed=r is not None,
             error_preview=lambda res: _multimodal_text_summary(res)[:200],
+            candidates=candidates,
         )
         if committed is None:
             return False
@@ -1401,7 +1463,8 @@ def _append_batch_results(agent, messages: list, effective_task_id: str, batch: 
     return True
 
 
-def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0, *, finalize: bool = True) -> None:
+def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0, *,
+                                 finalize: bool = True, artifact_access_candidates: Optional[list] = None) -> None:
     """Execute tool calls concurrently; results are appended in original call order.
     ``finalize=False`` skips end-of-batch budget enforcement and /steer injection (the
     segmented dispatcher owns turn-end work)."""
@@ -1440,10 +1503,14 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
             finished = [r for r in batch.results if r is not None]
             spinner.stop(f"⚡ {len(finished)}/{num_tools} tools completed in {sum(r.duration for r in finished):.1f}s total")
 
-    if not _append_batch_results(agent, messages, effective_task_id, batch, _tool_budget):
+    if artifact_access_candidates is None:
+        artifact_access_candidates = []
+    if not _append_batch_results(
+        agent, messages, effective_task_id, batch, _tool_budget, artifact_access_candidates):
         return
     if finalize:
-        _finalize_tool_batch(agent, messages, effective_task_id, len(parsed_calls), _tool_budget)
+        _finalize_tool_batch(agent, messages, effective_task_id, len(parsed_calls), _tool_budget,
+                             artifact_access_candidates)
 
 
 # ── Sequential dispatch ─────────────────────────────────────────────────────
@@ -1628,7 +1695,7 @@ def _run_sequential_call(
     return managed, tool_duration
 
 
-def _publish_sequential_result(agent, messages: list, ref: _ToolCallRef, managed: _ManagedToolResult, *, tool_duration: float, index: int, budget: BudgetConfig) -> bool:
+def _publish_sequential_result(agent, messages: list, ref: _ToolCallRef, managed: _ManagedToolResult, *, tool_duration: float, index: int, budget: BudgetConfig, candidates: Optional[list] = None) -> bool:
     """Terminal hook → observe → commit → completion callbacks/print for one sequential
     result; False when the incremental flush failed (the caller must stop the batch)."""
     ref.args, ref.trace, function_result = managed.args, managed.middleware_trace, managed.result
@@ -1648,6 +1715,7 @@ def _publish_sequential_result(agent, messages: list, ref: _ToolCallRef, managed
         error_preview=lambda res: res[:200] if isinstance(res, str) and not agent.verbose_logging else res,
         success_log_chars=_result_len,
         verbose_text=_multimodal_text_summary,
+        candidates=candidates,
     )
     if committed is None:
         return False
@@ -1659,7 +1727,8 @@ def _publish_sequential_result(agent, messages: list, ref: _ToolCallRef, managed
     return True
 
 
-def execute_tool_calls_sequential(agent, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0, *, finalize: bool = True) -> None:
+def execute_tool_calls_sequential(agent, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0, *,
+                                 finalize: bool = True, artifact_access_candidates: Optional[list] = None) -> None:
     """Execute tool calls sequentially (single calls or interactive tools). ``finalize=False``
     skips end-of-batch budget enforcement and /steer injection (the segmented dispatcher
     owns turn-end work)."""
@@ -1699,7 +1768,10 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             display_index=i,
             tool_start_time=tool_start_time,
         )
-        if not _publish_sequential_result(agent, messages, ref, managed, tool_duration=tool_duration, index=i, budget=_tool_budget):
+        if not _publish_sequential_result(
+            agent, messages, ref, managed, tool_duration=tool_duration, index=i, budget=_tool_budget,
+            candidates=artifact_access_candidates,
+        ):
             return
 
         if agent._interrupt_requested and i < len(tool_calls):
@@ -1713,7 +1785,8 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             break
 
     if finalize:
-        _finalize_tool_batch(agent, messages, effective_task_id, len(tool_calls), _tool_budget)
+        _finalize_tool_batch(agent, messages, effective_task_id, len(tool_calls), _tool_budget,
+                             artifact_access_candidates)
 
 
 def execute_tool_calls_segmented(agent, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0, segments=None) -> None:
@@ -1729,18 +1802,23 @@ def execute_tool_calls_segmented(agent, assistant_message, messages: list, effec
         _exec_cwd = Path(_active_env.cwd) if _active_env is not None and _active_env.cwd else None
         segments = _plan_tool_batch_segments(assistant_message.tool_calls, execution_cwd=_exec_cwd)
 
+    # ONE candidate list across every segment: the batch is finalised once, so
+    # provenance for a read in an early segment must survive to that point.
+    _artifact_candidates: list = []
     for kind, calls in segments:
         if getattr(agent, "_incremental_persistence_failed", False):
             return
         segment_message = SimpleNamespace(tool_calls=list(calls))
         run_segment = execute_tool_calls_concurrent if kind == "parallel" else execute_tool_calls_sequential
-        run_segment(agent, segment_message, messages, effective_task_id, api_call_count, finalize=False)
+        run_segment(agent, segment_message, messages, effective_task_id, api_call_count, finalize=False,
+                    artifact_access_candidates=_artifact_candidates)
         if getattr(agent, "_incremental_persistence_failed", False):
             return
 
     total_tools = len(assistant_message.tool_calls)
     if total_tools > 0:
-        _finalize_tool_batch(agent, messages, effective_task_id, total_tools, _budget_for_agent(agent))
+        _finalize_tool_batch(agent, messages, effective_task_id, total_tools, _budget_for_agent(agent),
+                             _artifact_candidates)
 
 
 __all__ = [

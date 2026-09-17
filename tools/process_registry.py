@@ -1401,6 +1401,15 @@ class ProcessRegistry(ProcessCheckpointMixin):
         """Check if a completion notification was already consumed via wait/log."""
         return session_id in self._completion_consumed
 
+    def is_completion_consumed_or_observed(self, session_id: str) -> bool:
+        """True when a terminal result was consumed OR already seen by poll().
+
+        A terminal poll() means the caller has the result in hand; delivering a
+        synthetic completion turn afterwards is a duplicate on every rail (the
+        gateway watcher and the TUI poller included), not only in the CLI drain.
+        """
+        return self._drain_should_skip(session_id, skip_poll_observed=True)
+
     def is_session_waiting(self, session_id: str) -> bool:
         """Whether a goal loop (``hermes_cli.goals`` wait barrier) should stay parked on
         this session: still running AND, with ``watch_patterns``, none matched yet (a
@@ -1562,6 +1571,18 @@ class ProcessRegistry(ProcessCheckpointMixin):
             # Routing happened first so a foreign session cannot drop the owner's
             # event via its own consumed/observed state.
             _evt_sid = evt.get("session_id", "")
+            if is_async_delegation:
+                # A delegation whose declared artifact the parent already read or
+                # wrote in full is acknowledged durably here instead of costing a
+                # second model turn to re-read content already in context.
+                try:
+                    from tools.async_delegation import consume_redundant_completion
+
+                    if consume_redundant_completion(
+                        evt, consumer="process-registry-redundant", session_keys=[session_key, _evt_sid]):
+                        continue
+                except Exception:
+                    logger.debug("redundant async-completion check failed", exc_info=True)
             if evt.get("type") == "completion" and self._drain_should_skip(
                 _evt_sid, skip_poll_observed=skip_poll_observed):
                 continue
@@ -1691,7 +1712,9 @@ class ProcessRegistry(ProcessCheckpointMixin):
             # Read-only: record in _poll_observed (CLI inline dedup) but NOT in
             # _completion_consumed, or a status check would suppress the watcher's
             # autonomous delivery turn. See __init__.
-            self._poll_observed.add(session_id)
+            # The canonical id, not the caller's possibly-prefix lookup key: a
+            # later check by canonical id must find this observation.
+            self._poll_observed.add(session.id)
         if session.detached:
             result.update(detached=True, note="Process recovered after restart -- output history unavailable")
         return result

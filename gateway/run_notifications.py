@@ -1579,6 +1579,16 @@ class GatewayNotificationsMixin:
             return False if False in outcomes else True
         deliverable: list[tuple[dict, str]] = []
         for evt in group:
+            # A delegation whose declared artifact this session already read or
+            # wrote in full is acknowledged durably instead of costing a turn;
+            # a material sibling in the same group still delivers.
+            try:
+                from tools.async_delegation import consume_redundant_completion
+
+                if consume_redundant_completion(evt, consumer=f"gateway-redundant:{id(self)}"):
+                    continue
+            except Exception:
+                logger.debug("redundant async-completion check failed", exc_info=True)
             synth_text = _format_gateway_process_notification(evt)
             if not synth_text:
                 continue
@@ -1811,7 +1821,12 @@ class GatewayNotificationsMixin:
             if session.exited:
                 # Agent-notify: inject a synthetic message unless the agent already consumed the result via
                 # wait/log (poll() is read-only and deliberately does NOT mark consumed).
-                if agent_notify and not process_registry.is_completion_consumed(session_id):
+                # A terminal poll() means the caller already has the result, so it
+                # suppresses this rail as well, not only the CLI drain.
+                _already_returned = getattr(
+                    process_registry, "is_completion_consumed_or_observed",
+                    process_registry.is_completion_consumed)
+                if agent_notify and not _already_returned(session_id):
                     completion_evt = self._build_process_completion_event(watcher, session, session_id)
                     synth_text = format_process_notification(completion_evt)
                     if not synth_text:
@@ -1824,7 +1839,7 @@ class GatewayNotificationsMixin:
                     break
                 # Text-only notification; skip when already consumed via wait/log (the agent_notify branch
                 # FALLS THROUGH here, hence the re-check).
-                if process_registry.is_completion_consumed(session_id):
+                if _already_returned(session_id):
                     logger.debug(
                         "Process watcher: completion for %s already consumed "
                         "via wait/log — skipping raw notification (#65379)", session_id,

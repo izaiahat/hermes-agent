@@ -48,6 +48,258 @@ _MAX_DELIVERY_ATTEMPTS = 8
 _MAX_COMPLETION_REPLAY_AGE_S = 48 * 3600.0
 _DB_LOCK = threading.Lock()
 
+# Parent-side artifact provenance: which files THIS session already read or wrote
+# in full, and when. A completed delegation whose only declared result is an
+# artifact the parent has already consumed needs acknowledging, not a second
+# model turn — the content is already in context.
+_artifact_observations_lock = threading.Lock()
+_artifact_observations: Dict[str, Dict[str, float]] = {}
+_ARTIFACT_OBSERVATION_TTL_SECONDS = 48 * 3600.0
+
+
+
+def _normalized_artifact_path(value: Any) -> str:
+    """Normalize an absolute artifact path without requiring it to exist."""
+    if not isinstance(value, str) or not value.strip():
+        return ""
+    try:
+        path = __import__("pathlib").Path(value).expanduser()
+        if not path.is_absolute():
+            return ""
+        return os.path.normpath(str(path))
+    except Exception:
+        return ""
+
+
+
+def _file_tool_paths(tool_name: str, args: Dict[str, Any]) -> set[str]:
+    """Extract exact full-read/full-write targets from a parent tool call."""
+    if not isinstance(args, dict):
+        return set()
+    raw_paths: set[str] = set()
+    if tool_name in {"read_file", "write_file"}:
+        if isinstance(args.get("path"), str):
+            raw_paths.add(args["path"])
+    return {path for value in raw_paths if (path := _normalized_artifact_path(value))}
+
+
+
+def _is_complete_parent_read(args: Dict[str, Any], result: Any) -> bool:
+    """Whether ``read_file`` returned the whole body to the parent model.
+
+    A path touch is not consumption. Require an actual JSON result containing
+    the body, an explicit untruncated marker, and a read starting at line one.
+    Persisted/inline-truncated previews and dedup stubs fail these checks.
+    """
+    offset = args.get("offset", 1)
+    if offset is None:
+        offset = 1
+    if isinstance(offset, bool) or offset != 1 or not isinstance(result, str):
+        return False
+    try:
+        payload = json.loads(result)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return False
+    return (
+        isinstance(payload, dict)
+        and "content" in payload
+        and isinstance(payload.get("content"), str)
+        and payload.get("truncated") is False
+        and not payload.get("error")
+        and payload.get("success") is not False
+        and payload.get("content_returned") is not False
+    )
+
+
+
+def record_parent_artifact_access(
+    *,
+    session_keys: List[str],
+    tool_name: str,
+    args: Dict[str, Any],
+    result: Any = None,
+    observed_at: Optional[float] = None,
+) -> None:
+    """Record only parent actions that establish complete artifact knowledge.
+
+    Callers must exclude delegated-child contexts and failed/blocked tool calls.
+    A full ``write_file`` qualifies because the parent supplied the complete
+    replacement body. ``read_file`` qualifies only when its final in-context
+    result is an untruncated body from line one. ``patch`` never qualifies and
+    invalidates the session's older observations so a relative/multi-file patch
+    cannot leave stale knowledge behind on coarse-mtime filesystems.
+    """
+    keys = {str(key) for key in session_keys if str(key or "")}
+    if not keys:
+        return
+    if tool_name == "patch":
+        with _artifact_observations_lock:
+            for key in keys:
+                _artifact_observations.pop(key, None)
+        return
+    paths = _file_tool_paths(tool_name, args)
+    if not paths:
+        return
+    if tool_name == "read_file" and not _is_complete_parent_read(args, result):
+        return
+    if tool_name not in {"read_file", "write_file"}:
+        return
+    now = float(observed_at if observed_at is not None else time.time())
+    cutoff = now - _ARTIFACT_OBSERVATION_TTL_SECONDS
+    with _artifact_observations_lock:
+        for key in keys:
+            observations = _artifact_observations.setdefault(key, {})
+            for path in paths:
+                observations[path] = now
+            stale = [path for path, ts in observations.items() if ts < cutoff]
+            for path in stale:
+                observations.pop(path, None)
+            if len(observations) > _MAX_ARTIFACT_OBSERVATIONS_PER_SESSION:
+                for path, _ts in sorted(
+                    observations.items(), key=lambda item: item[1]
+                )[: len(observations) - _MAX_ARTIFACT_OBSERVATIONS_PER_SESSION]:
+                    observations.pop(path, None)
+
+
+
+def _declared_result_artifacts(result: Dict[str, Any]) -> set[str]:
+    """Return child-written paths explicitly named in its final summary."""
+    summary = str(result.get("summary") or "")
+    if not summary.strip():
+        return set()
+    written: set[str] = set()
+    for trace in result.get("tool_trace") or []:
+        if not isinstance(trace, dict) or trace.get("status") != "ok":
+            continue
+        if trace.get("tool") not in {"write_file", "patch"}:
+            continue
+        targets = (trace.get("input_summary") or {}).get("targets") or {}
+        if not isinstance(targets, dict):
+            continue
+        for value in targets.values():
+            if isinstance(value, str):
+                path = _normalized_artifact_path(value)
+                if path and path in summary:
+                    written.add(path)
+    return written
+
+
+
+def redundant_completion_reason(
+    evt: Dict[str, Any], *, session_keys: Optional[List[str]] = None
+) -> Optional[str]:
+    """Classify an async completion that needs no autonomous model turn.
+
+    Failures, interrupted/stalled work, summary-only results, and any result
+    whose declared artifacts were not all observed remain deliverable. A
+    successful empty completion is redundant but stays queryable in the durable
+    ledger. Artifact suppression requires structured child write provenance,
+    an explicit mention in the child's summary, and a successful parent file
+    whole-file read/write after dispatch — never assistant-text heuristics.
+    """
+    if evt.get("type") != "async_delegation":
+        return None
+    terminal_status = str(evt.get("status") or "").lower()
+    if terminal_status not in {"completed", "success"} or evt.get("error"):
+        return None
+    results = evt.get("results")
+    if not isinstance(results, list):
+        results = [evt]
+    if not results:
+        return "empty-success"
+
+    keys = {
+        str(key)
+        for key in [
+            *(session_keys or []),
+            evt.get("session_key"),
+            evt.get("parent_session_id"),
+        ]
+        if str(key or "")
+    }
+    dispatched_at = float(evt.get("dispatched_at") or 0.0)
+    saw_material_summary = False
+    with _artifact_observations_lock:
+        observations: Dict[str, float] = {}
+        for key in keys:
+            for path, observed_at in _artifact_observations.get(key, {}).items():
+                observations[path] = max(observations.get(path, 0.0), observed_at)
+
+    for result in results:
+        if not isinstance(result, dict):
+            return None
+        status = str(result.get("status") or "").lower()
+        if status not in {"completed", "success"} or result.get("error"):
+            return None
+        summary = str(result.get("summary") or "").strip()
+        if not summary:
+            continue
+        saw_material_summary = True
+        artifacts = _declared_result_artifacts(result)
+        if not artifacts:
+            return None
+        for path in artifacts:
+            observed_at = observations.get(path, 0.0)
+            if observed_at < dispatched_at:
+                return None
+            try:
+                # If the child (or anyone else) rewrote the file after the
+                # parent observed it, the current artifact is unseen.
+                if os.path.getmtime(path) > observed_at + 1e-6:
+                    return None
+            except OSError:
+                return None
+    return "artifact-consumed" if saw_material_summary else "empty-success"
+
+
+
+def consume_redundant_completion(
+    evt: Dict[str, Any], *, consumer: str, session_keys: Optional[List[str]] = None
+) -> Optional[str]:
+    """Durably acknowledge a redundant async event and return its reason."""
+    reason = redundant_completion_reason(evt, session_keys=session_keys)
+    if reason is None:
+        return None
+    claim_id = claim_event_delivery(evt, consumer)
+    if claim_id is not None:
+        complete_event_delivery(evt, claim_id)
+    logger.info(
+        "Async delegation %s completion suppressed (%s): result remains queryable",
+        evt.get("delegation_id") or "<legacy>",
+        reason,
+    )
+    return reason
+
+# ---------------------------------------------------------------------------
+# Stale-delegation detection (progress-based, on by default)
+# ---------------------------------------------------------------------------
+# A detached runner that wedges before returning (e.g. stuck inside its first
+# model API call — #60203) never reaches its ``finally`` finalizer, so no
+# completion event is ever published: the delegation shows "dispatched"
+# forever and the owning session looks silent until a process restart. We do
+# NOT fix this with a wall-clock timeout — legitimate heavy subagent work
+# (deep reviews, research fan-outs, slow reasoning models) must never be
+# killed for taking long (see delegate_tool.DEFAULT_CHILD_TIMEOUT rationale).
+# Instead a single monitor thread watches per-dispatch PROGRESS (api-call
+# count + current tool, via an injected ``progress_fn``): a child that is
+# advancing is left alone forever; a child with NO progress past the stale
+# threshold is interrupted, given a grace window to unwind and deliver its
+# partial results through the normal finalize path, and only force-finalized
+# with a terminal ``stalled`` event if it never returns.
+#
+# Thresholds mirror the sync-path heartbeat staleness monitor in
+# delegate_tool: idle (not inside a tool) stays tight so a wedged first API
+# call is caught quickly; in-tool is much higher so legitimately slow tools
+# (long terminal commands, big fetches) get time to finish.
+_STALE_CHECK_INTERVAL = 30.0  # seconds between monitor sweeps
+_STALE_IDLE_SECONDS = 450.0  # no progress, no current tool → stalled
+_STALE_IN_TOOL_SECONDS = 1200.0  # no progress while inside a tool → stalled
+_STALL_GRACE_SECONDS = 120.0  # after interrupt, time for the runner to return
+
+_monitor_lock = threading.Lock()
+_monitor_thread: Optional[threading.Thread] = None
+_monitor_stop = threading.Event()
+
 # ── Stale-delegation detection (progress-based, on by default) ──────────────
 # A runner wedged before returning never reaches its finalizer, so it would show
 # "dispatched" forever. No wall-clock timeout (heavy work must never be killed for
