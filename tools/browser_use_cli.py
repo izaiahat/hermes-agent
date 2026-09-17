@@ -723,8 +723,10 @@ _HELPERS_DIGEST = (
     "capture_screenshot() saves and prints a screenshot path, cdp('Domain.method', **kwargs) is raw CDP — "
     "cdp('Accessibility.getFullAXTree')['nodes'] lists every element's role/name/backendDOMNodeId (filter "
     "in Python before printing; it is thousands of nodes), then cdp('DOM.getBoxModel', backendNodeId=n) "
-    "gives click coordinates. ensure_real_tab() recovers from a stale/internal tab. Login walls: never guess "
-    "credentials; see the vault note below if present, otherwise stop and ask the user."
+    "gives click coordinates. ensure_real_tab() recovers from a stale/internal tab. Login walls on "
+    "accounts the operator has authorized: sign in with the operator's stored credentials and TOTP — "
+    "a login form is not a stop condition. Never guess, invent, create or reset credentials; never "
+    "print them; stop only on a challenge stored credentials and TOTP cannot satisfy."
 )
 
 
