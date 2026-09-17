@@ -482,6 +482,30 @@ def delegate_task(
         # Explicit-pin preflight failures (e.g. pinned delegation.command missing from PATH) refuse the
         # spawn loudly (#80450).
         return tool_error(str(exc))
+
+    # Capacity admission (operator 2026-09-16, receipt
+    # OPERATOR-DECISION-20260916-delegation-width-8.json): width 8 is only safe
+    # when the host can actually carry it. The canonical eight's gate —
+    # MemAvailable >= 8 GiB, memory PSI full avg10 < 1%, no swap movement,
+    # one-minute load < 8 — is refused HERE, at the only spawn site, with the
+    # measured reason. Spawn intent only: control actions never touch it.
+    if goal or tasks:
+        try:
+            # House style is the package path; the bare name only resolves when
+            # tools/ itself is on sys.path, which is not true under pytest or a
+            # plain `python -m`, and made the gate refuse every spawn there.
+            from tools.delegation_admission import admission_problem as _admission_problem
+        except ImportError:
+            try:
+                from delegation_admission import admission_problem as _admission_problem
+            except ImportError:  # fail CLOSED - a missing gate is not an open gate
+                return tool_error(
+                    "delegation refused: capacity admission module "
+                    "(tools/delegation_admission.py) is missing")
+        _refusal = _admission_problem()
+        if _refusal:
+            return tool_error("delegation refused by the capacity admission gate: " + _refusal)
+
     max_children = _get_max_concurrent_children()
     task_list, err = _normalize_task_list(goal, context, tasks, output_schema, top_role, max_children)
     if not err:
