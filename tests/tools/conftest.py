@@ -36,6 +36,30 @@ def _no_host_browser_use_cli():
 
 
 @pytest.fixture(autouse=True)
+def _neutral_capacity_admission(request):
+    """Keep the host's live capacity gate out of unit tests.
+
+    ``delegate_task`` refuses a spawn when THIS machine is short on memory, is
+    swapping, or is loaded (tools/delegation_admission.py). That is correct in
+    production and wrong in a unit test: a heavy test run makes the host swap,
+    and every delegation test then fails for a reason that has nothing to do
+    with the code under test. Neutralise the verdict here; the gate's own
+    behaviour is covered directly in tests/tools/test_delegation_admission.py,
+    which opts out with ``@pytest.mark.real_capacity_admission``.
+    """
+    if request.node.get_closest_marker("real_capacity_admission"):
+        yield
+        return
+    try:
+        import tools.delegation_admission as admission
+    except Exception:
+        yield
+        return
+    with patch.object(admission, "admission_problem", lambda: None):
+        yield
+
+
+@pytest.fixture(autouse=True)
 def _materialize_mcp_sdk_symbols():
     """Materialize the lazily-imported MCP SDK before each tools test.
 

@@ -1897,11 +1897,15 @@ class TestDelegateEventEnum(unittest.TestCase):
 
 
 class TestConcurrencyDefaults(unittest.TestCase):
-    """Tests for the hard five-wide per-call ceiling."""
+    """Tests for the hard eight-wide per-call ceiling.
+
+    Operator decision 2026-09-16 raised the width from 5 to 8 (receipt
+    ops/linear/approvals/OPERATOR-DECISION-20260916-delegation-width-8.json).
+    """
 
     @patch("tools.delegate_tool._load_config", return_value={})
-    def test_default_is_five(self, mock_cfg):
-        self.assertEqual(_get_max_concurrent_children(), 5)
+    def test_default_is_eight(self, mock_cfg):
+        self.assertEqual(_get_max_concurrent_children(), 8)
 
     def test_load_config_prefers_active_persistent_config_over_cli_defaults(self):
         stale_cli = types.ModuleType("cli")
@@ -1912,7 +1916,7 @@ class TestConcurrencyDefaults(unittest.TestCase):
                 "hermes_cli.config.load_config_readonly", return_value=active_config
             ):
                 self.assertEqual(_load_config()["max_concurrent_children"], 50)
-                self.assertEqual(_get_max_concurrent_children(), 5)
+                self.assertEqual(_get_max_concurrent_children(), 8)
 
     @patch(
         "tools.delegate_tool._load_config",
@@ -1926,12 +1930,12 @@ class TestConcurrencyDefaults(unittest.TestCase):
         return_value={"max_concurrent_children": 999},
     )
     def test_very_high_values_clamped(self, mock_cfg):
-        self.assertEqual(_get_max_concurrent_children(), 5)
+        self.assertEqual(_get_max_concurrent_children(), 8)
 
     @patch("tools.delegate_tool._load_config", return_value={})
     @patch.dict("os.environ", {"DELEGATION_MAX_CONCURRENT_CHILDREN": "9"})
     def test_env_var_is_clamped(self, mock_cfg):
-        self.assertEqual(_get_max_concurrent_children(), 5)
+        self.assertEqual(_get_max_concurrent_children(), 8)
 
     @patch(
         "tools.delegate_tool._load_config",
