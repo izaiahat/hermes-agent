@@ -19,7 +19,7 @@ _RUNTIME_PROVIDER_CUSTOM = "custom"
 # (floor of 1 only); a box that can be driven to N children by config alone is how the
 # 2026-09-12 swap-critical incident happened, so width, detached batches and TOTAL active
 # descendants are all bounded here and admission is refused atomically at the spawn site.
-_DEFAULT_MAX_CONCURRENT_CHILDREN = 5
+_DEFAULT_MAX_CONCURRENT_CHILDREN = 8
 _DEFAULT_MAX_BACKGROUND_BATCHES = 1
 _descendant_budget_lock = threading.Lock()
 _active_descendants = 0
@@ -93,7 +93,14 @@ def _warn_once(flag_name: str, message: str, *args: Any) -> None:
 
 
 def _get_max_concurrent_children() -> int:
-    """Return the per-call child width, clamped to the hard safety ceiling 5."""
+    """Return the per-call child width, clamped to the hard safety ceiling 8.
+
+    Operator decision 2026-09-16 raised the width from 5 to 8 (receipt
+    ops/linear/approvals/OPERATOR-DECISION-20260916-delegation-width-8.json).
+    Upstream v2026.9.14 removed its ceiling entirely (default 10, floor only);
+    the ceiling is reintroduced here because the host admission gate is sized
+    for a bounded tree, not because upstream forgot it.
+    """
     cfg = _load_config()
     val = cfg.get("max_concurrent_children")
     if val is None:
@@ -109,10 +116,10 @@ def _get_max_concurrent_children() -> int:
             _DEFAULT_MAX_CONCURRENT_CHILDREN,
         )
         return _DEFAULT_MAX_CONCURRENT_CHILDREN
-    clamped = min(5, max(1, parsed))
+    clamped = min(8, max(1, parsed))
     if clamped != parsed:
         logger.warning(
-            "delegation.max_concurrent_children=%d outside [1, 5]; clamping to %d",
+            "delegation.max_concurrent_children=%d outside [1, 8]; clamping to %d",
             parsed,
             clamped,
         )
@@ -603,22 +610,26 @@ def _get_max_background_batches() -> int:
 
 
 def _get_max_total_descendants() -> int:
-    """Return the process/tree child budget, hard-capped at five."""
+    """Return the process/tree child budget, hard-capped at eight.
+
+    Raised 5 -> 8 with the per-call width by operator decision 2026-09-16
+    (receipt OPERATOR-DECISION-20260916-delegation-width-8.json).
+    """
     cfg = _load_config()
     val = cfg.get("max_total_descendants")
     if val is None:
         val = os.getenv("DELEGATION_MAX_TOTAL_DESCENDANTS")
     if val is None:
-        return 5
+        return 8
     try:
         parsed = int(val)
     except (TypeError, ValueError):
-        logger.warning("delegation.max_total_descendants=%r is invalid; using 5", val)
-        return 5
-    clamped = min(5, max(1, parsed))
+        logger.warning("delegation.max_total_descendants=%r is invalid; using 8", val)
+        return 8
+    clamped = min(8, max(1, parsed))
     if clamped != parsed:
         logger.warning(
-            "delegation.max_total_descendants=%d outside [1, 5]; clamping to %d",
+            "delegation.max_total_descendants=%d outside [1, 8]; clamping to %d",
             parsed,
             clamped,
         )
