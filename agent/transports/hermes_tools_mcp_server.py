@@ -1,10 +1,5 @@
 """Hermes-tools-as-MCP server for the codex_app_server runtime.
 
-<<<<<<< HEAD
-Codex owns the loop and tool list there, so a curated subset of Hermes tools is
-exposed over stdio MCP; codex registers it via ``~/.codex/config.toml
-[mcp_servers.hermes-tools]``. Run: ``python -m agent.transports.hermes_tools_mcp_server``.
-=======
 When the user runs `openai/*` turns through the codex app-server, codex
 owns the loop and builds its own tool list. By default, that means
 Hermes' richer tool surface — web search, browser automation,
@@ -47,7 +42,6 @@ What we DO NOT expose:
 Run with: python -m agent.transports.hermes_tools_mcp_server
 Spawned by: CodexAppServerSession.ensure_started() when the runtime is
             active and config opts in.
->>>>>>> 57e0b8f935 (feat: add codex delegate task shim)
 """
 
 from __future__ import annotations
@@ -430,6 +424,9 @@ def _codex_delegate_task_impl(
     title_seed = " ".join(description.split())[:80]
 
     from hermes_cli import kanban_db as kb
+    # dispatch_once moved out of kanban_db; the compat alias is removed on
+    # 2026-09-14, so call it at its real home.
+    import hermes_cli.kanban_db_dispatch as _kb_dispatch
 
     try:
         kb.create_board(
@@ -465,12 +462,19 @@ def _codex_delegate_task_impl(
             )
             task_ids.append(task_id)
 
-        first_dispatch = kb.dispatch_once(
+        first_dispatch = _kb_dispatch.dispatch_once(
             conn,
             board=board,
             spawn_fn=spawn_fn,
             max_spawn=child_count,
-            max_in_progress=child_count,
+            # max_in_progress is a HOST-level cap in v2026.9.14: workers running on
+            # EVERY OTHER board count against it. Passing this invocation's own
+            # child count there made a previous invocation's still-running children
+            # starve the next call, which is exactly what per-invocation board
+            # isolation exists to prevent. The per-board concurrency cap is
+            # max_spawn; the host bound stays the host's own configured/derived one.
+            max_in_progress=_kb_dispatch.resolve_max_in_progress(
+                _kb_dispatch.configured_max_in_progress()),
             failure_limit=1,
             stale_timeout_seconds=max(1, runtime_cap_s),
         )
@@ -542,12 +546,14 @@ def _codex_delegate_task_impl(
                     "synthesis": _codex_delegate_synthesis(children),
                     "error": reason,
                 }
-            dispatch_result = kb.dispatch_once(
+            dispatch_result = _kb_dispatch.dispatch_once(
                 conn,
                 board=board,
                 spawn_fn=spawn_fn,
                 max_spawn=child_count,
-                max_in_progress=child_count,
+                # Same host-vs-board distinction as the first dispatch above.
+                max_in_progress=_kb_dispatch.resolve_max_in_progress(
+                    _kb_dispatch.configured_max_in_progress()),
                 failure_limit=1,
                 stale_timeout_seconds=max(1, runtime_cap_s),
             )
