@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
 from contextlib import contextmanager, suppress
 from datetime import datetime, timezone
 from pathlib import Path
@@ -65,29 +66,38 @@ class UsagePersistenceError(RuntimeError):
     """Raised when a required usage-sidecar write cannot be persisted."""
 
 
+_held_locks = threading.local()  # per thread: flock is NOT re-entrant across separate fds
+
+
 @contextmanager
-def _exclusive_file_lock(lock_path: Path):
-    """Hold an exclusive cross-process lock for the supplied path."""
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
-    if fcntl is None and msvcrt is None:
+def skill_file_lock(lock_path: Path):
+    """Exclusive cross-process lock on ``lock_path`` held across a read-modify-write cycle.
+    Re-entrant within one thread (a nested acquire of the same path just runs); a no-op
+    where neither fcntl nor msvcrt exists."""
+    lock_path = Path(lock_path)
+    held = getattr(_held_locks, "paths", None)
+    if held is None:
+        held = _held_locks.paths = set()
+    if (fcntl is None and msvcrt is None) or lock_path in held:
         yield
         return
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
     if msvcrt and (not lock_path.exists() or lock_path.stat().st_size == 0):
         lock_path.write_text(" ", encoding="utf-8")  # msvcrt needs a non-empty byte range to lock
     with open(lock_path, "r+" if msvcrt else "a+", encoding="utf-8") as fd:
         _flock(fd, True)
+        held.add(lock_path)
         try:
             yield
         finally:
+            held.discard(lock_path)
             with suppress(OSError, IOError):
                 _flock(fd, False)
 
 
-@contextmanager
 def _usage_file_lock():
     """Serialize .usage.json read-modify-write cycles across processes."""
-    with _exclusive_file_lock(_usage_file().with_suffix(".json.lock")):
-        yield
+    return skill_file_lock(_usage_file().with_suffix(".json.lock"))
 
 
 @contextmanager
@@ -98,7 +108,7 @@ def _lifecycle_lock():
     Telemetry-only writers acquire the usage lock alone, so the ordering cannot
     invert and deadlock.
     """
-    with _exclusive_file_lock(_skills_dir() / ".lifecycle.lock"):
+    with skill_file_lock(_skills_dir() / ".lifecycle.lock"):
         yield
 
 
@@ -187,14 +197,14 @@ def _read_hub_installed_names() -> Set[str]:
 
 
 def _prune_builtins_enabled() -> bool:
-    """``curator.prune_builtins`` (default True); lazy config import keeps this module importable during update/sync."""
+    """``curator.prune_builtins`` (default False); lazy config import keeps this module importable during update/sync."""
     try:
         from hermes_cli.config import load_config
         cur = load_config().get("curator")
-        return bool(cur.get("prune_builtins", True)) if isinstance(cur, dict) else True
+        return bool(cur.get("prune_builtins", False)) if isinstance(cur, dict) else False
     except Exception as e:  # pragma: no cover — best-effort config read
         logger.debug("Failed to read curator.prune_builtins: %s", e)
-        return True
+        return False
 
 
 def read_suppressed_names() -> Set[str]:
@@ -351,7 +361,9 @@ def adopt_skill(skill_name: str) -> Tuple[bool, str]:
 def _empty_record() -> Dict[str, Any]:
     return {"created_by": None, "use_count": 0, "view_count": 0, "last_used_at": None, "last_viewed_at": None,
             "patch_count": 0, "patch_generation": 0, "last_reused_patch_generation": 0, "last_patched_at": None,
-            "created_at": _now_iso(), "state": STATE_ACTIVE, "pinned": False, "archived_at": None}
+            "created_at": _now_iso(), "state": STATE_ACTIVE, "pinned": False, "archived_at": None,
+            # When the curator first anchored this skill's inactivity clock (seed or re-anchor); None = never seen.
+            "first_seen_at": None}
 
 
 def _backfilled(rec: Any) -> Dict[str, Any]:
@@ -430,8 +442,20 @@ def seed_record_if_missing(skill_name: str) -> None:
     if skill_name and is_curation_eligible(skill_name):
         # load_usage() already dropped non-dict values, so "missing" == key absent; dirty only when inserted.
         def _seed(data):
-            return None, skill_name not in data and data.setdefault(skill_name, _empty_record()) is not None
+            return None, skill_name not in data and data.setdefault(skill_name, {**_empty_record(), "first_seen_at": _now_iso()}) is not None
         _locked_update(skill_name, _seed, "skill_usage.seed_record_if_missing(%s) failed: %s")
+
+
+def reanchor_clock(skill_name: str) -> None:
+    """Start a skill's inactivity clock NOW, once. Telemetry writes a record the moment a bundled skill is
+    seeded, so by the curator's first sight ``created_at`` can be months old and every never-used built-in
+    goes stale on that first pass (#79295); ``first_seen_at`` marks the clock as anchored so later runs age
+    it normally. A record the bug already marked stale is reactivated — the staleness was the artifact."""
+    def _apply(rec: Dict[str, Any]) -> None:
+        rec["created_at"] = rec["first_seen_at"] = _now_iso()
+        if rec.get("state") == STATE_STALE:
+            rec["state"] = STATE_ACTIVE
+    _mutate(skill_name, _apply)
 
 
 def _mutate(skill_name: str, mutator, *, require_curation_eligible: bool = False) -> Any:
@@ -525,10 +549,15 @@ def bump_patch(skill_name: str, *, action: str = "patch", task_id: Optional[str]
 
 def record_created(skill_name: str, *, agent_created: bool, task_id: Optional[str] = None,
                    session_id: Optional[str] = None) -> None:
-    """Persist creation provenance and emit a create fact; the record is reset (a create is a new logical skill)."""
+    """Persist creation provenance and emit a create fact; the record is reset (a create is a new logical skill).
+
+    Foreground creates (``agent_created=False`` — e.g. ``/learn`` at the user's request) are stamped
+    ``created_by="learn"``: a learning-signal marker, NOT the curator-management opt-in (``"agent"``),
+    so /journey can show user-taught skills without handing them to autonomous curation.
+    """
     def _apply(rec: Dict[str, Any]) -> Dict[str, Any]:
         rec.clear()
-        rec.update(_empty_record(), created_by="agent" if agent_created else None)
+        rec.update(_empty_record(), created_by="agent" if agent_created else "learn")
         return {"created_by": rec["created_by"]}
     _mutate_and_emit(skill_name, "created", _apply, task_id=task_id, session_id=session_id)
 
@@ -639,13 +668,15 @@ def _archive_skill_locked(skill_name: str) -> Tuple[bool, str]:
         return False, f"skill '{skill_name}' not found"
     if is_external_skill_path(skill_dir):
         return False, _external_read_only_message(skill_name)
-    dest = _archive_dir() / skill_dir.name
+    # Flatten under the skill NAME, not the directory name: `mlops/training/accelerate` is the skill
+    # `huggingface-accelerate`, and restore/list/purge all key on the name.
+    dest = _archive_dir() / skill_name
     try:
         dest.parent.mkdir(parents=True, exist_ok=True)
     except OSError as e:
         return False, f"failed to create archive dir: {e}"
     if dest.exists():
-        dest = dest.with_name(f"{skill_dir.name}-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}")
+        dest = dest.with_name(f"{skill_name}-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}")
     # complete_package: consolidation may have re-homed support files first, so a disk-only capture can come
     # back hollow; the fill from the newest curator backup keeps rollback restorable.
     return _relocate(skill_dir, dest, skill_name, "archive", complete_package=True, skill=skill_name)
@@ -700,13 +731,9 @@ def _restore_skill_locked(skill_name: str) -> Tuple[bool, str]:
     archive_root = _archive_dir()
     if not archive_root.exists():
         return False, "no archive directory"
-    # Exact name first (recursive: older archives left nested layouts), then the timestamped duplicate. Only
-    # "<skill>-YYYYMMDDHHMMSS" counts — a bare startswith("<skill>-") would let restoring "git" steal "git-helpers".
-    dirs = [p for p in archive_root.rglob("*") if p.is_dir()]
-    prefix = f"{skill_name}-"
-    candidates = [p for p in dirs if p.name == skill_name] or sorted(
-        (p for p in dirs if p.name.startswith(prefix) and len(p.name) - len(prefix) == 14
-         and p.name[len(prefix):].isdigit()), reverse=True)
+    # Repair and restore share exact-name/timestamp matching; frontmatter alone
+    # must not make an unrelated archive directory a recoverable usage record.
+    candidates = _find_archived_skill_candidates(skill_name)
     if not candidates:
         return False, f"skill '{skill_name}' not found in archive"
     if (dest := _skills_dir() / skill_name).exists():

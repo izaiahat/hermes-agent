@@ -16,6 +16,50 @@ from gateway.session import SessionSource
 
 class TestGetChannelOverride:
 
+    def test_parsed_discord_default_sets_medium_without_changing_other_routes(self):
+        from types import SimpleNamespace
+        runner = object.__new__(GatewayRunner)
+        runner.config = GatewayConfig(platforms={
+            Platform.DISCORD: PlatformConfig.from_dict({
+                "channel_overrides": {"*": {"model": "gpt-6-sol", "reasoning_effort": "medium"}},
+            }),
+        })
+        discord = SessionSource(platform=Platform.DISCORD, chat_id="new-channel", user_id="u")
+        telegram = SessionSource(platform=Platform.TELEGRAM, chat_id="new-channel", user_id="u")
+        with patch.object(runner, "_resolve_session_key_or_none", return_value="session"), \
+             patch.object(runner, "_peek_session_state", return_value=None) as state, \
+             patch.object(runner, "_load_reasoning_config", return_value={"enabled": True, "effort": "high"}):
+            assert runner._resolve_session_reasoning_config(source=discord) == {"enabled": True, "effort": "medium"}
+            assert runner._resolve_session_reasoning_config(source=telegram)["effort"] == "high"
+            assert runner._resolve_session_reasoning_config()["effort"] == "high"
+            state.return_value = SimpleNamespace(conversation=SimpleNamespace(reasoning_override={"enabled": True, "effort": "low"}))
+            assert runner._resolve_session_reasoning_config(source=discord)["effort"] == "low"
+
+    def test_platform_wildcard_is_last_fallback_without_cross_platform_leakage(self):
+        default = ChannelOverride(model="discord-default")
+        exact = ChannelOverride(model="exact-model")
+        thread = ChannelOverride(model="thread-model")
+        parent = ChannelOverride(model="parent-model")
+        config = GatewayConfig(platforms={
+            Platform.DISCORD: PlatformConfig(enabled=True, channel_overrides={
+                "*": default, "chat": exact, "thread": thread, "parent": parent,
+            }),
+            Platform.TELEGRAM: PlatformConfig(enabled=True),
+        })
+        assert _get_channel_override(config, Platform.DISCORD, "future-channel") is default
+        assert _get_channel_override(
+            config, Platform.DISCORD, "chat", thread_id="thread", parent_id="parent"
+        ) is exact
+        assert _get_channel_override(
+            config, Platform.DISCORD, "new-thread", thread_id="thread", parent_id="parent"
+        ) is thread
+        assert _get_channel_override(
+            config, Platform.DISCORD, "new-thread", parent_id="parent"
+        ) is parent
+        assert _get_channel_override(config, Platform.TELEGRAM, "future-channel") is None
+        assert _get_channel_override(config, Platform.TELEGRAM, "chat") is None
+        assert _get_channel_override(config, Platform.SLACK, "future-channel") is None
+
 
     def test_no_override_when_channel_not_in_overrides(self):
         config = GatewayConfig(
