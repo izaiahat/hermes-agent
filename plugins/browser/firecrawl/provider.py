@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from typing import Any, Dict, Optional
 
 from agent.secret_scope import get_secret
@@ -56,6 +57,8 @@ class FirecrawlBrowserProvider(CloudBrowserProvider):
         except (ValueError, TypeError):
             ttl = 300
 
+        # Anchor before provisioning so request latency cannot extend the remote lease.
+        expires_at = time.time() + ttl
         response = self._post_create(f"{self._api_url()}/v2/browser", self._headers(), {"ttl": ttl})
         self._check_created(response)
         data = response.json()
@@ -65,6 +68,7 @@ class FirecrawlBrowserProvider(CloudBrowserProvider):
             "session_name": session_name,
             "bb_session_id": data["id"],
             "cdp_url": data["cdpUrl"],
+            "expires_at": expires_at,
             "features": {"firecrawl": True},
         }
 
