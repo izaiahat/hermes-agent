@@ -59,6 +59,16 @@ def effective_runtime_provider(
     return resolved
 
 
+def fallback_applies_to_primary(entry: dict[str, Any], primary_provider: Any) -> bool:
+    """An optional ``from_provider`` confines an entry to that primary route.
+
+    Unscoped entries retain their historical behavior. A scoped entry fails closed
+    when the primary identity is unknown, including during pre-agent auth recovery.
+    """
+    source = str(entry.get("from_provider") or "").strip().lower() if isinstance(entry, dict) else ""
+    return not source or source == str(primary_provider or "").strip().lower()
+
+
 def pre_agent_fallback_notice(
     primary_provider: Any, primary_model: Any, fallback_provider: Any, fallback_model: Any
 ) -> str:

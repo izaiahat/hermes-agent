@@ -1947,6 +1947,8 @@ def _update_fallback_context_compressor(agent) -> None:
         model=agent.model, context_length=fb_context_length, base_url=agent.base_url,
         api_key=getattr(agent, "api_key", ""), provider=agent.provider, api_mode=agent.api_mode,
     )
+    from agent.agent_init import refresh_astra_extended_compression
+    refresh_astra_extended_compression(agent)
     # Fallback activation is an error path: refresh an EXISTING verdict eagerly (the ceiling was voided by
     # update_model()), but a session that never probed keeps its lazy compaction-time probe rather than
     # resolving an auxiliary client while the primary route is failing (#114707).
@@ -2023,6 +2025,10 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None, reset_a
         unavailable = agent._unavailable_fallback_keys
         fb_provider = (fb.get("provider") or "").strip().lower()
         fb_model = (fb.get("model") or "").strip()
+        from hermes_cli.fallback_config import fallback_applies_to_primary
+        primary_provider = (getattr(agent, "_primary_runtime", None) or {}).get("provider") or agent.provider
+        if not fallback_applies_to_primary(fb, primary_provider):
+            continue
         if _should_skip_fallback_candidate(agent, fb, fb_key, fb_provider, fb_model, unavailable):
             continue
 

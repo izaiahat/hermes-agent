@@ -1733,7 +1733,11 @@ def _resolve_job_runtime(job: dict, job_id: str, jc: _CronJobConfig) -> tuple[di
         logger.warning(
             "Job '%s': primary provider resolve failed (%s: %s), trying fallback",
             job_id, "auth" if is_auth else "transient network", resolve_exc)
+        from hermes_cli.fallback_config import fallback_applies_to_primary
+        primary_provider = requested or (jc.model_cfg.get("provider") if isinstance(jc.model_cfg, dict) else "")
         for entry in get_fallback_chain(jc.cfg):
+            if not fallback_applies_to_primary(entry, primary_provider):
+                continue
             if not isinstance(entry, dict):
                 continue
             fb_provider = str(entry.get("provider") or "").strip()

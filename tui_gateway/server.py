@@ -2245,7 +2245,11 @@ def _resolve_runtime_with_fallback(resolve_kwargs: dict | None = None) -> _Runti
     try:
         return _RuntimeFallbackResolution(resolve_runtime_provider(**(resolve_kwargs or {})), None, False)
     except AuthError as primary_exc:
+        from hermes_cli.fallback_config import fallback_applies_to_primary
+        primary_provider = (resolve_kwargs or {}).get("requested") or (_load_cfg().get("model") or {}).get("provider")
         for entry in _load_fallback_model() or []:
+            if not fallback_applies_to_primary(entry, primary_provider):
+                continue
             fb_provider = str(entry.get("provider") or "").strip() if isinstance(entry, dict) else ""
             fb_model = str(entry.get("model") or "").strip() if isinstance(entry, dict) else ""
             if not fb_provider or not fb_model:
