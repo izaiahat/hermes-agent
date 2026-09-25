@@ -269,7 +269,7 @@ def test_zero_timeout_rejects_immediately(monkeypatch, tmp_path):
     assert time.monotonic() - started < 0.1
 
 
-def test_policy_cannot_raise_hard_ceiling_above_seven(monkeypatch, tmp_path):
+def test_policy_cannot_raise_hard_ceiling_above_five(monkeypatch, tmp_path):
     throttle, _ = _reload_with_policy(
         monkeypatch,
         tmp_path,
@@ -278,6 +278,33 @@ def test_policy_cannot_raise_hard_ceiling_above_seven(monkeypatch, tmp_path):
     snapshot = throttle.runtime_config()
     assert snapshot["max_concurrency"] == 5
     assert snapshot["max_delegates"] == 5
+    # Oversized batch must not report phantom active leases.
+    leases, active, limit = throttle.try_acquire_codex_delegate_slots(6)
+    assert leases is None and (active, limit) == (0, 5)
+    isolated_gate = tmp_path / "delegate-slots"
+    isolated_gate.mkdir()
+    monkeypatch.setattr(throttle, "_gate_dir", lambda: isolated_gate)
+    leases, active, limit = throttle.try_acquire_codex_delegate_slots(5)
+    assert leases is not None and (active, limit) == (0, 5)
+    try:
+        refused, active, limit = throttle.try_acquire_codex_delegate_slots(1)
+        assert refused is None and (active, limit) == (5, 5)
+    finally:
+        for lease in leases:
+            lease.release()
+    rolling, active, limit = throttle.try_acquire_codex_delegate_slots(1)
+    assert rolling is not None and (active, limit) == (0, 5)
+    rolling[0].release()
+
+
+def test_delegate_default_five_and_env_override(monkeypatch, tmp_path):
+    throttle = _reload_throttle(monkeypatch, tmp_path)
+    monkeypatch.delenv("HERMES_CODEX_MAX_DELEGATES", raising=False)
+    throttle = importlib.reload(throttle)
+    assert throttle.runtime_config()["max_delegates"] == 5
+    monkeypatch.setenv("HERMES_CODEX_MAX_DELEGATES", "4")
+    throttle = importlib.reload(throttle)
+    assert throttle.runtime_config()["max_delegates"] == 4
 
 
 def test_box_wide_gate_is_shared_across_processes(monkeypatch, tmp_path):

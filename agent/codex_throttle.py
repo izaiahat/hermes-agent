@@ -354,8 +354,12 @@ def try_acquire_codex_delegate_slots(
     released and the whole batch is denied before child construction.
     """
     limit = _MAX_DELEGATES
-    if count < 1 or count > limit or _DISABLED or not _HAVE_FCNTL:
-        return None, limit, limit
+    if count < 1 or count > limit:
+        # No slot was occupied by this refusal: report the requested batch size
+        # separately rather than claiming all slots are active.
+        return None, 0, limit
+    if _DISABLED or not _HAVE_FCNTL:
+        return None, 0, limit
     import fcntl as _fcntl
 
     gate_dir = _gate_dir()
