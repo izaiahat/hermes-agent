@@ -662,12 +662,11 @@ compression:
   #   "claude-sonnet": 0.35
   #   "gpt-5": 0.30
 
-  # Absolute token cap for the compression trigger (default: 256000).
-  # Compression fires at the LOWER of the ratio-based threshold and this count,
-  # bounding large-window sessions while lower proportional triggers still win
-  # whenever they fall below the cap. The cap survives model switches and fallbacks.
-  # Set null to restore ratio-only behavior.
-  threshold_tokens: 256000
+  # Optional absolute token cap for the compression trigger (default: null).
+  # When set to a positive count, compression fires at the LOWER of the active
+  # model's ratio-based threshold and this explicit cap. The cap survives model
+  # switches and fallbacks; null follows the active model window.
+  threshold_tokens: null
 
   # Existing Codex gpt-5.5 behavior: raise Hermes' compaction trigger to 85%
   # for the ChatGPT Codex OAuth route. Set false to opt back down to threshold.

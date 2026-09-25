@@ -1916,7 +1916,83 @@ def _compressor_max_tokens(agent):
     return None
 
 
+def _scale_astra_extended_compression(agent, cfg, cs):
+    """Opt-in baseline budgets for the extended Astra alias, never fleet-wide multipliers.
+
+    Run after the built-in engine resolves its actual window, before settings are bound
+    to the agent. Runtime normalization preserves -900k; only the wire strips it.
+    Ratios, counts and timeouts remain untouched. Integer budgets round down.
+    """
+    from agent.codex_headers import is_official_codex_base_url
+    baseline = _positive_int(
+        _cfg_dict(cfg, "compression").get("astra_extended_context_reference_tokens"),
+        reject=(bool, float),
+    )
+    if (not baseline or str(agent.model).lower() != "gpt-6-astra-900k"
+            or str(agent.provider).lower() != "openai-codex"
+            or not is_official_codex_base_url(agent.base_url or "")):
+        return cs
+    cc = agent.context_compressor
+    context = cc.context_length
+    if context <= baseline:
+        return cs
+    from agent.native_compaction import resolve_compact_threshold
+    # Scale the EFFECTIVE native trigger, including the baseline safety gap, rather
+    # than scaling the configured value and accidentally shrinking the relative gap.
+    native = resolve_compact_threshold(
+        cs.codex_responses_compact_threshold,
+        cc.preview_threshold_tokens(agent.model, baseline, agent.provider),
+    )
+    cs = CompressionSettings(**vars(cs))
+    for setting, attr in (
+        ("threshold_tokens", "threshold_tokens_cap"),
+        ("proactive_prune_tokens", "proactive_prune_tokens"),
+        ("proactive_prune_min_chars", "proactive_prune_min_result_chars"),
+        ("proactive_prune_min_reclaim", "proactive_prune_min_reclaim_tokens"),
+    ):
+        value = getattr(cc, attr)
+        if isinstance(value, int) and value > 0:
+            value = value * context // baseline
+            setattr(cc, attr, value)
+            setattr(cs, setting, value)
+    for setting in ("tool_output_retention_min_chars", "tool_output_retention_max_inline_chars",
+                    "micro_compact_defrag_tokens"):
+        value = getattr(cs, setting)
+        if value > 0:
+            setattr(cs, setting, value * context // baseline)
+    cs.codex_responses_compact_threshold = native * context // baseline
+    cc.update_model(model=agent.model, context_length=context, base_url=agent.base_url,
+                    api_key=getattr(agent, "api_key", ""), provider=agent.provider, api_mode=agent.api_mode)
+    return cs
+
+
+def refresh_astra_extended_compression(agent):
+    """Rebase route-dependent budgets after update_model, before feasibility clamps.
+
+    Always start from the unscaled init settings, not the previous route's effective
+    values. No-op for plugins, legacy agents, and sessions without the opt-in.
+    """
+    baseline = getattr(agent, "_astra_compression_baseline", None)
+    if not isinstance(baseline, tuple):
+        return
+    reference, settings, compressor_budgets = baseline
+    cc = agent.context_compressor
+    for attr, value in compressor_budgets.items():
+        setattr(cc, attr, value)
+    cc.update_model(model=agent.model, context_length=cc.context_length,
+                    base_url=agent.base_url, api_key=getattr(agent, "api_key", ""),
+                    provider=agent.provider, api_mode=agent.api_mode)
+    cs = _scale_astra_extended_compression(
+        agent, {"compression": {"astra_extended_context_reference_tokens": reference}}, settings,
+    )
+    agent.codex_responses_compact_threshold = cs.codex_responses_compact_threshold
+    agent._tool_output_retention_min_chars = cs.tool_output_retention_min_chars
+    agent._tool_output_retention_max_inline_chars = cs.tool_output_retention_max_inline_chars
+    cc._micro_compact_defrag_threshold_tokens = cs.micro_compact_defrag_tokens
+
+
 def _build_context_engine(agent, _agent_cfg, cs, _custom_providers, _effective_context_length, session_db):
+    agent._astra_compression_baseline = None
     _selected_engine = _select_context_engine(_agent_cfg)
     if _selected_engine is not None:
         agent.context_compressor = _selected_engine
@@ -1958,6 +2034,19 @@ def _build_context_engine(agent, _agent_cfg, cs, _custom_providers, _effective_c
             min_tail_user_messages=cs.min_tail_users, tail_mode=cs.tail_mode,
             custom_providers=_custom_providers,
         )
+        reference = _positive_int(
+            _cfg_dict(_agent_cfg, "compression").get("astra_extended_context_reference_tokens"),
+            reject=(bool, float),
+        )
+        if reference:
+            agent._astra_compression_baseline = (
+                reference, CompressionSettings(**vars(cs)),
+                {attr: getattr(agent.context_compressor, attr) for attr in (
+                    "threshold_tokens_cap", "proactive_prune_tokens",
+                    "proactive_prune_min_result_chars", "proactive_prune_min_reclaim_tokens",
+                )},
+            )
+        cs = _scale_astra_extended_compression(agent, _agent_cfg, cs)
     _bind_session_state = getattr(agent.context_compressor, "bind_session_state", None)
     if callable(_bind_session_state):
         with suppress(Exception):

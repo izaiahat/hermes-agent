@@ -114,7 +114,7 @@ def test_unchanged_compression_config_is_noop(monkeypatch):
     assert compressor.threshold_tokens == 99_999
 
 
-def test_clearing_threshold_tokens_restores_default_cap(monkeypatch):
+def test_clearing_threshold_tokens_restores_uncapped_default(monkeypatch):
     session, compressor = _session_with_compressor(threshold_tokens_cap=100_000)
     assert compressor.threshold_tokens == 100_000
 
@@ -128,17 +128,12 @@ def test_clearing_threshold_tokens_restores_default_cap(monkeypatch):
     )
     server._sync_agent_compression_with_config("sid-95151", session)
 
-    # Key removal restores what a fresh agent build installs (merged DEFAULT_CONFIG), not "no
-    # cap": a None here re-derives the uncapped ratio trigger and the 256K default is lost.
-    assert compressor.threshold_tokens_cap == 256_000
+    assert compressor.threshold_tokens_cap is None
     assert compressor.threshold_tokens > 100_000
 
 
-def test_absent_threshold_tokens_keeps_default_cap_on_1m_window(monkeypatch):
-    """#117093: the live read is unmerged (missing key = unset), so a config.yaml without
-    compression.threshold_tokens used to wipe the ctor-installed 256K cap at the first
-    turn's sync — the trigger re-derived to the uncapped ratio value (500K on a 1M window)
-    and compaction stopped firing at 256K while telemetry still reported the capped figure."""
+def test_absent_threshold_tokens_removes_old_cap_on_1m_window(monkeypatch):
+    """The live unmerged config read must clear an old implicit cap when the key is absent."""
     compressor = ContextCompressor(
         model="unset-test-model",
         threshold_percent=0.85,
@@ -156,18 +151,15 @@ def test_absent_threshold_tokens_keeps_default_cap_on_1m_window(monkeypatch):
         codex_responses_compact_threshold=200_000,
     )
     session = {"agent": agent, "session_key": "session-unset"}
-    assert compressor.threshold_tokens == 256_000  # min(1M * 0.85, 256K cap)
+    assert compressor.threshold_tokens == 256_000
 
-    # The pin is scoped to the configured default route (#116467); that scoping has its own tests,
-    # this one is about the cap, so keep the 1M window in scope for the bare test runtime.
     import agent.agent_init as agent_init
 
     monkeypatch.setattr(agent_init, "config_context_length_for_runtime", lambda _agent, _cfg=None: 1_000_000)
-    _sync_with_cfg(monkeypatch, session, {"model": {"context_length": 1_000_000}, "compression": {}})
+    _sync_with_cfg(monkeypatch, session, {"model": {"context_length": 1_000_000}, "compression": {"threshold": 0.85}})
 
-    assert compressor.threshold_tokens_cap == 256_000
-    # threshold is absent too, so the derived 0.50 ratio applies — the 256K cap must still win.
-    assert compressor.threshold_tokens == 256_000
+    assert compressor.threshold_tokens_cap is None
+    assert compressor.threshold_tokens == 850_000
 
 
 
@@ -276,8 +268,8 @@ def test_removing_threshold_restores_derived_default(monkeypatch):
     )
     assert compressor._config_threshold_percent == 0.50
     assert compressor.threshold_percent == 0.50
-    # The absent cap key restores the 256K default, which binds below the 300K ratio value.
-    assert compressor.threshold_tokens == min(int(600_000 * 0.50), 256_000)
+    # Without an explicit cap the active model's ratio trigger wins.
+    assert compressor.threshold_tokens == int(600_000 * 0.50)
 
 
 def test_removing_context_length_reinfers_from_model_metadata(monkeypatch):
@@ -294,7 +286,7 @@ def test_removing_context_length_reinfers_from_model_metadata(monkeypatch):
     _sync_with_cfg(monkeypatch, session, {"model": {}, "compression": {}})
     assert compressor._config_context_length is None
     assert compressor.context_length == 1_000_000
-    assert compressor.threshold_tokens == min(int(1_000_000 * 0.50), 256_000)
+    assert compressor.threshold_tokens == int(1_000_000 * 0.50)
 
 
 def test_removing_idle_compact_after_seconds_restores_zero(monkeypatch):
