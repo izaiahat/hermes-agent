@@ -1,6 +1,11 @@
 """Unit tests for agent.turn_facade_lease (admission + lease bracket)."""
+import sqlite3
 import threading
 from types import SimpleNamespace
+
+import pytest
+
+import agent.turn_facade_lease as lease_module
 
 from agent.turn_facade_lease import (
     LEASE_TTL_SECONDS,
@@ -125,3 +130,93 @@ def test_interrupt_turn_only_while_active():
     assert calls == ["lost"] and lease.interrupt_message == "lost"
     lease.deactivate_after_liveness_abort()
     assert lease.stop.is_set() and lease.is_turn_active() is False
+
+
+@pytest.mark.parametrize("error", ["database is locked", "database is busy"])
+def test_transient_refresh_contention_does_not_interrupt(monkeypatch, error):
+    clock = [100.0]
+    monkeypatch.setattr(lease_module.time, "monotonic", lambda: clock[0])
+    db = _Db()
+    def locked(*args, **kwargs):
+        raise sqlite3.OperationalError(error)
+    db.refresh_session_turn_lease = locked
+    agent = _agent(db)
+    calls = []
+    agent.interrupt = lambda message, **kw: calls.append(message)
+    lease = DurableTurnLease(agent, db, "s1", "h")
+    lease.turn_active = True
+    clock[0] += 80.0  # one write-patience wait and a delayed scheduler tick
+    assert lease.refresh_tick() is None
+    assert calls == [] and lease.interrupt_message is None
+    assert not lease.stop.is_set()
+    db.refresh_session_turn_lease = lambda *args, **kwargs: True
+    clock[0] += 60.0
+    assert lease.refresh_tick() is None  # the next tick really retries
+    assert calls == []
+
+
+def test_repeated_contention_near_ttl_interrupts_before_expiry(monkeypatch):
+    clock = [100.0]
+    monkeypatch.setattr(lease_module.time, "monotonic", lambda: clock[0])
+    db = _Db()
+    def locked(*args, **kwargs):
+        raise sqlite3.OperationalError("database is locked")
+    db.refresh_session_turn_lease = locked
+    agent = _agent(db)
+    calls = []
+    agent.interrupt = lambda message, **kw: calls.append((message, kw))
+    lease = DurableTurnLease(agent, db, "s1", "h")
+    lease.turn_active = True
+    for elapsed in (80, 160, 239):
+        clock[0] = 100.0 + elapsed
+        assert lease.refresh_tick() is None
+    assert calls == []
+    clock[0] = 340.0  # TTL 300s, 60s safety margin
+    assert lease.refresh_tick() is False
+    assert len(calls) == 1 and calls[0][1]["hard_cancel"] is True
+    assert calls[0][1]["tool_reason"] == "session turn lease lost"
+
+
+def test_successful_refresh_resets_contention_deadline(monkeypatch):
+    clock = [100.0]
+    monkeypatch.setattr(lease_module.time, "monotonic", lambda: clock[0])
+    db = _Db()
+    agent = _agent(db)
+    calls = []
+    agent.interrupt = lambda message, **kw: calls.append(message)
+    lease = DurableTurnLease(agent, db, "s1", "h")
+    lease.turn_active = True
+    clock[0] = 300.0
+    assert lease.refresh_tick() is None
+    def locked(*args, **kwargs):
+        raise sqlite3.OperationalError("database is locked")
+    db.refresh_session_turn_lease = locked
+    clock[0] = 400.0
+    assert lease.refresh_tick() is None
+    assert calls == []
+
+
+def test_holder_fenced_refresh_miss_still_interrupts():
+    db = _Db()
+    db.refresh_session_turn_lease = lambda *args, **kwargs: False
+    agent = _agent(db)
+    calls = []
+    agent.interrupt = lambda message, **kw: calls.append((message, kw))
+    lease = DurableTurnLease(agent, db, "s1", "h")
+    lease.turn_active = True
+    assert lease.refresh_tick() is False
+    assert len(calls) == 1 and calls[0][1]["tool_reason"] == "session turn lease lost"
+
+
+def test_non_contention_refresh_error_still_interrupts():
+    db = _Db()
+    def broken(*args, **kwargs):
+        raise sqlite3.OperationalError("disk I/O error")
+    db.refresh_session_turn_lease = broken
+    agent = _agent(db)
+    calls = []
+    agent.interrupt = lambda message, **kw: calls.append(message)
+    lease = DurableTurnLease(agent, db, "s1", "h")
+    lease.turn_active = True
+    assert lease.refresh_tick() is False
+    assert len(calls) == 1

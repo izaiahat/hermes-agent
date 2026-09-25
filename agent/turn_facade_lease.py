@@ -9,7 +9,9 @@ bodies run on per-handle workers), not per-turn threads.
 """
 import logging
 import os
+import sqlite3
 import threading
+import time
 from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
@@ -21,6 +23,8 @@ logger = logging.getLogger("run_agent")
 _REASON_LEASE_LOST = "session turn lease lost"
 
 LEASE_TTL_SECONDS = 300.0
+# Stop renewal before the lease can expire; keep one normal 60s refresh interval in reserve.
+LEASE_EXPIRY_MARGIN_SECONDS = 60.0
 LEASE_WAIT_SECONDS = 1800.0
 
 
@@ -39,6 +43,9 @@ class DurableTurnLease:
         self.holder = holder
         self.stop = threading.Event()
         self.refresh_interval = float(getattr(agent, "_session_turn_lease_refresh_interval", 60.0))
+        # The row was just acquired. Track the last proven extension using a monotonic
+        # clock, never the wall clock (which may jump while a turn is running).
+        self._last_refresh_started_at = time.monotonic()
         self._lock = threading.Lock()
         self.turn_active = False
         self.interrupt_message: Optional[str] = None
@@ -178,18 +185,19 @@ class DurableTurnLease:
                 _set_interrupt(False, agent._execution_thread_id)
 
     def refresh_tick(self):
-        """One periodic renewal (every ``refresh_interval`` via the shared scheduler); a miss or
-        error interrupts the turn. Returning False stops the timer.
-
-        The holder-qualified UPDATE fences a late refresher from a successor lease. The façade's
-        finally sets ``stop`` before releasing, so a holder-fenced miss observed after stop is not
-        a loss."""
+        """Renew the holder-fenced row. A busy SQLite writer is not a lost lease:
+        retry next tick while the last proven extension is safely within its TTL.
+        Returning False stops the timer."""
         if self.stop.is_set():
             return False
+        started_at = time.monotonic()
         try:
             if self.db.refresh_session_turn_lease(
                 self._current_session_id(), self.holder, ttl_seconds=LEASE_TTL_SECONDS
             ):
+                # The DB computes expiry before it waits for the write lock; recording
+                # call start rather than completion keeps our deadline conservative.
+                self._last_refresh_started_at = started_at
                 return None
             if self.stop.is_set():
                 return False
@@ -197,12 +205,28 @@ class DurableTurnLease:
                 "Lost session turn lease while turn is active: %s", self._current_session_id()
             )
             self._interrupt_turn("Session turn lease lost; stopping to protect the transcript.")
-        except Exception:
+        except Exception as exc:
             if self.stop.is_set():
                 return False
-            logger.warning(
-                "Failed to refresh session turn lease: %s", self._current_session_id(), exc_info=True,
-            )
+            from hermes_state_errors import classify_persistence_error
+            if (isinstance(exc, sqlite3.OperationalError)
+                    and classify_persistence_error(exc) == "locked"):
+                remaining = (LEASE_TTL_SECONDS - LEASE_EXPIRY_MARGIN_SECONDS
+                             - (time.monotonic() - self._last_refresh_started_at))
+                if remaining > 0:
+                    logger.warning(
+                        "Session turn lease refresh busy for %s; retrying next tick "
+                        "(%.1fs until safety deadline)", self._current_session_id(), remaining,
+                    )
+                    return None
+                logger.error(
+                    "Session turn lease refresh blocked past safety deadline: %s",
+                    self._current_session_id(), exc_info=True,
+                )
+            else:
+                logger.warning(
+                    "Failed to refresh session turn lease: %s", self._current_session_id(), exc_info=True,
+                )
             self._interrupt_turn(
                 "Session turn lease could not be refreshed; stopping to protect the transcript."
             )
