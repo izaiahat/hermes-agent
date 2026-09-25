@@ -180,6 +180,7 @@ def _build_child_agent(
     # callers such as /review pass auxiliary.review here so fallback policy is
     # not accidentally read from the general delegation block.
     routing_cfg: Optional[Dict[str, Any]] = None,
+    task_reasoning_effort: Optional[str] = None,
     # Legacy; accepted for wire compat but ignored (capability is depth-derived).
     role: str = "leaf",
 ):
@@ -226,6 +227,7 @@ def _build_child_agent(
         override_acp_command=override_acp_command,
         override_acp_args=override_acp_args,
         routing_cfg=routing_cfg,
+        task_reasoning_effort=task_reasoning_effort,
     )
     if override_request_overrides is not None:
         # honored whenever set, incl. the inherit branch where
@@ -370,7 +372,7 @@ def _run_single_child(
 
 
 
-def _release_partial_children(parent_agent) -> None:
+def _release_partial_children(parent_agent, children) -> None:
     """Close and untrack children built before a failed construction.
 
     A half-built batch must leave no agent in ``parent._active_children``: the
@@ -380,12 +382,15 @@ def _release_partial_children(parent_agent) -> None:
     tracked = getattr(parent_agent, "_active_children", None)
     if not isinstance(tracked, list):
         return
+    owned = {id(child) for _, _, child in children}
     lock = getattr(parent_agent, "_active_children_lock", None)
     if lock is not None:
         with lock:
-            taken, tracked[:] = list(tracked), []
+            taken = [child for child in tracked if id(child) in owned]
+            tracked[:] = [child for child in tracked if id(child) not in owned]
     else:
-        taken, tracked[:] = list(tracked), []
+        taken = [child for child in tracked if id(child) in owned]
+        tracked[:] = [child for child in tracked if id(child) not in owned]
     for child in taken:
         with suppress(Exception):
             close = getattr(child, "close", None)
@@ -412,6 +417,15 @@ def _build_children(
     }
     children = []
     for i, t in enumerate(task_list):
+        route = t.get("_resolved_route", creds)
+        task_overrides = {**overrides,
+            "override_provider": route["provider"], "override_base_url": route["base_url"],
+            "override_api_key": route["api_key"], "override_api_mode": route["api_mode"],
+            "override_request_overrides": route.get("request_overrides"),
+            "override_acp_command": route.get("command"), "override_acp_args": route.get("args"),
+            "routing_cfg": t.get("_routing_cfg", routing_cfg),
+            "task_reasoning_effort": t.get("reasoning_effort"),
+        }
         _task_schema = task_schemas[i] if i < len(task_schemas) else None
         _child_context = t.get("context")
         if _task_schema is not None:
@@ -420,11 +434,15 @@ def _build_children(
             child = _build_child_preserving_parent_tools(
                 task_index=i, goal=t["goal"], context=_child_context,
                 toolsets=None,  # always inherit the parent's toolsets
-                model=creds["model"], max_iterations=max_iterations, task_count=len(task_list),
-                parent_agent=parent_agent, role=_normalize_role(t.get("role") or top_role), **overrides,
+                model=route["model"], max_iterations=max_iterations, task_count=len(task_list),
+                parent_agent=parent_agent, role=_normalize_role(t.get("role") or top_role), **task_overrides,
             )
         except ValueError as exc:
-            return [], str(exc)
+            return children, str(exc)
+        except BaseException:
+            _release_partial_children(parent_agent, children)
+            raise
+        setattr(child, "_delegate_requested_route", {k: t.get(k) for k in ("model", "provider", "reasoning_effort")})
         if _task_schema is not None:
             with _quiet("Could not attach output schema to child %d", i):
                 child._delegate_output_schema = _task_schema
@@ -446,6 +464,28 @@ def _build_children(
                 _ident_ref["delegation_id"] = live_deleg_id
         children.append((i, t, child))
     return children, None
+
+
+def _resolve_task_routes(task_list, routing_cfg, parent_agent, default_creds):
+    """Resolve every requested route through the official provider resolver before building children."""
+    from hermes_constants import parse_reasoning_effort
+    for task in task_list:
+        for key in ("model", "provider", "reasoning_effort"):
+            if key in task and (not isinstance(task[key], str) or not task[key].strip()):
+                raise ValueError(f"task {key} must be a nonempty string")
+        if "reasoning_effort" in task and parse_reasoning_effort(task["reasoning_effort"]) is None:
+            raise ValueError(f"Unknown task reasoning_effort {task['reasoning_effort']!r}")
+        if not any(key in task for key in ("model", "provider")):
+            task["_resolved_route"] = default_creds
+            continue
+        cfg = dict(routing_cfg)
+        if task.get("provider") and task["provider"] != cfg.get("provider"):
+            # Endpoint, static key, transport and mode belong to the OLD route.
+            for key in ("model", "base_url", "api_key", "api_mode", "command", "args", "request_overrides"):
+                cfg.pop(key, None)
+        cfg.update({k: task[k] for k in ("model", "provider") if k in task})
+        task["_routing_cfg"] = cfg
+        task["_resolved_route"] = _resolve_delegation_credentials(cfg, parent_agent)
 
 
 def _oneshot_spawn_budget(parent_agent: Any, requested: int) -> Optional[str]:
@@ -529,12 +569,10 @@ def delegate_task(
         # spawn loudly (#80450).
         return tool_error(str(exc))
 
-    # Capacity admission (operator 2026-09-16, receipt
-    # OPERATOR-DECISION-20260916-delegation-width-8.json): width 8 is only safe
-    # when the host can actually carry it. The canonical eight's gate —
-    # MemAvailable >= 8 GiB, memory PSI full avg10 < 1%, no swap movement,
-    # one-minute load < 8 — is refused HERE, at the only spawn site, with the
-    # measured reason. Spawn intent only: control actions never touch it.
+    # Host admission: 12-wide calls share 16 atomic host slots, subject to
+    # 4 GiB + 768 MiB/new-child available headroom, PSI full < 2%, sustained
+    # swap < 4 MiB/s and load < 1.5x affinity CPU count. Spawn intent only:
+    # control actions never touch this measured gate.
     if goal or tasks:
         try:
             # House style is the package path; the bare name only resolves when
@@ -560,6 +598,11 @@ def delegate_task(
         task_images, err = _coerce_task_images(task_list, images)
     if err:
         return tool_error(err)
+    assert task_list is not None
+    try:
+        _resolve_task_routes(task_list, routing_cfg, parent_agent, creds)
+    except ValueError as exc:
+        return tool_error(str(exc))
     err = _oneshot_spawn_budget(parent_agent, len(task_list))
     if err:
         return tool_error(err)
@@ -580,14 +623,18 @@ def delegate_task(
     # total budget. Rejecting here means no child ran, so nothing needs undoing.
     # A Codex-backed child also consumes a slot of the SHARED subscription, so it
     # must pass the host-wide gate too.
+    codex_indexes = [i for i, t in enumerate(task_list) if
+        str(t["_resolved_route"].get("provider") or getattr(parent_agent, "provider", "") or "").lower() == "openai-codex"]
     leases, active_before, limit = _try_reserve_descendants(
-        len(task_list), use_global_codex_gate=_delegation_uses_codex(parent_agent))
+        len(task_list), codex_indexes=codex_indexes)
     if leases is None:
         return tool_error(
-            f"delegation refused: {len(task_list)} more children would exceed the active-descendant "
-            f"budget ({active_before} active, limit {limit}) — no child ran. Wait for running children "
-            "or raise delegation.max_total_descendants."
+            f"delegation refused: requested batch size {len(task_list)}; active slots {active_before}, "
+            f"limit {limit} at the active-descendant/provider/host gate — no child ran. "
+            "Wait for running children or host pressure to clear; split a batch that exceeds its limit."
         )
+    handed_off = False
+    children = []
     try:
         children, err = _build_children(
             task_list, task_schemas, creds, top_role=top_role, max_iterations=default_max_iter,
@@ -595,20 +642,24 @@ def delegate_task(
             live_writers=live_writers, task_images=task_images,
         )
         if err:
+            _release_partial_children(parent_agent, children)
             return tool_error(err)
+        for (_, _, child), lease in zip(children, leases):
+            setattr(child, "_delegate_capacity_lease", lease)
         batch = _Batch(
             task_list, children, parent_agent, creds, context, top_role, max_children,
             live_deleg_id, live_writers, live_paths, *origin, overall_start,
         )
+        handed_off = True
         return _run_batch(batch, background)
     except BaseException:
-        # Construction died partway: close and untrack every child that WAS built,
-        # or the parent keeps tracking agents that will never run.
-        _release_partial_children(parent_agent)
+        if not handed_off:
+            _release_partial_children(parent_agent, children)
         raise
     finally:
-        for lease in leases:
-            lease.release()
+        if not handed_off:
+            for lease in leases:
+                lease.release()
 
 
 # ── OpenAI function-calling schema ──────────────────────────────────────────
@@ -669,7 +720,7 @@ _DESCRIPTION_HEAD = (
     "the parent applies the transition.\n"
 )
 _DESCRIPTION_TAIL = (
-    "- Children inherit the parent model unless pinned via delegation.provider / delegation.model in config.yaml."
+    "- Task model/provider/reasoning_effort overrides inherit delegation.provider/model or parent; auth uses Hermes."
 )
 
 def _build_tasks_param_description() -> str:
@@ -695,6 +746,9 @@ def _build_dynamic_schema_overrides() -> dict:
     # Copy properties so the static schema dict is never mutated.
     overrides_params["properties"] = {k: dict(v) for k, v in DELEGATE_TASK_SCHEMA["parameters"]["properties"].items()}
     overrides_params["properties"]["tasks"]["description"] = _build_tasks_param_description()
+    # Static schema can be imported before config is loaded. Keep the actual
+    # registry limit in sync with the dynamically advertised per-call width.
+    overrides_params["properties"]["tasks"]["maxItems"] = _get_max_concurrent_children()
 
     if not independent_completions:
         tasks = overrides_params["properties"]["tasks"]
@@ -744,6 +798,9 @@ DELEGATE_TASK_SCHEMA = {
                             "Background THIS child needs: file paths, error messages, constraints. Each child "
                             "sees only its own context — repeat shared background in every task that needs it.",
                         ),
+                        "model": _p("string", "Optional child model override supported by the selected provider."),
+                        "provider": _p("string", "Optional child provider resolved via Hermes configured provider/auth."),
+                        "reasoning_effort": _p("string", "Optional child effort: none, minimal, low, medium, high, xhigh, max or ultra; may clamp to route support."),
                         "output_schema": _p(
                             "object",
                             "Optional JSON Schema this child's final answer must validate against (told to the "

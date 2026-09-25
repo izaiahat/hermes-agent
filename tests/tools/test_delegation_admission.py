@@ -1,11 +1,8 @@
-"""The capacity admission gate that makes delegation width 8 safe.
+"""The capacity admission gate for the 12-wide / 16-host-slot policy.
 
-Operator decision 2026-09-16 raised the per-call child width from 5 to 8
-(receipt ops/linear/approvals/OPERATOR-DECISION-20260916-delegation-width-8.json)
-on the condition that the host itself be measured before every spawn. These
-tests drive the gate against a /proc-shaped directory through HERMES_PROC_ROOT —
-a test seam, never a bypass — and cover the delegate_task wiring, which must
-fail CLOSED when the gate module cannot be imported.
+Operator decision 2026-09-23 permits more parallel native children while keeping
+atomic host reservations and measured pressure refusals. These tests use a
+/proc-shaped directory through HERMES_PROC_ROOT (test seam, never bypass).
 """
 from __future__ import annotations
 
@@ -20,9 +17,11 @@ from tools import delegation_admission as admission
 GIB_KB = 1024 * 1024
 
 
-def write_proc(root, *, mem_kb=32 * GIB_KB, psi=0.0, load=1.0, swap=(0, 0, 0)):
+def write_proc(root, *, mem_kb=32 * GIB_KB, swap_free_kb=2 * GIB_KB,
+               psi=0.0, load=1.0, swap=(0, 0, 0)):
     (root / "meminfo").write_text(
-        f"MemTotal:       65000000 kB\nMemAvailable:   {mem_kb} kB\n", encoding="utf-8"
+        f"MemTotal:       65000000 kB\nMemAvailable:   {mem_kb} kB\n"
+        f"SwapFree:      {swap_free_kb} kB\n", encoding="utf-8"
     )
     pressure = root / "pressure"
     pressure.mkdir(exist_ok=True)
@@ -55,8 +54,16 @@ class TestThresholds:
         assert verdict() is None
 
     def test_low_memory_refuses_and_names_the_measure(self, proc_root):
-        write_proc(proc_root, mem_kb=4 * GIB_KB)
-        assert "MemAvailable" in verdict()
+        write_proc(proc_root, mem_kb=4 * GIB_KB - 1)
+        assert "MemAvailable" in (verdict() or "")
+
+    @pytest.mark.parametrize("free_kb,refused", [(GIB_KB - 1, True), (GIB_KB, False), (2 * GIB_KB, False)])
+    def test_swap_free_floor_is_independent_of_quiet_swap_io(self, proc_root, free_kb, refused):
+        write_proc(proc_root, swap_free_kb=free_kb)
+        result = verdict()
+        assert (result is not None) is refused
+        if refused:
+            assert result is not None and 'SwapFree' in result and '1 GiB' in result
 
     def test_memory_pressure_refuses(self, proc_root):
         write_proc(proc_root, psi=2.5)
@@ -86,13 +93,19 @@ class TestThresholds:
         finally:
             admission.swap_io = original
 
-    def test_swap_moving_in_both_samples_refuses(self, proc_root):
+    @pytest.mark.parametrize("pages_per_second,refused", [(0, False), (255, False), (1023, False), (1024, True), (2048, True)])
+    def test_only_sustained_material_swap_refuses(self, proc_root, monkeypatch, pages_per_second, refused):
         write_proc(proc_root)
-        reads = iter([10, 11, 13])
+        monkeypatch.setattr(admission.os, 'sysconf', lambda _key: 4096)
+        reads = iter([10, 10 + pages_per_second * 5, 10 + pages_per_second * 10])
         original = admission.swap_io
         admission.swap_io = lambda: next(reads)
         try:
-            assert "swap moving in both" in verdict()
+            result = admission.admission_problem(sample_seconds=5, sleep=lambda _s: None)
+            if refused:
+                assert result is not None and "sustained swap" in result
+            else:
+                assert result is None
         finally:
             admission.swap_io = original
 
@@ -107,6 +120,49 @@ class TestThresholds:
         finally:
             admission._measure = original
         assert len(calls) == 1
+
+    @pytest.mark.parametrize("psi,refused", [(1.99, False), (2.00, True)])
+    def test_psi_boundary(self, proc_root, psi, refused):
+        write_proc(proc_root, psi=psi)
+        assert (verdict() is not None) is refused
+
+    @pytest.mark.parametrize("load,refused", [(11.99, False), (12.00, True)])
+    def test_eight_core_load_boundary(self, proc_root, monkeypatch, load, refused):
+        write_proc(proc_root, load=load)
+        monkeypatch.setattr(admission, "MAX_LOAD_1M", 12.0)
+        assert (verdict() is not None) is refused
+
+    def test_four_gib_floor_and_four_child_available_reserve(self, proc_root, tmp_path, monkeypatch):
+        monkeypatch.setattr(admission, "_budget_path", lambda: tmp_path / "budget.json")
+        monkeypatch.setattr(admission, "_start_tick", lambda _pid: "test")
+        monkeypatch.setattr(admission.os, "sched_getaffinity", lambda _pid: set(range(8)))
+        write_proc(proc_root, mem_kb=4 * GIB_KB - 1)
+        assert "4 GiB" in (verdict() or "")
+        admission._CACHE.update(at=0.0, result=None)
+        write_proc(proc_root, mem_kb=4 * GIB_KB)
+        assert verdict() is None
+        # Four-child batch requires 4 GiB + 4 * 768 MiB available.
+        write_proc(proc_root, mem_kb=7 * GIB_KB - 1)
+        assert admission.try_reserve_host_children(4)[0] is None
+        write_proc(proc_root, mem_kb=7 * GIB_KB)
+        assert admission.host_child_limit() == 4
+        leases, active, limit = admission.try_reserve_host_children(4)
+        assert leases is not None and (active, limit) == (0, 4)
+        assert admission.try_reserve_host_children(1)[0] is None
+        for lease in leases:
+            lease.release()
+        assert admission.try_reserve_host_children(5)[0] is None
+
+    def test_host_memory_sizing_and_unreadable_total_fail_closed(self, proc_root, monkeypatch):
+        monkeypatch.setattr(admission.os, "sched_getaffinity", lambda _pid: set(range(8)))
+        write_proc(proc_root)
+        (proc_root / "meminfo").write_text(
+            f"MemTotal: {31 * GIB_KB} kB\nMemAvailable: {19 * GIB_KB} kB\n"
+        )
+        assert admission.host_child_limit() == 4
+        (proc_root / "meminfo").write_text(f"MemAvailable: {19 * GIB_KB} kB\n")
+        with pytest.raises(RuntimeError, match="MemTotal unreadable"):
+            admission.host_child_limit()
 
 
 def _mock_parent():

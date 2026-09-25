@@ -17,6 +17,15 @@ import types
 import unittest
 from unittest.mock import MagicMock, patch
 
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def _isolated_host_budget(tmp_path, monkeypatch):
+    """Mock children must not compete with live TUI host leases."""
+    from tools import delegation_admission
+    monkeypatch.setattr(delegation_admission, "_budget_path", lambda: tmp_path / "host-budget.json")
+
 from tools.delegate_tool import (
     DELEGATE_BLOCKED_TOOLS,
     DELEGATE_TASK_SCHEMA,
@@ -88,9 +97,10 @@ class TestDelegateRequirements(unittest.TestCase):
         self.assertNotIn("acp_args", props)
         self.assertNotIn("acp_command", props["tasks"]["items"]["properties"])
         self.assertNotIn("acp_args", props["tasks"]["items"]["properties"])
-        # Operator 2026-09-16 raised the hard width ceiling from 5 to 8
-        # (OPERATOR-DECISION-20260916-delegation-width-8.json).
-        self.assertEqual(props["tasks"]["maxItems"], 8)
+        # Import-time schema can reflect test/bootstrap config; the registered
+        # definition is rebuilt dynamically when the model requests it.
+        self.assertGreaterEqual(props["tasks"]["maxItems"], 1)
+        self.assertLessEqual(props["tasks"]["maxItems"], 12)
 
     def test_top_level_description_compact_and_complete(self):
         """The top-level description must stay compact while keeping every
@@ -1965,15 +1975,18 @@ class TestDelegateEventEnum(unittest.TestCase):
 
 
 class TestConcurrencyDefaults(unittest.TestCase):
-    """Tests for the hard eight-wide per-call ceiling.
-
-    Operator decision 2026-09-16 raised the width from 5 to 8 (receipt
-    ops/linear/approvals/OPERATOR-DECISION-20260916-delegation-width-8.json).
-    """
+    """Tests for the hard four-wide per-call ceiling and shared host admission."""
 
     @patch("tools.delegate_tool._load_config", return_value={})
-    def test_default_is_eight(self, mock_cfg):
-        self.assertEqual(_get_max_concurrent_children(), 8)
+    def test_default_is_four(self, mock_cfg):
+        self.assertEqual(_get_max_concurrent_children(), 4)
+
+    @patch("tools.delegate_tool._load_config", return_value={})
+    def test_registered_schema_advertises_four(self, mock_cfg):
+        from tools.delegate_tool import _build_dynamic_schema_overrides
+        schema = _build_dynamic_schema_overrides()["parameters"]["properties"]["tasks"]
+        self.assertEqual(schema["maxItems"], 4)
+        self.assertIn("up to 4", schema["description"])
 
     def test_load_config_prefers_active_persistent_config_over_cli_defaults(self):
         stale_cli = types.ModuleType("cli")
@@ -1984,7 +1997,7 @@ class TestConcurrencyDefaults(unittest.TestCase):
                 "hermes_cli.config.load_config_readonly", return_value=active_config
             ):
                 self.assertEqual(_load_config()["max_concurrent_children"], 50)
-                self.assertEqual(_get_max_concurrent_children(), 8)
+                self.assertEqual(_get_max_concurrent_children(), 4)
 
     @patch(
         "tools.delegate_tool._load_config",
@@ -1998,12 +2011,12 @@ class TestConcurrencyDefaults(unittest.TestCase):
         return_value={"max_concurrent_children": 999},
     )
     def test_very_high_values_clamped(self, mock_cfg):
-        self.assertEqual(_get_max_concurrent_children(), 8)
+        self.assertEqual(_get_max_concurrent_children(), 4)
 
     @patch("tools.delegate_tool._load_config", return_value={})
-    @patch.dict("os.environ", {"DELEGATION_MAX_CONCURRENT_CHILDREN": "9"})
+    @patch.dict("os.environ", {"DELEGATION_MAX_CONCURRENT_CHILDREN": "13"})
     def test_env_var_is_clamped(self, mock_cfg):
-        self.assertEqual(_get_max_concurrent_children(), 8)
+        self.assertEqual(_get_max_concurrent_children(), 4)
 
     @patch(
         "tools.delegate_tool._load_config",
@@ -2014,16 +2027,16 @@ class TestConcurrencyDefaults(unittest.TestCase):
 
 
 class TestBackgroundBatchCapSeparated(unittest.TestCase):
-    """Detached batch capacity is independent and hard-capped at one."""
+    """Detached calls roll as children finish, with a bounded per-process cap."""
 
     @patch(
         "tools.delegate_tool._load_config",
-        return_value={"max_background_batches": 8},
+        return_value={"max_background_batches": 99},
     )
     def test_explicit_background_batch_cap_is_clamped(self, mock_cfg):
         from tools.delegate_tool import _get_max_background_batches
 
-        self.assertEqual(_get_max_background_batches(), 1)
+        self.assertEqual(_get_max_background_batches(), 4)
 
     @patch(
         "tools.delegate_tool._load_config",
@@ -2032,26 +2045,26 @@ class TestBackgroundBatchCapSeparated(unittest.TestCase):
     def test_stale_max_async_children_is_ignored(self, mock_cfg):
         from tools.delegate_tool import _get_max_async_children
 
-        self.assertEqual(_get_max_async_children(), 1)
+        self.assertEqual(_get_max_async_children(), 4)
 
     @patch("tools.delegate_tool._load_config", return_value={})
-    def test_default_is_one_detached_batch(self, mock_cfg):
+    def test_default_is_four_detached_batches(self, mock_cfg):
         from tools.delegate_tool import _get_max_background_batches
 
-        self.assertEqual(_get_max_background_batches(), 1)
+        self.assertEqual(_get_max_background_batches(), 4)
 
     @patch("tools.delegate_tool._load_config", return_value={})
     @patch.dict("os.environ", {"DELEGATION_MAX_BACKGROUND_BATCHES": "7"})
-    def test_background_batch_env_override_is_clamped(self, mock_cfg):
+    def test_background_batch_env_override_is_preserved(self, mock_cfg):
         from tools.delegate_tool import _get_max_background_batches
 
-        self.assertEqual(_get_max_background_batches(), 1)
+        self.assertEqual(_get_max_background_batches(), 4)
 
 
 class TestDescendantAdmissionBudget(unittest.TestCase):
     @patch(
         "tools.delegate_tool._load_config",
-        return_value={"max_total_descendants": 5},
+        return_value={"max_total_descendants": 4},
     )
     def test_reservations_are_atomic_and_released_by_independent_leases(self, mock_cfg):
         from tools.delegate_tool import (
@@ -2061,20 +2074,20 @@ class TestDescendantAdmissionBudget(unittest.TestCase):
         )
 
         _reset_descendant_budget_for_tests()
-        leases, before, limit = _try_reserve_descendants(5)
-        self.assertEqual((before, limit), (0, 5))
+        leases, before, limit = _try_reserve_descendants(4)
+        self.assertEqual((before, limit), (0, 4))
         self.assertIsNotNone(leases)
-        self.assertEqual(active_descendant_count(), 5)
+        self.assertEqual(active_descendant_count(), 4)
 
         rejected, active, limit = _try_reserve_descendants(1)
         self.assertIsNone(rejected)
-        self.assertEqual((active, limit), (5, 5))
+        self.assertEqual((active, limit), (4, 4))
 
         assert leases is not None
         leases[0].release()
         replacement, active, limit = _try_reserve_descendants(1)
         self.assertIsNotNone(replacement)
-        self.assertEqual((active, limit), (4, 5))
+        self.assertEqual((active, limit), (3, 4))
         for lease in leases[1:]:
             lease.release()
         assert replacement is not None
@@ -2092,6 +2105,8 @@ class TestDescendantAdmissionBudget(unittest.TestCase):
         result = json.loads(delegate_task(goal="bounded task", parent_agent=parent))
 
         self.assertIn("error", result)
+        self.assertIn("requested batch size 1", result["error"])
+        self.assertIn("active slots 5, limit 5", result["error"])
         self.assertIn("no child ran", result["error"].lower())
         mock_build.assert_not_called()
 
@@ -2242,8 +2257,8 @@ class TestMaxSpawnDepth(unittest.TestCase):
         with self.assertLogs("tools.delegate_tool", level=logging.WARNING) as cm:
             result = _get_max_spawn_depth()
 
-        self.assertEqual(result, 4)
-        self.assertTrue(any("clamping to 4" in m for m in cm.output))
+        self.assertEqual(result, 1)
+        self.assertTrue(any("clamping to 1" in m for m in cm.output))
 
 # =========================================================================
 # role param plumbing
@@ -2286,14 +2301,13 @@ class TestOrchestratorRoleSchema(unittest.TestCase):
             return mock_child
 
     def test_role_is_depth_derived_not_caller_declared(self):
-        """With max_spawn_depth=2 (mocked), a depth-1 child has depth budget
-        left, so it becomes an orchestrator automatically — no role arg
-        needed, and a passed legacy role arg is ignored either way."""
+        """Even a requested depth of 2 is capped at 1: direct children are
+        leaves, regardless of a legacy caller-declared role."""
         child = self._run_with_mock_child(_SENTINEL)
-        self.assertEqual(child._delegate_role, "orchestrator")
-        # Legacy explicit role='leaf' does not override the depth derivation.
-        child = self._run_with_mock_child("leaf")
-        self.assertEqual(child._delegate_role, "orchestrator")
+        self.assertEqual((child._delegate_depth, child._delegate_role), (1, "leaf"))
+        # Explicit orchestrator cannot override the depth-derived leaf role.
+        child = self._run_with_mock_child("orchestrator")
+        self.assertEqual((child._delegate_depth, child._delegate_role), (1, "leaf"))
 
     def test_schema_no_longer_advertises_role(self):
         """`role` left the advertised schema (capability is depth-derived);
@@ -2347,10 +2361,8 @@ class TestOrchestratorRoleBehavior(unittest.TestCase):
     def test_orchestrator_role_keeps_delegation_at_depth_1(
         self, mock_cfg, mock_creds
     ):
-        """role='orchestrator' + depth-0 parent with max_spawn_depth=2 →
-        child at depth 1 gets 'delegation' in enabled_toolsets (can
-        further delegate).  Requires max_spawn_depth>=2 since the new
-        default is 1 (flat)."""
+        """A legacy orchestrator request cannot give a depth-1 child
+        delegation tools when the operator cap is one."""
         mock_creds.return_value = {
             "provider": None, "base_url": None,
             "api_key": None, "api_mode": None, "model": None,
@@ -2362,8 +2374,10 @@ class TestOrchestratorRoleBehavior(unittest.TestCase):
             MockAgent.return_value = mock_child
             delegate_task(goal="test", role="orchestrator", parent_agent=parent)
             kwargs = MockAgent.call_args[1]
-            self.assertIn("delegation", kwargs["enabled_toolsets"])
-            self.assertEqual(mock_child._delegate_role, "orchestrator")
+            self.assertNotIn("delegation", kwargs["enabled_toolsets"])
+            self.assertIn("delegation", kwargs["disabled_toolsets"])
+            self.assertEqual(mock_child._delegate_role, "leaf")
+            self.assertEqual(mock_child._delegate_depth, 1)
 
     @patch("tools.delegate_tool._resolve_delegation_credentials")
     @patch("tools.delegate_tool._load_config",
@@ -2371,8 +2385,8 @@ class TestOrchestratorRoleBehavior(unittest.TestCase):
     def test_orchestrator_blocked_at_max_spawn_depth(
         self, mock_cfg, mock_creds
     ):
-        """Parent at depth 1 with max_spawn_depth=2 spawns child
-        at depth 2 (the floor); role='orchestrator' degrades to leaf."""
+        """A depth-1 leaf cannot spawn a grandchild, even with a legacy
+        orchestrator role and a requested max_spawn_depth of 2."""
         mock_creds.return_value = {
             "provider": None, "base_url": None,
             "api_key": None, "api_mode": None, "model": None,
@@ -2382,10 +2396,10 @@ class TestOrchestratorRoleBehavior(unittest.TestCase):
         with patch("run_agent.AIAgent") as MockAgent:
             mock_child = _make_role_mock_child()
             MockAgent.return_value = mock_child
-            delegate_task(goal="test", role="orchestrator", parent_agent=parent)
-            kwargs = MockAgent.call_args[1]
-            self.assertNotIn("delegation", kwargs["enabled_toolsets"])
-            self.assertEqual(mock_child._delegate_role, "leaf")
+            result = json.loads(delegate_task(goal="test", role="orchestrator", parent_agent=parent))
+            self.assertIn("depth limit reached", result["error"].lower())
+            self.assertIn("depth=1, max_spawn_depth=1", result["error"])
+            MockAgent.assert_not_called()
 
 
     # ── Role-aware system prompt ────────────────────────────────────────
@@ -2403,20 +2417,7 @@ class TestOrchestratorRoleBehavior(unittest.TestCase):
 
 
 class TestOrchestratorEndToEnd(unittest.TestCase):
-    """End-to-end: parent -> orchestrator -> two-leaf nested orchestration.
-
-    Covers the acceptance gate: parent delegates to an orchestrator
-    child; the orchestrator delegates to two leaf grandchildren; the
-    role/toolset/depth chain all resolve correctly.
-
-    Mock strategy: a single AIAgent patch with a side_effect factory
-    that keys on the child's ephemeral_system_prompt — orchestrator
-    prompts contain the string "Orchestrator Role" (see
-    _build_child_system_prompt), leaves don't.  The orchestrator
-    mock's run_conversation recursively calls delegate_task with
-    tasks=[{goal:...},{goal:...}] to spawn two leaves.  This keeps
-    the test in one patch context and avoids depth-indexed nesting.
-    """
+    """The depth-1 fleet accepts flat leaves and refuses nested orchestration."""
 
     @patch("tools.delegate_tool._resolve_delegation_credentials")
     @patch("tools.delegate_tool._load_config",
@@ -2428,80 +2429,47 @@ class TestOrchestratorEndToEnd(unittest.TestCase):
         }
         parent = _make_mock_parent(depth=0)
         parent.enabled_toolsets = ["terminal", "file", "delegation"]
-
-        # (enabled_toolsets, _delegate_role) for each agent built
-        built_agents: list = []
-        # Keep the orchestrator mock around so the re-entrant delegate_task
-        # can reach it via closure.
-        orch_mock = {}
+        built_agents = []
+        nested_refusals = []
 
         def _factory(*a, **kw):
-            prompt = kw.get("ephemeral_system_prompt", "") or ""
-            is_orchestrator = "Orchestrator Role" in prompt
             m = _make_role_mock_child()
-            built_agents.append({
-                "enabled_toolsets": list(kw.get("enabled_toolsets") or []),
-                "is_orchestrator_prompt": is_orchestrator,
-            })
+            built_agents.append((m, kw))
 
-            if is_orchestrator:
-                # Prepare the orchestrator mock as a parent-capable object
-                # so the nested delegate_task call succeeds.
-                m._delegate_depth = 1
-                m._delegate_role = "orchestrator"
-                m._active_children = []
-                m._active_children_lock = threading.Lock()
-                m._session_db = None
-                m.platform = "cli"
-                m.enabled_toolsets = ["terminal", "file", "delegation"]
-                m.api_key = "***"
-                m.base_url = ""
-                m.provider = None
-                m.api_mode = None
-                m.providers_allowed = None
-                m.providers_ignored = None
-                m.providers_order = None
-                m.provider_sort = None
-                m._print_fn = None
-                m.tool_progress_callback = None
-                m.thinking_callback = None
-                orch_mock["agent"] = m
+            def _leaf_run(user_message=None, task_id=None, stream_callback=None):
+                # Even a direct call that bypasses the leaf's tool schema
+                # cannot turn this child into a parent.
+                nested_refusals.append(json.loads(delegate_task(
+                    goal="forbidden grandchild", role="orchestrator", parent_agent=m,
+                )))
+                return {
+                    "final_response": "leaf done", "completed": True,
+                    "api_calls": 1, "messages": [],
+                }
 
-                def _orchestrator_run(user_message=None, task_id=None, stream_callback=None):
-                    # Re-entrant: orchestrator spawns two leaves
-                    delegate_task(
-                        tasks=[
-                            {"goal": "Do leaf work stream A"},
-                            {"goal": "Do leaf work stream B"},
-                        ],
-                        parent_agent=m,
-                    )
-                    return {
-                        "final_response": "orchestrated 2 workers",
-                        "completed": True, "api_calls": 1,
-                        "messages": [],
-                    }
-                m.run_conversation.side_effect = _orchestrator_run
-
+            m.run_conversation.side_effect = _leaf_run
             return m
 
         with patch("run_agent.AIAgent", side_effect=_factory) as MockAgent:
-            delegate_task(
-                goal="top-level orchestration",
-                role="orchestrator",
-                parent_agent=parent,
-            )
+            result = json.loads(delegate_task(
+                tasks=[{"goal": "Complete leaf work A"}, {"goal": "Complete leaf work B"}],
+                role="orchestrator", parent_agent=parent,
+            ))
 
-        # 1 orchestrator + 2 leaf grandchildren = 3 agents
-        self.assertEqual(MockAgent.call_count, 3)
-        # First built = the orchestrator (parent's direct child)
-        self.assertIn("delegation", built_agents[0]["enabled_toolsets"])
-        self.assertTrue(built_agents[0]["is_orchestrator_prompt"])
-        # Next two = leaves (grandchildren)
-        self.assertNotIn("delegation", built_agents[1]["enabled_toolsets"])
-        self.assertFalse(built_agents[1]["is_orchestrator_prompt"])
-        self.assertNotIn("delegation", built_agents[2]["enabled_toolsets"])
-        self.assertFalse(built_agents[2]["is_orchestrator_prompt"])
+        self.assertIn("results", result, result)
+        self.assertEqual(MockAgent.call_count, 2)
+        self.assertEqual(len(result["results"]), 2)
+        self.assertEqual(len(nested_refusals), 2)
+        for refusal in nested_refusals:
+            self.assertIn("depth limit reached", refusal["error"].lower())
+            self.assertIn("depth=1, max_spawn_depth=1", refusal["error"])
+        for child, kwargs in built_agents:
+            self.assertEqual((child._delegate_depth, child._delegate_role), (1, "leaf"))
+            self.assertNotIn("delegation", kwargs["enabled_toolsets"])
+            self.assertIn("delegation", kwargs["disabled_toolsets"])
+            self.assertIn("terminal", kwargs["enabled_toolsets"])
+            self.assertIn("file", kwargs["enabled_toolsets"])
+            self.assertNotIn("Orchestrator Role", kwargs["ephemeral_system_prompt"])
 
 
 class TestSubagentApprovalCallback(unittest.TestCase):

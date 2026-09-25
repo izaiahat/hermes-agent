@@ -19,8 +19,8 @@ _RUNTIME_PROVIDER_CUSTOM = "custom"
 # (floor of 1 only); a box that can be driven to N children by config alone is how the
 # 2026-09-12 swap-critical incident happened, so width, detached batches and TOTAL active
 # descendants are all bounded here and admission is refused atomically at the spawn site.
-_DEFAULT_MAX_CONCURRENT_CHILDREN = 8
-_DEFAULT_MAX_BACKGROUND_BATCHES = 1
+_DEFAULT_MAX_CONCURRENT_CHILDREN = 4
+_DEFAULT_MAX_BACKGROUND_BATCHES = 4
 _descendant_budget_lock = threading.Lock()
 _active_descendants = 0
 _descendant_budget_epoch = 0
@@ -100,13 +100,10 @@ def _get_oneshot_max_children() -> int:
 
 
 def _get_max_concurrent_children() -> int:
-    """Return the per-call child width, clamped to the hard safety ceiling 8.
+    """Return the per-call child width, clamped to the hard safety ceiling 4.
 
-    Operator decision 2026-09-16 raised the width from 5 to 8 (receipt
-    ops/linear/approvals/OPERATOR-DECISION-20260916-delegation-width-8.json).
-    Upstream v2026.9.14 removed its ceiling entirely (default 10, floor only);
-    the ceiling is reintroduced here because the host admission gate is sized
-    for a bounded tree, not because upstream forgot it.
+    A host-wide 4-slot lease plus independent pressure gates bounds aggregate
+    fan-out across TUIs; a single batch remains bounded to 4 children.
     """
     cfg = _cfg()
     val = cfg.get("max_concurrent_children")
@@ -123,10 +120,10 @@ def _get_max_concurrent_children() -> int:
             _DEFAULT_MAX_CONCURRENT_CHILDREN,
         )
         return _DEFAULT_MAX_CONCURRENT_CHILDREN
-    clamped = min(8, max(1, parsed))
+    clamped = min(_DEFAULT_MAX_CONCURRENT_CHILDREN, max(1, parsed))
     if clamped != parsed:
         logger.warning(
-            "delegation.max_concurrent_children=%d outside [1, 8]; clamping to %d",
+            "delegation.max_concurrent_children=%d outside [1, 4]; clamping to %d",
             parsed,
             clamped,
         )
@@ -583,6 +580,7 @@ def _resolve_child_runtime(
     override_base_url: Optional[str], override_api_key: Optional[str], override_api_mode: Optional[str],
     override_acp_command: Optional[str], override_acp_args: Optional[List[str]],
     routing_cfg: Optional[Dict[str, Any]] = None,
+    task_reasoning_effort: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Child credentials, transport and routing (config override > parent inherit) as ``AIAgent`` kwargs. Rules that
     are easy to break: api_mode is re-derived (not inherited) when the child's provider differs from the parent's
@@ -672,6 +670,12 @@ def _resolve_child_runtime(
                 child_reasoning = parsed
     except Exception as exc:
         logger.debug("Could not load delegation reasoning_effort: %s", exc)
+    if task_reasoning_effort is not None:
+        from hermes_constants import parse_reasoning_effort
+        parsed = parse_reasoning_effort(task_reasoning_effort)
+        if parsed is None:
+            raise ValueError(f"Unknown task reasoning_effort {task_reasoning_effort!r}")
+        child_reasoning = parsed
     # Re-clamp against the CHILD's effective route, not the parent's: a child
     # pinned to a different provider/model may not support the level the parent
     # (or delegation.reasoning_effort) asked for, and an unsupported effort makes
@@ -703,51 +707,41 @@ def _resolve_child_runtime(
 
 
 def _get_max_background_batches() -> int:
-    """Return the hard-capped detached top-level batch capacity."""
-    cfg = _cfg()
-    val = cfg.get("max_background_batches")
-    if val is None:
-        val = os.getenv("DELEGATION_MAX_BACKGROUND_BATCHES")
-    if val is not None:
-        try:
-            parsed = int(val)
-        except (TypeError, ValueError):
-            logger.warning(
-                "delegation.max_background_batches=%r is invalid; using %d",
-                val,
-                _DEFAULT_MAX_BACKGROUND_BATCHES,
-            )
-        else:
-            if parsed != 1:
-                logger.warning(
-                    "delegation.max_background_batches=%d violates the hard ceiling 1; using 1",
-                    parsed,
-                )
-    return _DEFAULT_MAX_BACKGROUND_BATCHES
+    """Bound detached calls per process while the active-child leases enforce host-wide capacity."""
+    raw = _cfg().get("max_background_batches")
+    if raw is None:
+        raw = os.getenv("DELEGATION_MAX_BACKGROUND_BATCHES")
+    if raw is None:
+        return _DEFAULT_MAX_BACKGROUND_BATCHES
+    try:
+        parsed = int(raw)
+    except (TypeError, ValueError):
+        logger.warning("delegation.max_background_batches=%r invalid; using %d", raw, _DEFAULT_MAX_BACKGROUND_BATCHES)
+        return _DEFAULT_MAX_BACKGROUND_BATCHES
+    return min(_DEFAULT_MAX_BACKGROUND_BATCHES, max(1, parsed))
 
 
 
 def _get_max_total_descendants() -> int:
-    """Return the process/tree child budget, hard-capped at eight.
+    """Return the process/tree child budget, hard-capped at four.
 
-    Raised 5 -> 8 with the per-call width by operator decision 2026-09-16
-    (receipt OPERATOR-DECISION-20260916-delegation-width-8.json).
+    The host-wide 4-slot atomic gate is shared by all parent processes.
     """
     cfg = _cfg()
     val = cfg.get("max_total_descendants")
     if val is None:
         val = os.getenv("DELEGATION_MAX_TOTAL_DESCENDANTS")
     if val is None:
-        return 8
+        return 4
     try:
         parsed = int(val)
     except (TypeError, ValueError):
-        logger.warning("delegation.max_total_descendants=%r is invalid; using 8", val)
-        return 8
-    clamped = min(8, max(1, parsed))
+        logger.warning("delegation.max_total_descendants=%r is invalid; using 4", val)
+        return 4
+    clamped = min(4, max(1, parsed))
     if clamped != parsed:
         logger.warning(
-            "delegation.max_total_descendants=%d outside [1, 8]; clamping to %d",
+            "delegation.max_total_descendants=%d outside [1, 4]; clamping to %d",
             parsed,
             clamped,
         )
@@ -759,9 +753,10 @@ def _get_max_total_descendants() -> int:
 class _DescendantLease:
     """One idempotent active-child reservation bound to a budget epoch."""
 
-    def __init__(self, epoch: int, global_lease=None):
+    def __init__(self, epoch: int, global_lease=None, host_lease=None):
         self._epoch = epoch
         self._global_lease = global_lease
+        self._host_lease = host_lease
         self._released = False
 
     def release(self) -> None:
@@ -772,6 +767,8 @@ class _DescendantLease:
             self._released = True
             global_lease = self._global_lease
             self._global_lease = None
+            host_lease = self._host_lease
+            self._host_lease = None
             if self._epoch == _descendant_budget_epoch:
                 if _active_descendants <= 0:
                     logger.error("Descendant budget underflow prevented")
@@ -779,6 +776,8 @@ class _DescendantLease:
                     _active_descendants -= 1
         if global_lease is not None:
             global_lease.release()
+        if host_lease is not None:
+            host_lease.release()
 
 def active_descendant_count() -> int:
     """Return the number of descendant slots reserved in this process."""
@@ -792,16 +791,25 @@ def _try_reserve_descendants(
     count: int,
     *,
     use_global_codex_gate: bool = False,
+    codex_count: Optional[int] = None,
+    codex_indexes: Optional[list[int]] = None,
 ) -> tuple[Optional[list[_DescendantLease]], int, int]:
-    """Atomically reserve process-local and optional host-wide child slots."""
+    """Atomically reserve process-local, host-wide and optional Codex subscription slots."""
     global _active_descendants
     limit = _get_max_total_descendants()
     with _descendant_budget_lock:
         active_before = _active_descendants
         if count < 1 or active_before + count > limit:
             return None, active_before, limit
-        global_leases = [None] * count
-        if use_global_codex_gate:
+        global_leases: list[Any] = [None] * count
+        codex_slots = (count if use_global_codex_gate else 0) if codex_count is None else codex_count
+        if codex_indexes is not None:
+            codex_slots = len(codex_indexes)
+            if len(set(codex_indexes)) != codex_slots or any(i < 0 or i >= count for i in codex_indexes):
+                return None, active_before, limit
+        if codex_slots < 0 or codex_slots > count:
+            return None, active_before, limit
+        if codex_slots:
             try:
                 from agent.codex_throttle import (
                     is_enabled as codex_gate_is_enabled,
@@ -809,20 +817,32 @@ def _try_reserve_descendants(
                 )
 
                 if codex_gate_is_enabled():
-                    reserved, host_active, host_limit = try_acquire_codex_delegate_slots(count)
+                    reserved, host_active, host_limit = try_acquire_codex_delegate_slots(codex_slots)
                 else:
-                    reserved, host_active, host_limit = [None] * count, 0, count
+                    reserved, host_active, host_limit = [None] * codex_slots, 0, codex_slots
             except Exception:
                 logger.exception("Shared Codex descendant gate unavailable; denying delegation")
                 return None, limit, limit
             if reserved is None:
                 return None, host_active, host_limit
-            global_leases = list(reserved)
+            for idx, lease in zip(codex_indexes if codex_indexes is not None else range(codex_slots), reserved):
+                global_leases[idx] = lease
+        try:
+            from tools.delegation_admission import try_reserve_host_children
+            host_leases, host_active, host_limit = try_reserve_host_children(count)
+        except Exception:
+            logger.exception("Shared host descendant gate unavailable; denying delegation")
+            host_leases, host_active, host_limit = None, limit, limit
+        if host_leases is None:
+            for lease in global_leases:
+                if lease is not None:
+                    lease.release()
+            return None, host_active, host_limit
         _active_descendants += count
         return (
             [
-                _DescendantLease(_descendant_budget_epoch, global_lease)
-                for global_lease in global_leases
+                _DescendantLease(_descendant_budget_epoch, global_lease, host_lease)
+                for global_lease, host_lease in zip(global_leases, host_leases)
             ],
             active_before,
             limit,

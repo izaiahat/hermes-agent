@@ -14,7 +14,7 @@ from dataclasses import dataclass, replace
 from typing import Any, Dict, List, Optional
 
 from tools.async_delegation import _new_delegation_id, record_unit_child
-from tools.delegate_tool_child_run import _attach_child, _detach_child, _fabricated_entry, _signal_child_stop
+from tools.delegate_tool_child_run import _attach_child, _detach_child, _fabricated_entry, _route_receipt, _signal_child_stop
 from tools.delegate_tool_progress import (
     SUBAGENT_FAILURE_STATUSES, _print_completion_line, _quiet, describe_subagent_failure, format_batch_tag,
 )
@@ -58,7 +58,12 @@ class _Batch:
 
     def run_child(self, i: int, task: Dict[str, Any], child: Any) -> Dict[str, Any]:
         from tools.delegate_tool import _run_single_child
-        return _run_single_child(task_index=i, goal=task["goal"], child=child, parent_agent=self.parent_agent, **self.owner_kwargs())
+        try:
+            return _run_single_child(task_index=i, goal=task["goal"], child=child, parent_agent=self.parent_agent, **self.owner_kwargs())
+        finally:
+            lease = getattr(child, "_delegate_capacity_lease", None)
+            if lease is not None and getattr(child, "_delegate_capacity_release_deferred", False) is not True:
+                lease.release()
 
 
 def _announce_batch(parent_agent, n_tasks: int, live_deleg_id: Optional[str]) -> None:
@@ -353,6 +358,10 @@ def _dispatched_payload(batch: _Batch, units: List[tuple[_Batch, str]]) -> dict:
     payload = {
         "status": "dispatched", "mode": "background", "count": n,
         "delegation_id": batch.live_deleg_id or units[0][1], "goals": goals,
+        "routes": [
+            {"task_index": i, **_route_receipt(child)}
+            for i, _, child in batch.children
+        ],
         "note": _BACKGROUND_NOTES["one"] if n == 1 else _BACKGROUND_NOTES["many"].format(n=n, k=len(units)),
     }
     if len(units) > 1:

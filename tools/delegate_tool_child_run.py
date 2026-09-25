@@ -36,6 +36,23 @@ def _fabricated_entry(idx: int, status: str, error: str, child: Any, duration: f
     return {
         "task_index": idx, "status": status, "summary": None, "error": error, "api_calls": 0,
         "duration_seconds": duration, "_child_role": getattr(child, "_delegate_role", None),
+        "route": _route_receipt(child),
+    }
+
+
+def _route_receipt(child: Any) -> dict:
+    """Requested versus constructed route; omit endpoints and credential material."""
+    reasoning = getattr(child, "reasoning_config", None)
+    requested = getattr(child, "_delegate_requested_route", None)
+    return {
+        "requested": {k: v if isinstance(v, str) else None for k, v in requested.items()}
+                     if isinstance(requested, dict) else None,
+        "effective": {
+            "model": _str_or_none(getattr(child, "model", None)),
+            "provider": _str_or_none(getattr(child, "provider", None)),
+            "reasoning_effort": (_str_or_none(reasoning.get("effort")) if reasoning.get("enabled", True)
+                                 else "none") if isinstance(reasoning, dict) else None,
+        },
     }
 
 def _append_missed_steer(entry: Dict[str, Any], late_steer: Optional[str]) -> None:
@@ -413,7 +430,14 @@ def _defer_close_after_timeout(child: Any, child_future: Any) -> None:
     sweep + one delayed re-sweep for a connection opened in between; a worker that still won't settle keeps its
     resources until process exit.
     """
-    child_future.add_done_callback(lambda _done: _close_child(child, "Failed to close timed-out child after worker exit"))
+    # Timed-out workers retain their host slot until they actually exit.
+    child._delegate_capacity_release_deferred = True
+    def _finish(_done):
+        _close_child(child, "Failed to close timed-out child after worker exit")
+        lease = getattr(child, "_delegate_capacity_lease", None)
+        if lease is not None:
+            lease.release()
+    child_future.add_done_callback(_finish)
     # Bounded drain (#94248 native half): the deferred close above only fires once the abandoned worker
     # unwinds, but that worker is typically parked inside an in-flight OpenSSL read (Codex / httpx). Never
     # hard-close that transport from this thread — releasing FDs under a live SSL read is the #29507/#70773
@@ -599,6 +623,7 @@ def _build_result_entry(
         "api_calls": result.get("api_calls", 0),
         "duration_seconds": duration,
         "model": _str_or_none(getattr(child, "model", None)),
+        "route": _route_receipt(child),
         "exit_reason": exit_reason,
         # A budget-exhausted child still returns a summary (status stays
         # "completed"), so the parent needs this explicit flag.
@@ -938,6 +963,7 @@ class _ChildRun:
             "last_event_age": _child_last_event_age(child) if is_timeout else None,
             "_child_role": getattr(child, "_delegate_role", None),
             "diagnostic_path": diagnostic_path,
+            "route": _route_receipt(child),
         }
         self.finish_failed(_error_entry, _late_pending_steer, preview=f"Timed out after {duration}s" if is_timeout else str(exc))
         close_deferred = is_timeout and not future.done()

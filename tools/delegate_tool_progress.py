@@ -207,6 +207,12 @@ def _build_child_system_prompt(
         if _ctx_files.strip():
             parts.append(_CONTEXT_FILES_INTRO + _ctx_files.strip())
     parts.append(_COMPLETION_INSTRUCTIONS)
+    parts.append(
+        "Fleet task/model/effort policy: read "
+        "/home/ubuntu/.hermes/skills/linear-orchestrator/references/model-delegation-doctrine.md "
+        "when present. This shared reference does not grant orchestrator authority or override "
+        "the runtime's leaf-depth, capacity, ownership or approval boundaries."
+    )
     if role == "orchestrator":
         child_note = _LEAF_CHILDREN_NOTE if child_depth + 1 >= max_spawn_depth else _NESTED_CHILDREN_NOTE
         parts.append(
