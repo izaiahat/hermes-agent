@@ -1590,13 +1590,18 @@ def _validate_switch(st: _Switch) -> Optional[ModelSwitchResult]:
             if st.user_providers and st.target_provider in st.user_providers else None)
     # A ``providers.<key>`` endpoint is the user's own: validate it as a custom endpoint (an id its
     # listing lacks is soft-accepted) whether the slug arrived as ``custom:<key>`` or the bare key
-    # the picker rows carry — otherwise the bare spelling fell into the built-in live-listing
-    # branch and hard-rejected the very model the user selected.
+    # the picker rows carry. A metadata-only providers.openai-codex row is NOT a custom endpoint:
+    # its built-in Codex URL has no generic /models listing.
     validate_as = st.target_provider
     if not validate_as.lower().startswith("custom"):
         pdef = resolve_provider_full(validate_as, st.user_providers, st.custom_providers)
         if pdef is not None and pdef.source == "user-config":
-            validate_as = f"custom:{validate_as}"
+            from hermes_cli.auth import DEFAULT_CODEX_BASE_URL
+            builtin_codex = (validate_as == "openai-codex"
+                             and st.base_url.rstrip("/") == DEFAULT_CODEX_BASE_URL.rstrip("/")
+                             and (not pdef.base_url or pdef.base_url.rstrip("/") == DEFAULT_CODEX_BASE_URL.rstrip("/")))
+            if not builtin_codex:
+                validate_as = f"custom:{validate_as}"
     try:
         validation = validate_requested_model(
             st.new_model, validate_as, api_key=st.api_key, base_url=st.base_url,

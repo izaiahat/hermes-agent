@@ -17,6 +17,8 @@ it.
 
 from unittest.mock import patch
 
+import pytest
+
 from hermes_cli.model_switch import switch_model
 from hermes_cli.models_validate import validate_requested_model
 
@@ -62,3 +64,67 @@ def test_switch_model_allows_openai_codex_model_missing_from_listing():
     assert result.target_provider == "openai-codex"
     assert result.warning_message
     assert "OpenAI Codex model listing" in result.warning_message
+
+
+@pytest.mark.parametrize("model", ["gpt-6-sol", "gpt-6-astra-900k", "gpt-6-luna"])
+def test_config_metadata_does_not_make_builtin_codex_a_custom_endpoint(model):
+    """A providers.openai-codex metadata row must keep the Codex catalog validator."""
+    from hermes_cli.auth import DEFAULT_CODEX_BASE_URL
+
+    with patch("hermes_cli.runtime_provider.resolve_runtime_provider", return_value={
+        "api_key": "test-token", "base_url": DEFAULT_CODEX_BASE_URL,
+        "api_mode": "codex_responses",
+    }), patch("hermes_cli.models.provider_model_ids", return_value=[
+        "gpt-6-sol", "gpt-6-astra-900k", "gpt-6-luna",
+    ]), patch("hermes_cli.models.probe_api_models") as probe:
+        result = switch_model(
+            model, current_provider="openai-codex", current_model="gpt-6-astra-900k",
+            current_base_url=DEFAULT_CODEX_BASE_URL, current_api_key="test-token",
+            explicit_provider="openai-codex",
+            user_providers={"openai-codex": {"models": {"gpt-6-sol": {"context_length": 1050000}},
+                                               "request_timeout_seconds": 120}},
+        )
+
+    assert result.success is True, result.error_message
+    assert result.target_provider == "openai-codex"
+    assert result.new_model == model
+    probe.assert_not_called()
+
+
+def test_codex_metadata_row_keeps_unknown_foreign_model_rejected():
+    from hermes_cli.auth import DEFAULT_CODEX_BASE_URL
+
+    with patch("hermes_cli.runtime_provider.resolve_runtime_provider", return_value={
+        "api_key": "test-token", "base_url": DEFAULT_CODEX_BASE_URL,
+        "api_mode": "codex_responses",
+    }), patch("hermes_cli.models.provider_model_ids", return_value=["gpt-6-sol"]), \
+            patch("hermes_cli.models.probe_api_models") as probe:
+        result = switch_model(
+            "qwen-unknown", current_provider="openai-codex", current_model="gpt-6-sol",
+            current_base_url=DEFAULT_CODEX_BASE_URL, current_api_key="test-token",
+            explicit_provider="openai-codex",
+            user_providers={"openai-codex": {"request_timeout_seconds": 120}},
+        )
+
+    assert result.success is False
+    probe.assert_not_called()
+
+
+def test_codex_named_custom_endpoint_still_probes_its_own_listing():
+    custom_url = "https://codex-proxy.example.invalid/v1"
+    with patch("hermes_cli.runtime_provider.resolve_runtime_provider", return_value={
+        "api_key": "test-token", "base_url": custom_url, "api_mode": "codex_responses",
+    }), patch("hermes_cli.models.probe_api_models", return_value={
+        "models": None, "probed_url": custom_url + "/models",
+        "resolved_base_url": custom_url, "suggested_base_url": None, "used_fallback": False,
+    }) as probe:
+        result = switch_model(
+            "gpt-6-sol", current_provider="openai-codex", current_model="gpt-6-astra-900k",
+            current_base_url=custom_url, current_api_key="test-token",
+            explicit_provider="openai-codex",
+            user_providers={"openai-codex": {"base_url": custom_url}},
+        )
+
+    assert result.success is False
+    assert "custom endpoint's model listing" in result.error_message
+    probe.assert_called_once()
