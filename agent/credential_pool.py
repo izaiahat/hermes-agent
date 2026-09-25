@@ -2049,14 +2049,22 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
                 exhausted_until = _exhausted_until(entry, sole_credential=sole_credential)
                 # Codex quota windows can reopen EARLY; a throttled live probe
                 # lifts a stale cooldown (issue #43747).
+                restored_by_probe = False
                 if (
                     exhausted_until is not None
                     and now < exhausted_until
-                    and not (clear_expired and self._codex_quota_restored_upstream(entry))
                 ):
-                    continue
+                    restored_by_probe = bool(clear_expired and self._codex_quota_restored_upstream(entry))
+                    if not restored_by_probe:
+                        continue
                 if clear_expired:
-                    entry = self._adopt(entry, persist=False, **_MARK_OK)
+                    # The disk-boundary cooldown merge otherwise restores the
+                    # old 429 on persist, leaving auth list falsely exhausted.
+                    # Only a positive upstream probe gets an early-clear marker.
+                    entry = self._adopt(
+                        entry, persist=False, **_MARK_OK,
+                        status_cleared_at=time.time() if restored_by_probe else entry.status_cleared_at,
+                    )
                     cleared_any = True
             if refresh and self._entry_needs_refresh(entry):
                 if self.provider in _TOKENS_SINGLETON_PROVIDERS:
@@ -2126,12 +2134,14 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
         self._current_id = entry.id
         return entry, pending_refresh
 
-    def peek(self) -> Optional[PooledCredential]:
+    def peek(self, *, model: Optional[str] = None) -> Optional[PooledCredential]:
         with self._lock:
             current = self._current_unlocked()
+            available, _pending = self._available_entries(model=model)
             if current is not None:
-                return current
-            available, _pending = self._available_entries()
+                matched = next((entry for entry in available if entry.id == current.id), None)
+                if matched is not None:
+                    return matched
             return available[0] if available else None
 
     def reclaim(self, credential_id: str, *, model: Optional[str] = None) -> Optional[PooledCredential]:
@@ -2278,7 +2288,9 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
             else:
                 logger.info("credential pool: marking %s exhausted (status=%s), rotating", _label, status_code)
             self._current_id = None
-            next_entry, _pending = self._select_unlocked(refresh=False)
+            # A sibling model's cooldown must not hide an otherwise healthy account
+            # from this request's failover (the initial select is model-scoped too).
+            next_entry, _pending = self._select_unlocked(refresh=False, model=model)
             if next_entry is not None and next_entry.id == entry.id:
                 # No-recovery guard (#97315): selection handed back the very entry that was
                 # just marked (the auth-store sync adopted fresher tokens, or a quota probe

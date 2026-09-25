@@ -1283,6 +1283,8 @@ def restore_primary_runtime(agent) -> bool:
             base_url=rt["compressor_base_url"], api_key=rt["compressor_api_key"],
             provider=rt["compressor_provider"], api_mode=rt.get("compressor_api_mode", ""),
         )
+        from agent.agent_init import refresh_astra_extended_compression
+        refresh_astra_extended_compression(agent)
         # Same rule as fallback activation: refresh an existing verdict only; never-probed sessions stay lazy.
         if getattr(agent, "_compression_feasibility_checked", False) is True:
             from agent.conversation_compression import revalidate_compression_feasibility
@@ -2193,8 +2195,10 @@ def _update_switch_compressor(agent, custom_providers, effective_context_length,
     except Exception:
         _restore_switch_snapshot(agent, snapshot)
         raise
-    # Outside the rollback guard: a probe hiccup must not undo a good switch. Eager, so the aux
-    # clamp lands before the first compaction on the new window, not after it (#114707).
+    from agent.agent_init import refresh_astra_extended_compression
+    refresh_astra_extended_compression(agent)
+    # Outside the rollback guard: a probe hiccup must not undo a good switch. Revalidate
+    # auxiliary prompt input bounds for the new route; never clamp the main trigger.
     from agent.conversation_compression import revalidate_compression_feasibility
     revalidate_compression_feasibility(agent)
 

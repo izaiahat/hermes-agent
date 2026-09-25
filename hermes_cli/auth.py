@@ -931,6 +931,14 @@ def _merge_disk_cooldown_state(
         disk_status = disk_entry.get("last_status")
         if disk_status not in (STATUS_DEAD, STATUS_EXHAUSTED):
             return merged
+        # A live upstream quota probe may reopen a Codex window before the
+        # server's previous reset_at. Preserve that verified clear over an
+        # older on-disk 429, but never over a newer concurrent failure.
+        if provider_id == "openai-codex" and entry.get("last_status") not in (STATUS_DEAD, STATUS_EXHAUSTED):
+            verified_at = _parse_absolute_timestamp(entry.get("status_cleared_at")) or 0.0
+            disk_at = _parse_absolute_timestamp(disk_entry.get("last_status_at")) or 0.0
+            if verified_at > disk_at:
+                return merged
         # A token change means the caller re-authed this entry and intentionally cleared its status:
         # never resurrect the old cooldown onto fresh credentials.
         mem_access = entry.get("access_token") or ""

@@ -219,11 +219,11 @@ class TestAuxiliaryClientWiring:
         # _read_codex_access_token.
         monkeypatch.setattr(
             auxiliary_client, "_select_pool_entry",
-            lambda provider: (False, None),
+            lambda provider, *, model=None: (False, None),
         )
         monkeypatch.setattr(
             auxiliary_client, "_read_codex_access_token",
-            lambda: token,
+            lambda model=None: token,
         )
         with patch("agent.auxiliary_client.OpenAI") as mock_openai:
             mock_openai.return_value = MagicMock()
@@ -241,7 +241,7 @@ class TestAuxiliaryClientWiring:
         token = _make_codex_jwt("acct-aux-raw-codex")
         monkeypatch.setattr(
             auxiliary_client, "_read_codex_access_token",
-            lambda: token,
+            lambda model=None: token,
         )
         with patch("agent.auxiliary_client.OpenAI") as mock_openai:
             mock_openai.return_value = MagicMock()
