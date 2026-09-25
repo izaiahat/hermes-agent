@@ -81,6 +81,58 @@ def _strip_marker_for_comparison(msgs: Any) -> Any:
     return [{k: v for k, v in m.items() if k != _DB_PERSISTED_MARKER} if isinstance(m, dict) else m for m in msgs]
 
 
+def _preserve_exhausted_compression(agent: Any, messages: List[Dict[str, Any]]) -> Optional[Path]:
+    """One private full-transcript checkpoint and one ops alert per exhausted session.
+
+    The deterministic handoff is advisory: do not replace/drop any live turns
+    when included-quota inference is unavailable. The operator starts /new.
+    """
+    from hermes_cli.config import get_hermes_home
+
+    session_id = str(getattr(agent, "session_id", "") or "")
+    if not session_id or not all(c.isalnum() or c in "-_" for c in session_id):
+        logger.error("Codex compression exhausted: cannot checkpoint invalid session id")
+        return None
+    directory = get_hermes_home() / "sessions" / "compression-fallback"
+    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.chmod(directory, 0o700)
+    path = directory / f"{session_id}.json"
+    try:
+        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    except FileExistsError:
+        return path
+    try:
+        compressor = agent.context_compressor
+        summary = compressor._build_static_fallback_summary(
+            messages, reason="Codex compression pool exhausted; full transcript preserved"
+        )
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            json.dump({"session_id": session_id, "reason": "codex_compression_pool_exhausted",
+                       "deterministic_summary": summary, "messages": _strip_marker_for_comparison(messages)},
+                      stream, ensure_ascii=False, default=str)
+            stream.flush()
+            os.fsync(stream.fileno())
+    except Exception:
+        with contextlib.suppress(OSError):
+            os.close(fd)
+        with contextlib.suppress(OSError):
+            path.unlink()
+        logger.exception("Codex compression exhausted: private checkpoint failed")
+        return None
+    try:
+        from tools.discord_tool import _discord_request, _get_bot_token
+        token = _get_bot_token()
+        if not token:
+            raise RuntimeError("Discord bot token unavailable")
+        _discord_request("POST", "/channels/1487300132054765629/messages", token,
+                         body={"content": "⚠️ Hermes Codex compression pool exhausted. Full transcript and "
+                                          "deterministic handoff saved privately; start a fresh session with /new. "
+                                          "No paid or Claude compression fallback used."}, timeout=15)
+    except Exception:
+        logger.exception("Codex compression exhausted: ops-alerts delivery failed; checkpoint remains")
+    return path
+
+
 def _emit_compaction_done(agent: Any) -> None:
     """Emit the structured terminal edge for a started compaction."""
     status_callback = getattr(agent, "status_callback", None)
@@ -175,6 +227,7 @@ _COMPRESSOR_ATTEMPT_STATE_FIELDS = (
     "_last_summary_fallback_used", "_last_compress_aborted", "_last_summary_auth_failure",
     "_last_summary_network_failure", "_last_summary_empty_content_failure", "_last_summary_truncated_failure",
     "_last_summary_overload_failure",
+    "_last_summary_pool_exhausted",
     "_last_aux_model_failure_error", "_last_aux_model_failure_model", "_last_aux_resolved_model",
     "_summary_model_fallen_back", "summary_model",
     "_last_compression_telemetry", "_active_compression_telemetry", "_compression_telemetry_seed",
@@ -2119,14 +2172,10 @@ def check_compression_model_feasibility(agent: Any) -> None:
                 f"auxiliary.compression.context_length to override the "
                 f"detected value if it is wrong."
             )
-        if aux_context < agent.context_compressor.threshold_tokens:
-            _lower_threshold_to_aux_context(
-                agent, aux_model=aux_model, aux_context=aux_context, aux_provider=_aux_cfg_provider,
-                aux_base_url=aux_base_url,
-            )
-        elif getattr(agent, "_last_feasibility_notice", None) is not None:
-            # Symmetric un-clamp: the summariser fits again, so the stale "auto-lowered" notice must not be
-            # replayed (``replay_compression_warning``) for a session that is no longer clamped (#114707).
+        # A smaller summarizer must bound its own prompt, never the active model's trigger.
+        # SummaryDispatchMixin keeps the source turns bounded; the final prompt fit uses this window.
+        agent.context_compressor._summary_input_aux_context = aux_context
+        if getattr(agent, "_last_feasibility_notice", None) is not None:
             agent._last_feasibility_notice = None
             agent._compression_warning = None
     except ValueError:
@@ -2138,8 +2187,8 @@ def check_compression_model_feasibility(agent: Any) -> None:
 
 def revalidate_compression_feasibility(agent: Any) -> None:
     """Re-run the aux feasibility probe after the main runtime changed (model switch, fallback activation,
-    primary restore). ``update_model()`` already voided the previous ceiling; probing now clamps the trigger
-    before the first compaction on the new window rather than after it (#114707). A probe failure leaves the
+    primary restore). ``update_model()`` re-resolves the main trigger; the auxiliary window bounds only the
+    summary input. A probe failure leaves the
     latch unset so the lazy probe at the next compaction re-raises hard rejections."""
     agent._compression_feasibility_checked = False
     if not getattr(agent, "context_compressor", None):
@@ -3498,6 +3547,18 @@ def _candidate_rejected(
     if getattr(agent.context_compressor, "_last_compress_aborted", False):
         _summary_error = getattr(agent.context_compressor, "_last_summary_error", None)
         _err = _summary_error or "unknown error"
+        if getattr(agent.context_compressor, "_last_summary_pool_exhausted", False):
+            checkpoint = _preserve_exhausted_compression(agent, messages_before_compression)
+            if checkpoint is not None:
+                agent._emit_warning(
+                    "⚠ Codex compression pool exhausted. Full transcript and deterministic handoff "
+                    f"saved to {checkpoint}. Start a fresh session with /new; no paid or Claude fallback was used."
+                )
+            else:
+                agent._emit_warning(
+                    "⚠ Codex compression pool exhausted; private transcript checkpoint FAILED. "
+                    "The live conversation remains unchanged. Save it before starting /new."
+                )
         if getattr(agent, "_last_compression_summary_warning", None) != _err:
             agent._last_compression_summary_warning = _err
             agent._emit_warning(

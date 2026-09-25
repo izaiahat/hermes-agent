@@ -670,6 +670,12 @@ def _classify_summary_failure(e: Exception) -> _SummaryFailureKind:
 # order: (flag attribute, telemetry failure_class, user-facing warning with %d preserved messages).
 _TERMINAL_SUMMARY_FAILURES = (
     (
+        "_last_summary_pool_exhausted",
+        "codex_compression_pool_exhausted",
+        "Codex compression pool exhausted — aborting compression. %d message(s) preserved unchanged; "
+        "save the transcript and start a fresh session. No paid or Claude fallback was attempted.",
+    ),
+    (
         "_last_summary_auth_failure",
         "summary_auth_failure",
         "Summary generation failed with a terminal access or quota error — aborting compression. %d "
@@ -711,6 +717,10 @@ _TERMINAL_SUMMARY_FAILURES = (
 # unchanged route and prompt, so a flat 30s cooldown let every async-completion turn re-issue the same
 # capped request after its per-turn attempt budget was refilled (#69637).
 _TIMEOUT_COOLDOWN_LADDER = (60, 300, 900)
+
+
+class CompressionPoolExhausted(RuntimeError):
+    """No eligible Codex account for the configured compression model."""
 
 
 def _next_timeout_cooldown(compressor: Any, counter: str = "_consecutive_timeout_failures") -> int:
@@ -2261,6 +2271,8 @@ class ContextCompressor(SummaryDispatchMixin, MicroCompactionMixin, ContextEngin
 
     def _reset_session_compaction_state(self) -> None:
         """Shared per-session reset for /new, /reset and session end."""
+        for flag, _class, _message in _TERMINAL_SUMMARY_FAILURES:
+            setattr(self, flag, False)
         # A handoff may carry role="user" only for alternation, so role alone can't prove a human turn existed.
         self._previous_summary = self._summary_has_user_turn = self._last_summary_error = None
         self._last_aux_model_failure_error = self._last_aux_model_failure_model = None
@@ -2616,11 +2628,6 @@ class ContextCompressor(SummaryDispatchMixin, MicroCompactionMixin, ContextEngin
         # A switch that genuinely changes the output budget passes the new value explicitly. (#43547)
         if max_tokens is not None:
             self.max_tokens = self._coerce_max_tokens(max_tokens)
-        if runtime_changed:
-            # The aux ceiling was probed against the previous main runtime (an "auto" aux route follows the
-            # main model); the caller re-runs the feasibility probe. A same-runtime recompute (overflow-reported
-            # window, grown local window, tier cap) keeps it: the summariser did not change (#114707).
-            self._aux_context_ceiling = None
         self._base_threshold_percent, self.threshold_percent, self.threshold_tokens = self._derive_trigger(
             model, context_length, provider)
         self._apply_threshold_tokens_cap()
@@ -2678,10 +2685,7 @@ class ContextCompressor(SummaryDispatchMixin, MicroCompactionMixin, ContextEngin
             _effective_cap = min(self.threshold_tokens_cap, self.context_length)
             if _effective_cap < self.threshold_tokens:
                 self.threshold_tokens = _effective_cap
-        # Durable, so every recomputation honours it rather than a one-time assignment (#114707).
-        _aux_ceiling = getattr(self, "_aux_context_ceiling", None)
-        if isinstance(_aux_ceiling, int) and 0 < _aux_ceiling < self.threshold_tokens:
-            self.threshold_tokens = _aux_ceiling
+        # Only an explicit compression.threshold_tokens config may cap the trigger.
 
     @staticmethod
     def _effective_threshold_percent(context_length: int, threshold_percent: float) -> float:
@@ -2751,8 +2755,8 @@ class ContextCompressor(SummaryDispatchMixin, MicroCompactionMixin, ContextEngin
         self.threshold_percent = self._base_threshold_percent
         # Effective trigger = min(ratio threshold, cap); re-applied in update_model().
         self.threshold_tokens_cap = self._coerce_threshold_tokens_cap(threshold_tokens_cap)
-        # Aux summariser window installed by the feasibility probe; None until it runs.
-        self._aux_context_ceiling: int | None = None
+        # Auxiliary summariser window bounds its own input prompt, never the main trigger.
+        self._summary_input_aux_context: int | None = None
         self.protect_first_n, self.protect_last_n = protect_first_n, protect_last_n
         # Proactive prune runs independently of the full-compression trigger. 0 = disabled.
         self.proactive_prune_tokens = int(proactive_prune_tokens or 0)
@@ -3597,9 +3601,10 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
         return summary
 
     @classmethod
-    def _bound_summary_input(cls, content: str) -> str:
+    def _bound_summary_input(cls, content: str, max_chars: int | None = None) -> str:
         """Cap total summarizer input, keeping head and tail and marking the omitted middle."""
-        if len(content) <= cls._SUMMARY_INPUT_MAX_CHARS:
+        limit = min(cls._SUMMARY_INPUT_MAX_CHARS, max_chars) if max_chars is not None else cls._SUMMARY_INPUT_MAX_CHARS
+        if len(content) <= limit:
             return content
 
         marker_template = (
@@ -3610,7 +3615,7 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
         omitted = len(content)
         for _ in range(2):
             marker = marker_template.format(omitted=omitted)
-            remaining = max(cls._SUMMARY_INPUT_MAX_CHARS - len(marker), 0)
+            remaining = max(limit - len(marker), 0)
             head_chars = int(remaining * 0.45)
             tail_chars = remaining - head_chars
             omitted = max(len(content) - head_chars - tail_chars, 0)
@@ -3680,6 +3685,15 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
         """Issue the single aux summary call; return validated content text.
         Raises RuntimeError for empty content or a length-truncated (PARTIAL) summary so the failure
         routes through main-model fallback + cooldown instead of wiping the compacted turns."""
+        # The pinned included-quota route must not enter the generic auxiliary
+        # fallback chain (or retry on the Claude main model) when the pool is empty.
+        from agent.auxiliary_client import _get_auxiliary_task_config, _select_pool_entry
+        compression_route = _get_auxiliary_task_config("compression")
+        if compression_route.get("provider") == "openai-codex":
+            model = str(compression_route.get("model") or "").strip()
+            _pool_present, eligible = _select_pool_entry("openai-codex", model=model)
+            if not model or eligible is None:
+                raise CompressionPoolExhausted("Codex compression pool exhausted")
         # call_llm writes the route it actually selected; never pre-resolve a second, stale pair.
         _aux_route: Dict[str, str] = {}
         call_kwargs: Dict[str, Any] = {
@@ -3706,6 +3720,12 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
             call_kwargs["model"] = self.summary_model
         # Pinned route (stall fallback) overrides task routing so the retry leaves the stalled backend.
         call_kwargs.update(_pinned_summary_call_kwargs())
+        if compression_route.get("provider") == "openai-codex" and (
+            call_kwargs.get("provider", "openai-codex") != "openai-codex"
+            or call_kwargs.get("model", compression_route.get("model")) != compression_route.get("model")
+            or call_kwargs.get("base_url") or call_kwargs.get("api_key")
+        ):
+            raise CompressionPoolExhausted("Non-Codex compression fallback refused")
         # Compression is atomic: protect the in-flight summary call from a mid-turn gateway interrupt.
         # Without this, an incoming user message aborts the summary and compression falls back to a degraded
         # static marker, losing the real handoff (#23975). Re-entrant: a main-model retry (_generate_summary
@@ -3891,6 +3911,19 @@ Use this exact structure:
 
 FOCUS TOPIC: "{focus_topic}"
 This compaction should PRIORITISE preserving all information related to the focus topic above. For content related to "{focus_topic}", include full detail — exact values, file paths, command outputs, error messages, and decisions. For content NOT related to the focus topic, summarise more aggressively (brief one-liners or omit if truly irrelevant). The focus topic sections should receive roughly 60-70% of the summary token budget. Even for the focus topic, NEVER preserve API keys, tokens, passwords, or credentials — use [REDACTED]."""
+        aux_window = getattr(self, "_summary_input_aux_context", None)
+        if isinstance(aux_window, int) and aux_window > 0:
+            from agent.model_metadata import estimate_tokens_rough
+            # The auxiliary window bounds only its own request, never the main model's trigger.
+            budget = aux_window - max(8_192, int(aux_window * 0.20))
+            for _ in range(8):
+                estimated = estimate_tokens_rough(prompt)
+                if estimated <= budget:
+                    break
+                cap = max(4_096, int(len(prompt) * budget / estimated * 0.85))
+                prompt = self._bound_summary_input(prompt, max_chars=cap)
+            if estimate_tokens_rough(prompt) > budget:
+                raise ValueError("Auxiliary compression prompt exceeds its context window after bounding")
         return prompt
 
     @staticmethod
@@ -3978,6 +4011,20 @@ Write only the summary body. Do not include any preamble or prefix."""
         from agent.conversation_compression import _raise_if_stale_attempt
 
         _raise_if_stale_attempt(self)
+        from agent.auxiliary_client import _get_auxiliary_task_config, _select_pool_entry
+        route = _get_auxiliary_task_config("compression")
+        codex_model = str(route.get("model") or "").strip()
+        pool_drained = (
+            route.get("provider") == "openai-codex" and codex_model
+            and _select_pool_entry("openai-codex", model=codex_model)[1] is None
+        )
+        if isinstance(e, CompressionPoolExhausted) or pool_drained:
+            self._last_summary_pool_exhausted = True
+            self._last_summary_error = "Codex compression pool exhausted"
+            telemetry = getattr(self, "_active_compression_telemetry", None)
+            if isinstance(telemetry, dict):
+                telemetry["failure_class"] = "codex_compression_pool_exhausted"
+            return None
         # Only a genuine no-provider RuntimeError gets the long cooldown; empty/invalid-response
         # RuntimeErrors are transient and must get the main-model retry below first.
         # ``call_llm`` raises ``RuntimeError`` for two very different cases: 1. 2. An empty/invalid response
@@ -4015,7 +4062,9 @@ Write only the summary body. Do not include any preamble or prefix."""
         _route_model = str(
             self.summary_model or getattr(self, "_last_aux_resolved_model", "") or ""
         ).strip()
-        if _route_model and _route_model != self.model and not getattr(self, "_summary_model_fallen_back", False):
+        from agent.auxiliary_client import _get_auxiliary_task_config
+        pinned_codex = _get_auxiliary_task_config("compression").get("provider") == "openai-codex"
+        if _route_model and _route_model != self.model and not pinned_codex and not getattr(self, "_summary_model_fallen_back", False):
             self._fallback_to_main_for_compression(e, kind.fallback_reason(), failed_model=_route_model)
             # Retry immediately on the main model.
             return self._generate_summary(turns_to_summarize, focus_topic=focus_topic, memory_context=memory_context)

@@ -116,7 +116,7 @@ def aux_probe_mode():
         _aux_probe_state.active = prev
 
 
-from agent.credential_pool import load_pool
+from agent.credential_pool import CredentialPool, load_pool
 from agent.model_metadata import MINIMUM_CONTEXT_LENGTH, get_model_context_length
 from hermes_cli.config import get_hermes_home
 from hermes_cli.config_providers import _canonical_api_mode
@@ -1028,19 +1028,27 @@ def _load_pool_with_credentials(provider: str, note: str = "") -> Optional[Any]:
     return pool if pool and pool.has_credentials() else None
 
 
-def _select_pool_entry(provider: str) -> Tuple[bool, Optional[Any]]:
-    """Return (pool_exists_for_provider, selected_entry)."""
+def _select_pool_entry(provider: str, *, model: Optional[str] = None) -> Tuple[bool, Optional[Any]]:
+    """Return (pool_exists_for_provider, selected_entry), scoped to the requested model."""
     pool = _load_pool_with_credentials(provider)
     if pool is None:
         return False, None
     try:
-        return True, pool.select()
+        if not model:
+            return True, pool.select()
+        try:
+            return True, pool.select(model=model)
+        except TypeError:
+            if isinstance(pool, CredentialPool):
+                raise  # Never bypass model cooldowns on a real pool.
+            # Older injected pool implementations may only expose select().
+            return True, pool.select()
     except Exception as exc:
         logger.debug("Auxiliary client: could not select pool entry for %s: %s", provider, exc)
         return True, None
 
 
-def _peek_pool_entry(provider: str, pool: Any = None) -> Optional[Any]:
+def _peek_pool_entry(provider: str, pool: Any = None, *, model: Optional[str] = None) -> Optional[Any]:
     """Best-effort current/next pool entry without mutating selection order.
 
     ``pool`` skips the disk re-read when the caller already loaded it.
@@ -1050,13 +1058,19 @@ def _peek_pool_entry(provider: str, pool: Any = None) -> Optional[Any]:
     if pool is None:
         return None
     try:
-        current_fn = getattr(pool, "current", None)
-        current = current_fn() if callable(current_fn) else None
-        if current is not None:
-            return current
         peek_fn = getattr(pool, "peek", None)
         if callable(peek_fn):
+            if model:
+                try:
+                    return peek_fn(model=model)
+                except TypeError:
+                    if isinstance(pool, CredentialPool):
+                        raise  # Do not substitute an unscoped peek on the real pool.
+                    # Preserve compatibility with lightweight pool shims.
+                    pass
             return peek_fn()
+        current_fn = getattr(pool, "current", None)
+        return current_fn() if callable(current_fn) else None
     except Exception as exc:
         logger.debug("Auxiliary client: could not peek pool entry for %s: %s", provider, exc)
     return None
@@ -2108,13 +2122,15 @@ def _resolve_xai_oauth_for_aux() -> Optional[Tuple[str, str]]:
     return _creds_pair(creds)
 
 
-def _read_codex_access_token() -> Optional[str]:
-    """Valid, non-expired Codex OAuth access token; an exhausted pool falls back to the profile's auth.json token."""
-    pool_present, entry = _select_pool_entry("openai-codex")
+def _read_codex_access_token(model: Optional[str] = None) -> Optional[str]:
+    """Valid Codex OAuth token, selecting pool credentials for the requested model."""
+    pool_present, entry = _select_pool_entry("openai-codex", model=model)
     if pool_present:
         token = _pool_runtime_api_key(entry)
         if token:
             return token
+        # Never bypass a model-exhausted pool via the legacy singleton token.
+        return None
     try:
         from hermes_cli.auth import _read_codex_tokens
         access_token = _read_codex_tokens().get("tokens", {}).get("access_token")
@@ -2915,13 +2931,13 @@ def _build_codex_client(model: str) -> Tuple[Optional[Any], Optional[str]]:
             "pass model explicitly (auxiliary.<task>.model in config.yaml)."
         )
         return None, None
-    pool_present, entry = _select_pool_entry("openai-codex")
+    pool_present, entry = _select_pool_entry("openai-codex", model=model)
     codex_token = _pool_runtime_api_key(entry) if pool_present else None
     codex_override = _codex_base_url_override()
     if codex_token:
         base_url = codex_override or _pool_runtime_base_url(entry, _CODEX_AUX_BASE_URL) or _CODEX_AUX_BASE_URL
     else:
-        codex_token = _read_codex_access_token()
+        codex_token = _read_codex_access_token(model=model)
         if not codex_token:
             return None, None
         base_url = codex_override or _CODEX_AUX_BASE_URL
@@ -3534,7 +3550,8 @@ def _pool_credential_digest(pool: Any, entry: Any = None) -> str:
     return digest.hexdigest()
 
 
-def _pool_cache_hint(provider: str, *, main_runtime: Optional[Dict[str, Any]] = None) -> str:
+def _pool_cache_hint(provider: str, *, main_runtime: Optional[Dict[str, Any]] = None,
+                     model: Optional[str] = None) -> str:
     """Return a cache discriminator that follows the pooled credential, not just its entry id.
 
     ``<provider>:<entry id>:<digest of that entry's key>`` when ``peek()`` names an entry,
@@ -3552,7 +3569,7 @@ def _pool_cache_hint(provider: str, *, main_runtime: Optional[Dict[str, Any]] = 
     pool = _load_pool_with_credentials(normalized, " (cache hint)")
     if pool is None:
         return ""
-    entry = _peek_pool_entry(normalized, pool)
+    entry = _peek_pool_entry(normalized, pool, model=model)
     digest = _pool_credential_digest(pool, entry)
     entry_id = str(getattr(entry, "id", "") or "").strip() if entry is not None else ""
     if not entry_id and not digest:
@@ -4313,6 +4330,10 @@ def _try_configured_fallback_chain(
     run after a model-scoped failure). Returns (client, model, provider_label) or (None, None, "")."""
     if not task:
         return None, None, ""
+    if task == "compression" and _get_auxiliary_task_config(task).get("provider") == "openai-codex":
+        # Included-quota compression never walks an API-key or Claude fallback,
+        # even if an old profile still carries a generic auxiliary chain.
+        return None, None, ""
     chain = _get_auxiliary_task_config(task).get("fallback_chain")
     if not chain or not isinstance(chain, list):
         return None, None, ""
@@ -4418,6 +4439,9 @@ def _try_main_fallback_chain(
         if not fb_provider or not fb_model:
             continue
         fb_norm = fb_provider.lower()
+        from hermes_cli.fallback_config import fallback_applies_to_primary
+        if not fallback_applies_to_primary(entry, failed_provider):
+            continue
         label = f"fallback_providers[{i}]({fb_provider})"
         fb_base_url = _custom_health_base_url(fb_provider, entry.get("base_url"))
         if fb_norm == "auto" or skip(fb_provider, fb_model, fb_base_url):
@@ -4963,7 +4987,7 @@ def _resolve_openai_codex_branch(req: _ResolveRequest) -> _ResolveResult:
     no_token_msg = "resolve_provider_client: openai-codex requested but no Codex OAuth token found (run: hermes model)"
     if req.raw_codex:
         # Raw OpenAI client for callers needing responses.stream() (main agent loop).
-        codex_token = _read_codex_access_token()
+        codex_token = _read_codex_access_token(model=model)
         if not codex_token:
             logger.warning(no_token_msg)
             return None, None
@@ -5707,7 +5731,7 @@ def _client_cache_key(
     # `auto` resolves through the main runtime and task-specific policy, so both join the key.
     runtime_key = tuple(_runtime_cache_discriminator(f, runtime.get(f, "")) for f in _MAIN_RUNTIME_FIELDS) if provider == "auto" else ()
     task_key = (task or "", _task_prefers_fast_model(task)) if provider == "auto" else ""
-    pool_hint = _pool_cache_hint(provider, main_runtime=main_runtime)
+    pool_hint = _pool_cache_hint(provider, main_runtime=main_runtime, model=model)
     # Model MUST be in the key: concurrent calls to the same endpoint with different models would
     # share an entry, and the second builder's _store_cached_client would close the first's client.
     model_key = model or runtime.get("model", "")
@@ -5939,7 +5963,7 @@ def _get_cached_client(
     # and retry an exhausted key.
     effective_api_key = api_key
     if not effective_api_key:
-        _pe = _peek_pool_entry(_normalize_aux_provider(provider))
+        _pe = _peek_pool_entry(_normalize_aux_provider(provider), model=model)
         if _pe is not None:
             effective_api_key = _pool_runtime_api_key(_pe) or api_key
     client, default_model = resolve_provider_client(
