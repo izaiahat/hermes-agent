@@ -61,6 +61,7 @@ def _eval_js(task_id: str, expression: str) -> Dict[str, Any]:
     embed secret values — the fallback places the expression in subprocess
     argv. Use :func:`_eval_js_secret` for secret-bearing expressions.
     """
+    supervisor = None
     try:
         from tools.browser_supervisor import SUPERVISOR_REGISTRY
 
@@ -70,12 +71,12 @@ def _eval_js(task_id: str, expression: str) -> Dict[str, Any]:
             if sup.get("ok"):
                 return {"success": True, "result": sup.get("result")}
             err = str(sup.get("error") or "")
-            if "supervisor" not in err.lower():
+            if supervisor.browser_exec_target_id is not None or "supervisor" not in err.lower():
                 return {"success": False, "error": err}
-    except ImportError:
-        pass
-    except Exception as exc:  # pragma: no cover — defensive
-        logger.debug("vault fill: supervisor eval unavailable (%s)", exc)
+    except Exception as exc:  # Includes ImportError raised during evaluation.
+        if supervisor is not None and supervisor.browser_exec_target_id is not None:
+            return {"success": False, "error": "Bound browser evaluation failed."}
+        logger.debug("vault fill: supervisor eval unavailable (%s)", type(exc).__name__)
 
     from tools.browser_tool import _last_session_key
     from tools.browser_tool_session import _run_browser_command
@@ -166,6 +167,17 @@ def _parse_json_result(raw: Any) -> Any:
 
 
 def _current_page_origin(task_id: str) -> Optional[str]:
+    # A failed focus leaves the supervisor's previous CDP page session intact.
+    # In browser_exec mode that session may belong to a different/closed tab;
+    # never derive a credential origin from it instead of the bound target.
+    try:
+        from tools.browser_supervisor import SUPERVISOR_REGISTRY
+        supervisor = SUPERVISOR_REGISTRY.get(task_id)
+        if supervisor is not None and supervisor.browser_exec_target_id is not None:
+            if not supervisor.browser_exec_target_id or not supervisor.focus_page("").get("ok"):
+                return None
+    except Exception:
+        return None
     res = _eval_js(task_id, "window.location.href")
     if not res.get("success"):
         return None
@@ -286,8 +298,10 @@ def browser_vault_save_login(label: str = "", task_id: Optional[str] = None) -> 
     effective_task_id = task_id or "default"
     # The supervisor's default page session is whatever tab it attached to first (on Browser Use that is
     # the daemon's blank tab); the login form lives in the tab with a password field, so focus that one.
-    _focus_bound_origin(effective_task_id, "", "login")
-    origin = _current_page_origin(effective_task_id)
+    # Saving a new login has no saved origin to constrain the search. A failed
+    # form probe must not fall through to the supervisor's unrelated first tab.
+    focused = _focus_bound_origin(effective_task_id, "", "login")
+    origin = _current_page_origin(effective_task_id) if focused else None
     if not origin:
         return json.dumps({"success": False, "error": "Open the site's login page first; the login is saved for that page's origin."})
     prompt = get_save_login_prompt_callback()
@@ -321,7 +335,61 @@ _TAB_PROBES["otp"] = ("!!document.querySelector('input[autocomplete=one-time-cod
                       "input[id*=otp i], input[id*=code i], input[name*=totp i], input[aria-label*=code i]')")
 
 
-def browser_vault_enter_code(handle: str = "", task_id: Optional[str] = None) -> str:
+def _request_email_code(handle: str, task_id: str, request_selector: str, identifier_selector: str) -> str:
+    """Initiate an explicitly requested email-first login, never invent a password fill."""
+    from agent.vault_backends import backend_for_handle
+    from agent.vault_email_otp import EmailOTPError, arm, configured
+
+    try:
+        backend = backend_for_handle(handle)
+        meta = backend.get_meta(handle) if backend else None
+        origin = _current_page_origin(task_id)
+        if not meta or meta.kind != 'login' or not origin or meta.origin != origin:
+            return json.dumps({'success': False, 'error_type': 'origin_mismatch'})
+        cfg = configured(handle, origin, meta.identifier)
+        if not cfg or not request_selector or not identifier_selector:
+            return json.dumps({'success': False, 'error_type': 'email_otp_request_not_configured'})
+        supervisor = _ensure_supervisor(task_id)
+        if supervisor is None or not supervisor.browser_exec_target_id:
+            return json.dumps({'success': False, 'error_type': 'email_otp_target_unavailable'})
+        nonce = secrets.token_hex(16)
+        # Exact DOM controls are stamped before the Gmail baseline read, then
+        # rechecked together with origin + identifier in the initiating action.
+        preflight = """(() => {
+          if (location.origin !== %s) return false;
+          const ids = document.querySelectorAll(%s), buttons = document.querySelectorAll(%s);
+          const visible = e => e && !e.disabled && e.getClientRects().length > 0;
+          if (ids.length !== 1 || buttons.length !== 1) return false;
+          const id = ids[0], button = buttons[0];
+          if (!visible(id) || !visible(button) || id.value !== %s ||
+              !['email', 'text'].includes(id.type) ||
+              !['BUTTON', 'INPUT'].includes(button.tagName) ||
+              !id.form || id.form !== button.form ||
+              [...id.form.querySelectorAll('input[type=password]')].some(visible)) return false;
+          %s
+        })()"""
+        args = (json.dumps(origin), json.dumps(identifier_selector), json.dumps(request_selector), json.dumps(meta.identifier))
+        stamp = "id.dataset.hermesRequest = button.dataset.hermesRequest = %s; return true;" % json.dumps(nonce)
+        probe = _eval_js(task_id, preflight % (*args, stamp))
+        if not probe.get('success') or probe.get('result') is not True:
+            return json.dumps({'success': False, 'error_type': 'email_otp_request_control_mismatch'})
+        cfg['target_nonce'] = nonce
+        arm(cfg, task_id)
+        click = ("if (id.dataset.hermesRequest !== %s || button.dataset.hermesRequest !== %s) return false; "
+                 "sessionStorage.setItem('__hermes_vault_attempt', %s); button.click(); return true;") % ((json.dumps(nonce),) * 3)
+        result = _eval_js(task_id, preflight % (*args, click))
+        return json.dumps({'success': bool(result.get('success') and result.get('result') is True),
+                           'action': 'request', 'origin': origin, 'source': 'gmail',
+                           'next': 'Wait for the code controls, then call browser_vault_enter_code with the same handle.'})
+    except EmailOTPError as exc:
+        return json.dumps({'success': False, 'error_type': str(exc)})
+    except Exception:
+        return json.dumps({'success': False, 'error_type': 'email_otp_request_failed',
+                           'error': 'Private request failed; do not repeat an ambiguous submission.'})
+
+
+def browser_vault_enter_code(handle: str = "", task_id: Optional[str] = None, *,
+                             action: str = "enter", request_selector: str = "", identifier_selector: str = "") -> str:
     """Second factor: fill the one-time code the CURRENT page asks for. If the saved login (``handle``) has an
     authenticator seed, the code is minted server-side and nobody is asked; otherwise the user is prompted on
     their surface for the code their phone/email/app shows. The code goes into the page over the supervisor
@@ -332,6 +400,10 @@ def browser_vault_enter_code(handle: str = "", task_id: Optional[str] = None) ->
     from agent.vault_login_classifier import LoginControl, build_fill_js, build_inspection_js, build_otp_fills, classify_otp_controls
 
     effective_task_id = task_id or "default"
+    if action == "request":
+        return _request_email_code(handle, effective_task_id, request_selector, identifier_selector)
+    if action != "enter":
+        return json.dumps({'success': False, 'error_type': 'invalid_action'})
     _focus_bound_origin(effective_task_id, "", "otp")
     origin = _current_page_origin(effective_task_id)
     if not origin:
@@ -352,7 +424,30 @@ def browser_vault_enter_code(handle: str = "", task_id: Optional[str] = None) ->
     code: Optional[str] = None
     source = "user"
     backend = backend_for_handle(handle) if handle else None
+    email_cfg = None
     if backend is not None:
+        from agent.vault_email_otp import EmailOTPError, configured, retrieve
+        meta = backend.get_meta(handle)
+        if meta is None or meta.kind != "login":
+            return json.dumps({"success": False, "error_type": "invalid_login_handle"})
+        if meta is not None:
+            if meta.origin != origin:
+                return json.dumps({"success": False, "error_type": "origin_mismatch",
+                                   "error": "The verification page does not match the saved login origin."})
+            try:
+                email_cfg = configured(handle, origin, meta.identifier)
+                if email_cfg:
+                    marker = _eval_js(effective_task_id, "sessionStorage.getItem('__hermes_vault_attempt')")
+                    email_cfg['target_nonce'] = marker.get('result') if marker.get('success') else None
+                    code = retrieve(email_cfg, effective_task_id)
+                    source = "gmail"
+            except EmailOTPError as exc:
+                return json.dumps({"success": False, "error_type": str(exc),
+                                   "error": "The configured email verification source could not safely provide a fresh code."})
+            except Exception:
+                return json.dumps({"success": False, "error_type": "email_otp_source_error",
+                                   "error": "Private email verification failed; no message contents are returned."})
+    if backend is not None and not code:
         try:
             code = backend.resolve_otp(handle)
         except Exception:
@@ -372,10 +467,13 @@ def browser_vault_enter_code(handle: str = "", task_id: Optional[str] = None) ->
 
     register_vault_redaction_value(code)
     fills = build_otp_fills(otp_controls, code)
-    result = _eval_js_secret(effective_task_id, build_fill_js(fills, expected_origin=origin, nonce=nonce))
+    try:
+        result = _eval_js_secret(effective_task_id, build_fill_js(fills, expected_origin=origin, nonce=nonce))
+    except Exception:
+        return json.dumps({"success": False, "error_type": "otp_fill_failed", "error": "Private code fill failed; outcome unverified."})
     del code
     if not result.get("success"):
-        return json.dumps({"success": False, "error": str(result.get("error") or "fill failed")[:200]})
+        return json.dumps({"success": False, "error_type": "otp_fill_failed", "error": "Private code fill failed; outcome unverified."})
     parsed = _parse_json_result(result.get("result"))
     if isinstance(parsed, str):
         parsed = _parse_json_result(parsed)
@@ -506,6 +604,24 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None) -> str:
         return json.dumps(
             {"success": False, "error": f"No fillable {meta.kind} field matched the saved item on this page."}
         )
+
+    if meta.kind == "login":
+        from agent.vault_email_otp import EmailOTPError, arm, configured
+        try:
+            email_cfg = configured(handle, page_origin, meta.identifier)
+            if email_cfg:
+                import uuid
+                email_cfg['target_nonce'] = uuid.uuid4().hex
+                marker = _eval_js(effective_task_id, "sessionStorage.setItem('__hermes_vault_attempt', " + json.dumps(email_cfg['target_nonce']) + "); true")
+                if not marker.get('success'):
+                    raise EmailOTPError('email_otp_target_unavailable')
+                arm(email_cfg, effective_task_id)
+        except EmailOTPError as exc:
+            return json.dumps({"success": False, "error_type": str(exc),
+                               "error": "Email verification could not be armed; password not entered."})
+        except Exception:
+            return json.dumps({"success": False, "error_type": "email_otp_source_error",
+                               "error": "Private email verification setup failed; password not entered."})
 
     # Register the secret bytes with the model-egress redaction boundary
     # BEFORE they touch the page: any later browser_* result (including
@@ -658,18 +774,29 @@ BROWSER_VAULT_ENTER_CODE_SCHEMA = {
         "for the code in their UI (they read it from their phone, email or authenticator app). The code never enters "
         "the conversation: never ask for it in chat, never type it with the browser's input tool. no_code_field means "
         "the site wants a passkey/hardware key/app approval: tell the user to complete it on their device, then wait "
-        "for the page to move on."
+        "for the page to move on. For an explicitly configured Gmail email-first login, action=request "
+        "arms a fresh attempt and clicks request_selector on the exact current tab. First fill the "
+        "nonsecret identifier in identifier_selector. It does not fill a password or retrieve a code. "
+        "Then use action=enter on the resulting code form. Never repeat an ambiguous request."
     ),
     "parameters": {
         "type": "object",
-        "properties": {"handle": {"type": "string", "description": "The login handle you just filled (lets Hermes generate the code when an authenticator key is saved)."}},
+        "properties": {
+            "handle": {"type": "string", "description": "The exact saved login handle."},
+            "action": {"type": "string", "enum": ["enter", "request"], "default": "enter"},
+            "request_selector": {"type": "string", "description": "For action=request only: exact CSS selector for the initiating login button."},
+            "identifier_selector": {"type": "string", "description": "For action=request only: exact CSS selector for the already-filled identifier input."},
+        },
         "required": [],
     },
 }
 
 
 def _handle_vault_enter_code(args: Dict[str, Any], **kwargs) -> str:
-    return browser_vault_enter_code(handle=str(args.get("handle") or ""), task_id=kwargs.get("task_id"))
+    return browser_vault_enter_code(handle=str(args.get("handle") or ""), task_id=kwargs.get("task_id"),
+                                    action=str(args.get("action") or "enter"),
+                                    request_selector=str(args.get("request_selector") or ""),
+                                    identifier_selector=str(args.get("identifier_selector") or ""))
 
 
 def _handle_vault_save_login(args: Dict[str, Any], **kwargs) -> str:

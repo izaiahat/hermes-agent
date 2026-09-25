@@ -1341,9 +1341,18 @@ describe('createGatewayEventHandler', () => {
   })
 
   it('declines the requests a terminal cannot answer so the channel fails them fast', () => {
-    for (const method of ['preview.act', 'window.read', 'tour', 'mcp.setup', 'vault.code']) {
+    for (const method of ['preview.act', 'window.read', 'tour', 'mcp.setup']) {
       expect(serverRequest(method, {}).handled).toBe(false)
     }
+  })
+
+  it('routes vault verification codes into the masked private response overlay', () => {
+    expect(serverRequest('vault.code', { site: 'carrier.example', hint: '' }).handled).toBe(true)
+    expect(getOverlayState().secret).toMatchObject({
+      envVar: 'carrier.example',
+      prompt: 'Verification code for carrier.example',
+      requestId: 'srq-vault.code'
+    })
   })
 
   it('still surfaces terminal turn failures as errors', () => {

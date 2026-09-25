@@ -510,7 +510,7 @@ def _resolve_real_profile_cdp(env: dict, force_local: bool) -> Optional[str]:
     return err or None
 
 
-def _attach_vault_supervisor(env: dict, task_id: Optional[str]) -> None:
+def _attach_vault_supervisor(env: dict, task_id: Optional[str]):
     """Attach the per-task CDP supervisor to the browser this exec drives so ``browser_vault_fill`` has
     a secret-capable WebSocket (never argv) into the SAME browser. Only CDP-routed backends expose an
     endpoint; BU direct-cloud (BU_AUTOSPAWN) does not, and the vault tools report ``supervisor_required``."""
@@ -521,7 +521,7 @@ def _attach_vault_supervisor(env: dict, task_id: Optional[str]) -> None:
         from tools.browser_supervisor import SUPERVISOR_REGISTRY
         from tools.browser_tool_cdp import _get_dialog_policy_config, _resolve_cdp_override
         policy, timeout_s = _get_dialog_policy_config()
-        SUPERVISOR_REGISTRY.get_or_start(task_id=task_id or "default", cdp_url=_resolve_cdp_override(cdp),
+        return SUPERVISOR_REGISTRY.get_or_start(task_id=task_id or "default", cdp_url=_resolve_cdp_override(cdp),
                                          dialog_policy=policy, dialog_timeout_s=timeout_s)
     except Exception as exc:
         logger.debug("browser_exec: CDP supervisor attach failed (non-fatal): %s", exc)
@@ -630,7 +630,9 @@ def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT
     route_err = _route_backend(env, session, task_id, bool(local))
     if route_err:
         return tool_error(route_err)
-    _attach_vault_supervisor(env, task_id)
+    supervisor = _attach_vault_supervisor(env, task_id)
+    if supervisor is not None:
+        supervisor.bind_exec_target("")
 
     # SHARED browser (/browser connect CDP override): pin each named session to its own tab (see
     # _OWN_TAB_PREAMBLE). Private per-name browsers skip this — nothing to collide with.
@@ -648,6 +650,14 @@ def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT
         env["BU_AUTOSPAWN"] = "1"
 
     timeout = _clamp_timeout(timeout_s)
+    # The supervisor initially attaches to the first target (often about:blank),
+    # not the harness's current tab. Carry only that tab's ID back privately;
+    # never guess by origin or by the presence of a password field.
+    import secrets
+    target_receipt = "__hermes_exec_target_" + secrets.token_hex(16) + ":"
+    code += ("\nimport json as _hermes_target_json\n"
+             "print(" + repr(target_receipt) + " + _hermes_target_json.dumps("
+             "current_tab()['targetId']))\n")
     started = time.time()
     try:
         proc = _run_cli_killing_process_group(cmd, code, env, timeout)
@@ -657,6 +667,20 @@ def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT
                           "append to workspace files — anything already written to the workspace is preserved.")
     except OSError as e:
         return tool_error(f"Failed to launch browser-use CLI: {e}")
+
+    target_id = ""
+    output_lines = []
+    for line in proc.stdout.splitlines(keepends=True):
+        if line.startswith(target_receipt):
+            try:
+                target_id = json.loads(line[len(target_receipt):])
+            except (ValueError, TypeError):
+                target_id = ""
+        else:
+            output_lines.append(line)
+    if supervisor is not None:
+        supervisor.bind_exec_target(target_id if isinstance(target_id, str) else "")
+    proc.stdout = "".join(output_lines)
 
     # browser_vault_fill registers injected values with this forced model-egress
     # boundary. Preserve raw stdout only for screenshot-path detection below.

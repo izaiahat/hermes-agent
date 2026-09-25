@@ -125,6 +125,9 @@ class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin):
         self._pending_calls: Dict[int, asyncio.Future] = {}
         self._ws: Optional[ClientConnection] = None
         self._page_session_id: Optional[str] = None
+        # None is a legacy browser; an exec binding (including failed "") must
+        # never select a different tab just because it has a matching form.
+        self.browser_exec_target_id: Optional[str] = None
         # Dialog auto-dismiss watchdog handles (per dialog id) + id generator.
         self._dialog_watchdogs: Dict[str, asyncio.TimerHandle] = {}
         self._dialog_seq = 0
@@ -263,6 +266,13 @@ class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin):
             value = result_obj.get("description") or result_obj.get("unserializableValue")
         return {"ok": True, "result": value, "result_type": result_type}
 
+    def bind_exec_target(self, target_id: str) -> Dict[str, Any]:
+        """Bind vault operations to the tab actually used by browser_exec."""
+        with self._state_lock:
+            self.browser_exec_target_id = target_id
+            self._page_session_id = None
+        return self.focus_page("") if target_id else _fail("browser_exec has no bound target")
+
     def focus_page(self, origin: str, *, accept: Optional[str] = None, timeout: float = 10.0) -> Dict[str, Any]:
         """Re-attach the supervisor's page session to an open page target on ``origin``
         (``scheme://host[:port]``). The initial attach picks the FIRST page target, but tools
@@ -286,6 +296,8 @@ class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin):
             targets = (await self._cdp("Target.getTargets", timeout=timeout)).get("result", {}).get("targetInfos", [])
             candidates = []
             for t in targets:
+                if self.browser_exec_target_id is not None and t.get("targetId") != self.browser_exec_target_id:
+                    continue
                 url = str(t.get("url") or "")
                 try:
                     # origin="" = any http(s) page (used to FIND the login tab before its origin is known)

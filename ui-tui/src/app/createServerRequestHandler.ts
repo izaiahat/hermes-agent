@@ -20,7 +20,7 @@ const strList = (v: unknown): null | string[] =>
  * (`tui_gateway/server_requests.py`). Each method opens its overlay card;
  * the card's answer path resolves the request through `serverRequestStore`.
  * Methods the terminal cannot answer (desktop GUI bridges: `preview.*`,
- * `window.read`, `tour`, `mcp.setup`, `terminal.read`, the vault card
+ * `window.read`, `tour`, `mcp.setup`, `terminal.read`, vault save-login
  * prompts) return `false` so the channel answers `-32601` and the tool
  * fails fast instead of waiting out its deadline.
  */
@@ -90,6 +90,20 @@ export function createServerRequestHandler(ctx: ServerRequestHandlerContext): (r
       case 'sudo':
         patchOverlayState({ sudo: { requestId: request.id } })
         open(request, 'sudo password needed')
+
+        return true
+
+      case 'vault.code':
+        // Reuse the masked prompt's private RPC reply, never the chat composer.
+        // envVar is a display label here; answerSecret returns only { value }.
+        patchOverlayState({
+          secret: {
+            envVar: str(p.site),
+            prompt: `Verification code for ${str(p.site)}`,
+            requestId: request.id
+          }
+        })
+        open(request, 'private verification code needed')
 
         return true
 

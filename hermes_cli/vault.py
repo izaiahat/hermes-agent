@@ -17,6 +17,11 @@ server-side without ever seeing it.
 from __future__ import annotations
 
 import getpass
+import json
+import sys
+import warnings
+from pathlib import Path
+from urllib.parse import urlsplit
 
 
 def _console():
@@ -109,6 +114,78 @@ def _cmd_add(args) -> None:
     c.print(f"[green]Stored.[/] handle=[bold]{meta.id}[/] kind={meta.kind} origin={meta.origin or '-'}")
 
 
+def _cmd_add_logins(args) -> None:
+    """Preview exact origin bindings, then collect one hidden password for new logins."""
+    from agent.vault_store import VaultError, get_vault_store, normalize_origin
+
+    c = _console()
+    identifier = args.identifier.strip()
+    if not identifier or "@" not in identifier:
+        raise VaultError("--identifier must be an email address")
+    try:
+        manifest = json.loads(Path(args.manifest).read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise VaultError("cannot read a JSON login manifest") from exc
+    if not isinstance(manifest, dict) or set(manifest) != {"logins"} or not isinstance(manifest["logins"], list):
+        raise VaultError("manifest must contain only a logins array")
+    logins = {}
+    for entry in manifest["logins"]:
+        if not isinstance(entry, dict) or set(entry) != {"origin", "label"}:
+            raise VaultError("each login must contain only origin and label")
+        origin, label = entry["origin"], entry["label"]
+        if not isinstance(origin, str) or not isinstance(label, str) or not label.strip():
+            raise VaultError("each login needs a string origin and nonempty label")
+        parts = urlsplit(origin)
+        if (parts.scheme != "https" or parts.username or parts.password or parts.path or parts.query
+                or parts.fragment or normalize_origin(origin) != origin):
+            raise VaultError("login origins must be exact canonical HTTPS origins without paths or credentials")
+        logins.setdefault(origin, label.strip())
+    if not logins:
+        raise VaultError("manifest has no logins")
+
+    store = get_vault_store()
+    existing = {}
+    for item in store.list_items():
+        if item.kind == "login":
+            existing.setdefault(item.origin, set()).add(item.identifier)
+    pending = []
+    for origin, label in logins.items():
+        identities = existing.get(origin, set())
+        status = "skip (existing identity)" if identifier in identities else (
+            "skip (different identity; preserve existing)" if identities else "add")
+        c.print(f"{origin}  {label}  {status}")
+        if not identities:
+            pending.append((origin, label))
+    c.print(f"{len(logins)} distinct origins; {len(pending)} to add; {len(logins) - len(pending)} skipped.")
+    if args.dry_run or not pending:
+        return
+    if not sys.stdin.isatty():
+        raise VaultError("interactive terminal with hidden input required; nothing saved")
+    try:
+        answer = input(f"Save {len(pending)} origin-bound logins for {identifier}? Type yes to confirm: ")
+    except (EOFError, KeyboardInterrupt) as exc:
+        raise VaultError("confirmation cancelled; nothing saved") from exc
+    if answer.strip().lower() != "yes":
+        c.print("Cancelled; nothing saved.")
+        return
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", getpass.GetPassWarning)
+            password = getpass.getpass("Password (hidden, once): ")
+    except (getpass.GetPassWarning, EOFError, KeyboardInterrupt, OSError) as exc:
+        raise VaultError("hidden password input unavailable; nothing saved") from exc
+    if not password:
+        raise VaultError("empty password; nothing saved")
+    for origin, label in pending:
+        # Recheck before each write; never replace an identity already present on the origin.
+        if any(item.kind == "login" and item.origin == origin for item in store.list_items()):
+            c.print(f"Skipped {origin}: existing login")
+            continue
+        store.add_item("login", label, {"identifier_type": "email", "identifier": identifier,
+                                        "password": password}, origin=origin)
+        c.print(f"Stored {origin}")
+
+
 def _cmd_list(args) -> None:
     """Local items always; external managers only for the lifetime of this CLI process (a
     `hermes vault list` unlock does not carry into a chat session — unlock there when asked)."""
@@ -195,6 +272,12 @@ def register_cli(subparser) -> None:
         help="Item kind (interactive prompt when omitted)",
     )
     p_add.set_defaults(_vault_handler=_cmd_add)
+
+    p_bulk = subs.add_parser("add-logins", help="Preview and add origin-bound logins with one hidden password")
+    p_bulk.add_argument("--manifest", required=True, help="JSON file with non-secret logins: origin and label only")
+    p_bulk.add_argument("--identifier", required=True, help="Email identifier stored as visible metadata")
+    p_bulk.add_argument("--dry-run", action="store_true", help="Preview exact deduped origins without a password or writes")
+    p_bulk.set_defaults(_vault_handler=_cmd_add_logins)
 
     p_list = subs.add_parser("list", help="List vault items (metadata only, never values)")
     p_list.set_defaults(_vault_handler=_cmd_list)
