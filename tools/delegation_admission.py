@@ -144,7 +144,7 @@ def _measure(sample_seconds: float, sleep) -> str | None:
 # A PID plus kernel start tick makes leases reclaimable after crashes and PID reuse.
 def _budget_path() -> Path:
     # All named profiles and external one-shots share the physical host pool.
-    # A profile-scoped Hermes home here would multiply the four slots.
+    # A profile-scoped Hermes home here would multiply the host-wide slots.
     return Path.home() / ".hermes" / "cache" / "delegation-host-budget.json"
 
 
@@ -207,7 +207,7 @@ def host_child_limit() -> int:
     if not total:
         raise RuntimeError("MemTotal unreadable; refusing host reservation")
     cpu_lanes = len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else (os.cpu_count() or 1)
-    return max(1, min(4, 2 * cpu_lanes, (total - MIN_MEM_AVAILABLE_KB) // (1536 * 1024)))
+    return max(1, min(8, 2 * cpu_lanes, (total - MIN_MEM_AVAILABLE_KB) // (1536 * 1024)))
 
 
 def try_reserve_host_children(count: int) -> tuple[list[HostLease] | None, int, int]:

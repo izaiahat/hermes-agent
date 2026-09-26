@@ -132,7 +132,7 @@ class TestThresholds:
         monkeypatch.setattr(admission, "MAX_LOAD_1M", 12.0)
         assert (verdict() is not None) is refused
 
-    def test_four_gib_floor_and_four_child_available_reserve(self, proc_root, tmp_path, monkeypatch):
+    def test_four_gib_floor_and_eight_child_available_reserve(self, proc_root, tmp_path, monkeypatch):
         monkeypatch.setattr(admission, "_budget_path", lambda: tmp_path / "budget.json")
         monkeypatch.setattr(admission, "_start_tick", lambda _pid: "test")
         monkeypatch.setattr(admission.os, "sched_getaffinity", lambda _pid: set(range(8)))
@@ -141,17 +141,21 @@ class TestThresholds:
         admission._CACHE.update(at=0.0, result=None)
         write_proc(proc_root, mem_kb=4 * GIB_KB)
         assert verdict() is None
-        # Four-child batch requires 4 GiB + 4 * 768 MiB available.
-        write_proc(proc_root, mem_kb=7 * GIB_KB - 1)
-        assert admission.try_reserve_host_children(4)[0] is None
-        write_proc(proc_root, mem_kb=7 * GIB_KB)
-        assert admission.host_child_limit() == 4
-        leases, active, limit = admission.try_reserve_host_children(4)
-        assert leases is not None and (active, limit) == (0, 4)
-        assert admission.try_reserve_host_children(1)[0] is None
+        # Eight-child batch requires 4 GiB + 8 * 768 MiB available.
+        write_proc(proc_root, mem_kb=10 * GIB_KB - 1)
+        assert admission.try_reserve_host_children(8)[0] is None
+        write_proc(proc_root, mem_kb=11 * GIB_KB)  # Enough for a ninth; the slot cap must refuse it.
+        assert admission.host_child_limit() == 8
+        leases, active, limit = admission.try_reserve_host_children(8)
+        assert leases is not None and (active, limit) == (0, 8)
+        ninth, active, limit = admission.try_reserve_host_children(1)
+        assert ninth is None and (active, limit) == (8, 8)
         for lease in leases:
             lease.release()
-        assert admission.try_reserve_host_children(5)[0] is None
+        leases, active, limit = admission.try_reserve_host_children(8)
+        assert leases is not None and (active, limit) == (0, 8)
+        for lease in leases:
+            lease.release()
 
     def test_host_memory_sizing_and_unreadable_total_fail_closed(self, proc_root, monkeypatch):
         monkeypatch.setattr(admission.os, "sched_getaffinity", lambda _pid: set(range(8)))
@@ -159,7 +163,7 @@ class TestThresholds:
         (proc_root / "meminfo").write_text(
             f"MemTotal: {31 * GIB_KB} kB\nMemAvailable: {19 * GIB_KB} kB\n"
         )
-        assert admission.host_child_limit() == 4
+        assert admission.host_child_limit() == 8
         (proc_root / "meminfo").write_text(f"MemAvailable: {19 * GIB_KB} kB\n")
         with pytest.raises(RuntimeError, match="MemTotal unreadable"):
             admission.host_child_limit()

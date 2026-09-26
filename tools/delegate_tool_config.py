@@ -19,8 +19,8 @@ _RUNTIME_PROVIDER_CUSTOM = "custom"
 # (floor of 1 only); a box that can be driven to N children by config alone is how the
 # 2026-09-12 swap-critical incident happened, so width, detached batches and TOTAL active
 # descendants are all bounded here and admission is refused atomically at the spawn site.
-_DEFAULT_MAX_CONCURRENT_CHILDREN = 4
-_DEFAULT_MAX_BACKGROUND_BATCHES = 4
+_DEFAULT_MAX_CONCURRENT_CHILDREN = 8
+_DEFAULT_MAX_BACKGROUND_BATCHES = 8
 _descendant_budget_lock = threading.Lock()
 _active_descendants = 0
 _descendant_budget_epoch = 0
@@ -100,10 +100,10 @@ def _get_oneshot_max_children() -> int:
 
 
 def _get_max_concurrent_children() -> int:
-    """Return the per-call child width, clamped to the hard safety ceiling 4.
+    """Return the per-call child width, clamped to the hard safety ceiling 8.
 
-    A host-wide 4-slot lease plus independent pressure gates bounds aggregate
-    fan-out across TUIs; a single batch remains bounded to 4 children.
+    A host-wide 8-slot lease plus independent pressure gates bounds aggregate
+    fan-out across TUIs; a single batch remains bounded to 8 children.
     """
     cfg = _cfg()
     val = cfg.get("max_concurrent_children")
@@ -123,7 +123,7 @@ def _get_max_concurrent_children() -> int:
     clamped = min(_DEFAULT_MAX_CONCURRENT_CHILDREN, max(1, parsed))
     if clamped != parsed:
         logger.warning(
-            "delegation.max_concurrent_children=%d outside [1, 4]; clamping to %d",
+            "delegation.max_concurrent_children=%d outside [1, 8]; clamping to %d",
             parsed,
             clamped,
         )
@@ -723,25 +723,25 @@ def _get_max_background_batches() -> int:
 
 
 def _get_max_total_descendants() -> int:
-    """Return the process/tree child budget, hard-capped at four.
+    """Return the process/tree child budget, hard-capped at eight.
 
-    The host-wide 4-slot atomic gate is shared by all parent processes.
+    The host-wide 8-slot atomic gate is shared by all parent processes.
     """
     cfg = _cfg()
     val = cfg.get("max_total_descendants")
     if val is None:
         val = os.getenv("DELEGATION_MAX_TOTAL_DESCENDANTS")
     if val is None:
-        return 4
+        return 8
     try:
         parsed = int(val)
     except (TypeError, ValueError):
-        logger.warning("delegation.max_total_descendants=%r is invalid; using 4", val)
-        return 4
-    clamped = min(4, max(1, parsed))
+        logger.warning("delegation.max_total_descendants=%r is invalid; using 8", val)
+        return 8
+    clamped = min(8, max(1, parsed))
     if clamped != parsed:
         logger.warning(
-            "delegation.max_total_descendants=%d outside [1, 4]; clamping to %d",
+            "delegation.max_total_descendants=%d outside [1, 8]; clamping to %d",
             parsed,
             clamped,
         )

@@ -1975,18 +1975,18 @@ class TestDelegateEventEnum(unittest.TestCase):
 
 
 class TestConcurrencyDefaults(unittest.TestCase):
-    """Tests for the hard four-wide per-call ceiling and shared host admission."""
+    """Tests for the hard eight-wide per-call ceiling and shared host admission."""
 
     @patch("tools.delegate_tool._load_config", return_value={})
-    def test_default_is_four(self, mock_cfg):
-        self.assertEqual(_get_max_concurrent_children(), 4)
+    def test_default_is_eight(self, mock_cfg):
+        self.assertEqual(_get_max_concurrent_children(), 8)
 
     @patch("tools.delegate_tool._load_config", return_value={})
-    def test_registered_schema_advertises_four(self, mock_cfg):
+    def test_registered_schema_advertises_eight(self, mock_cfg):
         from tools.delegate_tool import _build_dynamic_schema_overrides
         schema = _build_dynamic_schema_overrides()["parameters"]["properties"]["tasks"]
-        self.assertEqual(schema["maxItems"], 4)
-        self.assertIn("up to 4", schema["description"])
+        self.assertEqual(schema["maxItems"], 8)
+        self.assertIn("up to 8", schema["description"])
 
     def test_load_config_prefers_active_persistent_config_over_cli_defaults(self):
         stale_cli = types.ModuleType("cli")
@@ -1997,7 +1997,7 @@ class TestConcurrencyDefaults(unittest.TestCase):
                 "hermes_cli.config.load_config_readonly", return_value=active_config
             ):
                 self.assertEqual(_load_config()["max_concurrent_children"], 50)
-                self.assertEqual(_get_max_concurrent_children(), 4)
+                self.assertEqual(_get_max_concurrent_children(), 8)
 
     @patch(
         "tools.delegate_tool._load_config",
@@ -2011,12 +2011,12 @@ class TestConcurrencyDefaults(unittest.TestCase):
         return_value={"max_concurrent_children": 999},
     )
     def test_very_high_values_clamped(self, mock_cfg):
-        self.assertEqual(_get_max_concurrent_children(), 4)
+        self.assertEqual(_get_max_concurrent_children(), 8)
 
     @patch("tools.delegate_tool._load_config", return_value={})
     @patch.dict("os.environ", {"DELEGATION_MAX_CONCURRENT_CHILDREN": "13"})
     def test_env_var_is_clamped(self, mock_cfg):
-        self.assertEqual(_get_max_concurrent_children(), 4)
+        self.assertEqual(_get_max_concurrent_children(), 8)
 
     @patch(
         "tools.delegate_tool._load_config",
@@ -2036,7 +2036,7 @@ class TestBackgroundBatchCapSeparated(unittest.TestCase):
     def test_explicit_background_batch_cap_is_clamped(self, mock_cfg):
         from tools.delegate_tool import _get_max_background_batches
 
-        self.assertEqual(_get_max_background_batches(), 4)
+        self.assertEqual(_get_max_background_batches(), 8)
 
     @patch(
         "tools.delegate_tool._load_config",
@@ -2045,23 +2045,28 @@ class TestBackgroundBatchCapSeparated(unittest.TestCase):
     def test_stale_max_async_children_is_ignored(self, mock_cfg):
         from tools.delegate_tool import _get_max_async_children
 
-        self.assertEqual(_get_max_async_children(), 4)
+        self.assertEqual(_get_max_async_children(), 8)
 
     @patch("tools.delegate_tool._load_config", return_value={})
-    def test_default_is_four_detached_batches(self, mock_cfg):
+    def test_default_is_eight_detached_batches(self, mock_cfg):
         from tools.delegate_tool import _get_max_background_batches
 
-        self.assertEqual(_get_max_background_batches(), 4)
+        self.assertEqual(_get_max_background_batches(), 8)
 
     @patch("tools.delegate_tool._load_config", return_value={})
     @patch.dict("os.environ", {"DELEGATION_MAX_BACKGROUND_BATCHES": "7"})
     def test_background_batch_env_override_is_preserved(self, mock_cfg):
         from tools.delegate_tool import _get_max_background_batches
 
-        self.assertEqual(_get_max_background_batches(), 4)
+        self.assertEqual(_get_max_background_batches(), 7)
 
 
 class TestDescendantAdmissionBudget(unittest.TestCase):
+    @patch("tools.delegate_tool._load_config", return_value={"max_total_descendants": 99})
+    def test_total_descendants_clamped_to_eight(self, mock_cfg):
+        from tools.delegate_tool import _get_max_total_descendants
+        self.assertEqual(_get_max_total_descendants(), 8)
+
     @patch(
         "tools.delegate_tool._load_config",
         return_value={"max_total_descendants": 4},
