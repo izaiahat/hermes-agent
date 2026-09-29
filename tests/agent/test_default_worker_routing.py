@@ -65,6 +65,31 @@ def test_auxiliary_policy_matches_actual_sdk_request(tmp_path, monkeypatch, task
         assert resolved[:2] == ("anthropic", None)
 
 
+def test_auxiliary_slot_effort_precedes_legacy_wire_controls(tmp_path, monkeypatch):
+    home = tmp_path / "root"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    runtime = {"provider": "openai-codex", "model": "gpt-6-astra-900k", "api_mode": "codex_responses"}
+    with OpenAI(api_key="offline-only", base_url="https://chatgpt.com/backend-api/codex") as sdk:
+        monkeypatch.setattr(aux, "_build_codex_client", lambda model: (aux.CodexAuxiliaryClient(sdk, model), model))
+        for legacy in ({"enabled": True, "effort": "low"}, {"enabled": False}):
+            config = {"worker_routing": {"enabled": True}, "model": runtime,
+                      "auxiliary": {"compression": {"provider": "auto", "reasoning_effort": "high",
+                                    "extra_body": {"reasoning": legacy}}}}
+            (home / "config.yaml").write_text(yaml.safe_dump(config), encoding="utf-8")
+            for override, expected in ((None, "high"), ({"enabled": True, "effort": "medium"}, "medium")):
+                info = {}
+                prepared = aux._prepare_aux_request(
+                    "compression", provider=None, model=None, base_url=None, api_key=None,
+                    main_runtime=runtime, messages=[{"role": "user", "content": "offline"}],
+                    temperature=None, max_tokens=None, tools=None, timeout=None, extra_body=None,
+                    reasoning_config=override, extra_headers=None, api_mode=None, route_info=info,
+                    async_mode=False)
+                assert prepared.effective_extra_body["reasoning"]["effort"] == expected
+                assert info["resolved"]["reasoning_effort"] == expected
+
+
 def test_curator_and_independent_review_preserve_explicit_routes(tmp_path, monkeypatch):
     from types import SimpleNamespace
     from agent import curator, review_engine

@@ -7299,7 +7299,8 @@ def _prepare_aux_request(
                                          api_key=api_key, main_runtime=main_runtime)
     if api_mode:
         resolved_api_mode = api_mode
-    effective_extra_body = _get_task_extra_body(task)
+    effective_extra_body = (dict(worker_route["request_overrides"].get("extra_body") or {})
+                            if worker_route is not None else _get_task_extra_body(task))
     effective_extra_body.update(extra_body or {})
     client, final_model, resolved_provider, effective_provider = _resolve_call_client(
         task, provider=provider, model=model, base_url=base_url, api_key=api_key,
@@ -7319,7 +7320,7 @@ def _prepare_aux_request(
         from tools.delegate_tool_config import validate_worker_effort
         from hermes_constants import parse_reasoning_effort
         policy_reasoning = parse_reasoning_effort(worker_route["reasoning_effort"])
-        selected_reasoning = reasoning_config if reasoning_config is not None else effective_extra_body.get("reasoning")
+        selected_reasoning = reasoning_config if reasoning_config is not None else (extra_body or {}).get("reasoning")
         if selected_reasoning is None:
             selected_reasoning = policy_reasoning
         effort = selected_reasoning.get("effort") if selected_reasoning.get("enabled", True) else "none"
