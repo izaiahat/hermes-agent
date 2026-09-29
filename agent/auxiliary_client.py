@@ -1591,6 +1591,10 @@ class _CodexCompletionsAdapter:
             # slot exactly like an ordinary turn does, so they must queue behind the same
             # gate or a compression pass can 429 every live seat.
             with codex_request_gate():
+                worker_receipt = kwargs.get("_worker_receipt")
+                if worker_receipt is not None:
+                    from tools.delegate_tool_config import record_worker_wire
+                    record_worker_wire(worker_receipt, stream_kwargs)
                 event_stream = self._client.responses.create(**stream_kwargs)
             note_success()
 
@@ -5447,7 +5451,7 @@ def resolve_provider_client(
 
 def get_text_auxiliary_client(task: str = "", *, main_runtime: Optional[Dict[str, Any]] = None) -> Tuple[Optional[OpenAI], Optional[str]]:
     """Return (client, default_model_slug) for text-only aux tasks; ``task`` selects auxiliary.<task> overrides."""
-    provider, model, base_url, api_key, api_mode = _resolve_task_provider_model(task or None)
+    provider, model, base_url, api_key, api_mode = _resolve_task_provider_model(task or None, main_runtime=main_runtime)
     return resolve_provider_client(
         provider, model=model, explicit_base_url=base_url, explicit_api_key=api_key,
         api_mode=api_mode, main_runtime=main_runtime,
@@ -6028,9 +6032,25 @@ def _preserve_provider_with_base_url(prov: Optional[str]) -> bool:
         }
 
 
+_POLICY_TEXT_TASKS = {"compression": "synthesis", "title_generation": "simple_check"}
+
+
+def _auxiliary_worker_route(task, *, provider=None, model=None, base_url=None, api_key=None, main_runtime=None):
+    """Reuse the native worker policy for the current text auxiliary paths."""
+    if task not in _POLICY_TEXT_TASKS:
+        return None
+    from tools.delegate_tool_config import resolve_worker_route
+    route = dict(_get_auxiliary_task_config(task))
+    route.update({k: v for k, v in {"provider": provider, "model": model, "base_url": base_url, "api_key": api_key}.items()
+                  if v is not None})
+    route["request_overrides"] = {"extra_body": dict(route.get("extra_body") or {})}
+    return resolve_worker_route(route, inherited_provider=_normalize_main_runtime(main_runtime).get("provider"),
+                                task_kind=_POLICY_TEXT_TASKS[task])
+
+
 def _resolve_task_provider_model(
     task: str = None, provider: str = None, model: str = None, base_url: Optional[str] = None,
-    api_key: Optional[str] = None,
+    api_key: Optional[str] = None, main_runtime: Optional[Dict[str, Any]] = None,
 ) -> Tuple[str, Optional[str], Optional[str], Optional[str], Optional[str]]:
     """Determine (provider, model, base_url, api_key, api_mode) for a call.
 
@@ -6040,7 +6060,8 @@ def _resolve_task_provider_model(
     """
     cfg_provider = cfg_model = cfg_base_url = cfg_api_key = resolved_api_mode = None
     if task:
-        task_config = _get_auxiliary_task_config(task)
+        task_config = _auxiliary_worker_route(task, provider=provider, model=model, base_url=base_url,
+                                               api_key=api_key, main_runtime=main_runtime) or _get_auxiliary_task_config(task)
         cfg_provider = str(task_config.get("provider", "")).strip() or None
         cfg_model = str(task_config.get("model", "")).strip() or None
         cfg_base_url = str(task_config.get("base_url", "")).strip() or None
@@ -7272,7 +7293,10 @@ def _prepare_aux_request(
     Sync-only: compression fast lane, per-request ``extra_headers``, and ``base_info`` falling
     back to the resolved base_url when the client exposes none."""
     resolved_provider, resolved_model, resolved_base_url, resolved_api_key, resolved_api_mode = _resolve_task_provider_model(
-        task, provider, model, base_url, api_key)
+        task, provider, model, base_url, api_key, main_runtime=main_runtime)
+    requested_reasoning = dict(reasoning_config) if isinstance(reasoning_config, dict) else None
+    worker_route = _auxiliary_worker_route(task, provider=provider, model=model, base_url=base_url,
+                                         api_key=api_key, main_runtime=main_runtime)
     if api_mode:
         resolved_api_mode = api_mode
     effective_extra_body = _get_task_extra_body(task)
@@ -7291,6 +7315,22 @@ def _prepare_aux_request(
         if isinstance(client, (CodexAuxiliaryClient, AsyncCodexAuxiliaryClient)) else None
     )
     request_provider = effective_provider or resolved_provider
+    if worker_route is not None:
+        from tools.delegate_tool_config import validate_worker_effort
+        from hermes_constants import parse_reasoning_effort
+        policy_reasoning = parse_reasoning_effort(worker_route["reasoning_effort"])
+        selected_reasoning = reasoning_config if reasoning_config is not None else effective_extra_body.get("reasoning")
+        if selected_reasoning is None:
+            selected_reasoning = policy_reasoning
+        effort = selected_reasoning.get("effort") if selected_reasoning.get("enabled", True) else "none"
+        validate_worker_effort(request_provider, final_model, effort, api_mode="codex_responses",
+                               base_url=str(getattr(client, "base_url", "") or ""))
+        if not isinstance(client, (CodexAuxiliaryClient, AsyncCodexAuxiliaryClient)):
+            raise ValueError("Worker policy requires the selected Codex auxiliary client")
+        worker_route["_worker_route"]["reasoning_effort"] = effort
+        reasoning_config = selected_reasoning
+        effective_extra_body["reasoning"] = selected_reasoning
+        effective_extra_body["service_tier"] = worker_route["request_overrides"]["service_tier"]
     if not async_mode:
         compression_config = _get_auxiliary_task_config("compression") if task == "compression" else {}
         _, effective_extra_body = _compression_fast_lane_controls(
@@ -7316,6 +7356,17 @@ def _prepare_aux_request(
         tools=tools, timeout=effective_timeout, extra_body=effective_extra_body,
         reasoning_config=reasoning_config, base_url=base_info or resolved_base_url, task=task,
         no_progress_timeout=no_progress_timeout)
+    if worker_route is not None:
+        from types import SimpleNamespace
+        receipt = SimpleNamespace(provider=request_provider, base_url=base_info,
+                                  _worker_route=worker_route["_worker_route"], _worker_wire_requests=[])
+        kwargs["_worker_receipt"] = receipt
+        if route_info is not None:
+            route_info.update(requested={"provider": provider, "model": model,
+                                         "reasoning_effort": (requested_reasoning or {}).get("effort"),
+                                         "speed": _get_auxiliary_task_config(task).get("speed"),
+                                         "task_kind": _get_auxiliary_task_config(task).get("task_kind")},
+                              resolved=dict(worker_route["_worker_route"]), wire_requests=receipt._worker_wire_requests)
     if extra_headers:
         kwargs["extra_headers"] = dict(extra_headers)
     # Convert image blocks for Anthropic-compatible endpoints (e.g. MiniMax)
@@ -7739,6 +7790,8 @@ def _aux_recovery_ladder(
     resp, first_err = yield from _ladder_credential_rungs(first_err, route, kwargs, client_is_nous)
     if first_err is None:
         return resp
+    if kwargs.get("_worker_receipt") is not None:
+        raise first_err  # The opt-in subscription worker route never discovers a paid fallback.
     resp = yield from _ladder_provider_fallback(first_err, route)
     if resp is not None:
         return resp
