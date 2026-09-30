@@ -1563,6 +1563,7 @@ class _CronJobConfig:
     model: str
     model_cfg: Any
     cron_default_provider: str
+    worker_route: Optional[dict] = None
 
 
 def _load_cron_job_config(job: dict, job_id: str, job_name: str) -> _CronJobConfig:
@@ -1597,6 +1598,15 @@ def _load_cron_job_config(job: dict, job_id: str, job_name: str) -> _CronJobConf
     except Exception as e:
         logger.warning("Job '%s': failed to load config.yaml, using defaults: %s", job_id, e)
 
+    from tools.delegate_tool_config import resolve_worker_route
+    cron_route = dict(_cfg.get("cron") or {})
+    cron_route["provider"] = cron_route.pop("model_provider", None)
+    cron_route.update({k: job[k] for k in ("model", "provider", "base_url", "reasoning_effort", "speed", "task_kind")
+                       if job.get(k) is not None and job.get(k) != ""})
+    worker_route = resolve_worker_route(cron_route, config=_cfg)
+    if worker_route is not None:
+        model, _cron_default_provider = worker_route["model"], worker_route["provider"]
+
     # Fail fast: an empty model otherwise reaches the provider as an opaque 400.
     # See #23979.
     if not (isinstance(model, str) and model.strip()):
@@ -1615,7 +1625,7 @@ def _load_cron_job_config(job: dict, job_id: str, job_name: str) -> _CronJobConf
         _net_cfg = _cfg.get("network", {})
         if isinstance(_net_cfg, dict) and _net_cfg.get("force_ipv4"):
             apply_ipv4_preference(force=True)
-    return _CronJobConfig(_cfg, model, _model_cfg, _cron_default_provider)
+    return _CronJobConfig(_cfg, model, _model_cfg, _cron_default_provider, worker_route)
 
 
 def _load_prefill_messages(cfg: dict, job_id: str) -> Optional[list]:
@@ -1721,8 +1731,15 @@ def _resolve_job_runtime(job: dict, job_id: str, jc: _CronJobConfig) -> tuple[di
         }
         if job.get("base_url"):
             runtime_kwargs["explicit_base_url"] = job.get("base_url")
-        return resolve_runtime_provider(**runtime_kwargs), model
+        runtime = resolve_runtime_provider(**runtime_kwargs)
+        worker_route = getattr(jc, "worker_route", None)
+        if worker_route is not None:
+            from tools.delegate_tool_config import worker_request_overrides
+            runtime["request_overrides"] = worker_request_overrides(runtime.get("request_overrides"), worker_route)
+        return runtime, model
     except Exception as resolve_exc:
+        if getattr(jc, "worker_route", None) is not None:
+            raise  # A pinned policy route cannot silently switch provider/cost.
         # Walk the fallback chain on AuthError AND transient network/DNS failures (e.g. during
         # OAuth refresh); anything else re-raises.
         is_auth = isinstance(resolve_exc, AuthError)
@@ -2368,7 +2385,10 @@ def _resolve_cron_agent_setup(job: dict, job_id: str, job_name: str, jc) -> _Cro
     # that would ship a stored credential off-host; hand-written jobs bypass create-time checks.
     _guard_job_credential_exfil(job)
 
-    setup.blocked = _preflight_or_block(job, job_id, job_name, _cfg)
+    preflight_job = job
+    if jc.worker_route is not None:
+        preflight_job = {**job, "model": jc.model, "provider": jc.cron_default_provider}
+    setup.blocked = _preflight_or_block(preflight_job, job_id, job_name, _cfg)
     if setup.blocked is not None:
         return setup
 
@@ -2377,7 +2397,15 @@ def _resolve_cron_agent_setup(job: dict, job_id: str, job_name: str, jc) -> _Cro
     setup.reasoning_config = _resolve_job_reasoning_config(
         job, _cfg if isinstance(_cfg, dict) else {}, str(setup.model)
     )
-    setup.fallback_model = get_fallback_chain(_cfg) or None
+    if jc.worker_route is not None:
+        from hermes_constants import parse_reasoning_effort
+        from tools.delegate_tool_config import validate_worker_effort
+        effort = jc.worker_route["reasoning_effort"]
+        validate_worker_effort(setup.runtime.get("provider"), setup.model, effort,
+                               api_mode=setup.runtime.get("api_mode"), base_url=setup.runtime.get("base_url"))
+        setup.reasoning_config = parse_reasoning_effort(effort)
+        setup.runtime["_worker_route"] = jc.worker_route["_worker_route"]
+    setup.fallback_model = None if jc.worker_route is not None else (get_fallback_chain(_cfg) or None)
     setup.credential_pool = _load_credential_pool(setup.runtime, job_id)
     # MCP servers must be registered before AIAgent is constructed.
     _init_cron_mcp_tools(job_id)
@@ -2393,7 +2421,7 @@ def _resolve_cron_agent_setup(job: dict, job_id: str, job_name: str, jc) -> _Cro
 def _construct_cron_agent(AIAgent, job: dict, _cfg: dict, setup: _CronAgentSetup, *, workdir, session_id, session_db):
     runtime = setup.runtime
     pr = _cfg.get("provider_routing") or {}
-    return AIAgent(
+    agent = AIAgent(
         model=setup.model,
         api_key=runtime.get("api_key"),
         base_url=runtime.get("base_url"),
@@ -2425,6 +2453,9 @@ def _construct_cron_agent(AIAgent, job: dict, _cfg: dict, setup: _CronAgentSetup
         session_id=session_id,
         session_db=session_db,
     )
+
+    agent._worker_route = runtime.get("_worker_route")
+    return agent
 
 
 class _FireAudit:

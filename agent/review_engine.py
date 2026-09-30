@@ -150,6 +150,12 @@ def _load_review_credentials_cfg() -> Optional[Dict[str, Any]]:
     cfg = {k: str(review.get(k) or "").strip() for k in ("provider", "model", "base_url", "api_key", "api_mode")}
     if cfg["provider"].lower() == "auto":
         cfg["provider"] = ""
+    cfg.update({k: review[k] for k in ("reasoning_effort", "speed", "task_kind", "request_overrides", "fallback_providers")
+                if k in review})
+    from tools.delegate_tool_config import resolve_worker_route
+    policy = resolve_worker_route({**cfg, "task_kind": cfg.get("task_kind") or "independent_review"})
+    if policy is not None:
+        return policy
     if not (cfg["provider"] or cfg["model"] or cfg["base_url"]):
         return None
     return cfg

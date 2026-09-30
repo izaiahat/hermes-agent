@@ -3687,8 +3687,10 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
         routes through main-model fallback + cooldown instead of wiping the compacted turns."""
         # The pinned included-quota route must not enter the generic auxiliary
         # fallback chain (or retry on the Claude main model) when the pool is empty.
-        from agent.auxiliary_client import _get_auxiliary_task_config, _select_pool_entry
-        compression_route = _get_auxiliary_task_config("compression")
+        from agent.auxiliary_client import _auxiliary_worker_route, _get_auxiliary_task_config, _select_pool_entry
+        compression_route = _auxiliary_worker_route("compression", main_runtime={
+            "provider": self.provider, "model": self.model, "api_mode": self.api_mode,
+        }) or _get_auxiliary_task_config("compression")
         if compression_route.get("provider") == "openai-codex":
             model = str(compression_route.get("model") or "").strip()
             _pool_present, eligible = _select_pool_entry("openai-codex", model=model)
