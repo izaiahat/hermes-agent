@@ -115,7 +115,7 @@ def _cmd_add(args) -> None:
 
 
 def _cmd_add_logins(args) -> None:
-    """Preview exact origin bindings, then collect one hidden password for new logins."""
+    """Preview exact origin bindings, then reuse a saved login or collect one hidden password."""
     from agent.vault_store import VaultError, get_vault_store, normalize_origin
 
     c = _console()
@@ -144,6 +144,13 @@ def _cmd_add_logins(args) -> None:
         raise VaultError("manifest has no logins")
 
     store = get_vault_store()
+    reuse_from = getattr(args, "reuse_from", None)
+    if reuse_from:
+        source = store.get_meta(reuse_from)
+        if source is None or source.kind != "login":
+            raise VaultError("--reuse-from requires an existing local login handle")
+        if source.identifier_type != "email" or source.identifier != identifier:
+            raise VaultError("--reuse-from login identifier must match --identifier")
     existing = {}
     for item in store.list_items():
         if item.kind == "login":
@@ -158,6 +165,11 @@ def _cmd_add_logins(args) -> None:
             pending.append((origin, label))
     c.print(f"{len(logins)} distinct origins; {len(pending)} to add; {len(logins) - len(pending)} skipped.")
     if args.dry_run or not pending:
+        return
+    if reuse_from:
+        for origin, label in pending:
+            meta = store.bind_login(reuse_from, origin, label, identifier=identifier)
+            c.print(f"Bound {meta.origin}  handle={meta.id}")
         return
     if not sys.stdin.isatty():
         raise VaultError("interactive terminal with hidden input required; nothing saved")
@@ -276,6 +288,8 @@ def register_cli(subparser) -> None:
     p_bulk = subs.add_parser("add-logins", help="Preview and add origin-bound logins with one hidden password")
     p_bulk.add_argument("--manifest", required=True, help="JSON file with non-secret logins: origin and label only")
     p_bulk.add_argument("--identifier", required=True, help="Email identifier stored as visible metadata")
+    p_bulk.add_argument("--reuse-from", metavar="HANDLE",
+                        help="Reuse a saved local login password for explicitly authorized origins, without prompting; never copies MFA")
     p_bulk.add_argument("--dry-run", action="store_true", help="Preview exact deduped origins without a password or writes")
     p_bulk.set_defaults(_vault_handler=_cmd_add_logins)
 
