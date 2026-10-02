@@ -1,10 +1,12 @@
 name: F11 exact-head acceptance
 
-# Narrow source acceptance for PR #3; does not enable the broad CI workflow.
+# Narrow F11 source acceptance; does not enable the broad CI workflow.
 # Push supplies the real branch head, not GitHub's synthetic PR merge commit.
 on:
   push:
-    branches: [fix/f11-exact-claim-disposition-20261002]
+    branches:
+      - fix/f11-exact-claim-disposition-20261002
+      - fix/f11-registry-writer-exclusion-20261002
 
 permissions:
   contents: read

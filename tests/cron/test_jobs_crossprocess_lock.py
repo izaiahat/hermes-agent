@@ -13,6 +13,7 @@ lock. This test proves the lock actually excludes a *separate process*, which an
 in-process ``threading.Lock`` cannot do.
 """
 
+import json
 import os
 import subprocess
 import sys
@@ -125,3 +126,86 @@ def test_jobs_lock_excludes_another_process(tmp_path, monkeypatch):
     # Once the child has released, the lock is freely acquirable again.
     with jobs._jobs_lock():
         pass
+
+
+@pytest.mark.linux_only
+def test_timed_out_writer_cannot_save_under_held_registry_lock(tmp_path, monkeypatch):
+    """F11: the real 30s fallback must never authorize a registry mutation."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    row = {"id": "fixture-only", "name": "before", "enabled": False,
+           "state": "paused", "prompt": "No effect fixture",
+           "schedule": {"kind": "interval", "minutes": 60}, "next_run_at": None}
+    jobs.save_jobs([row], replace=True)
+    registry = jobs._current_cron_store().jobs_file
+    before = registry.read_bytes()
+    child_code = """
+import json, time
+from cron import jobs
+start = time.monotonic()
+with jobs._jobs_lock():
+    cross_process = jobs._jobs_lock_state.cross_process
+    rows = json.loads(jobs._current_cron_store().jobs_file.read_text())["jobs"]
+    rows[0]["name"] = "ordinary-writer-landed"
+    error = None
+    try:
+        jobs.save_jobs(rows, replace=True)
+    except RuntimeError as exc:
+        error = str(exc)
+print(json.dumps({"cross_process": cross_process, "error": error,
+                  "elapsed": time.monotonic() - start}))
+"""
+    with jobs._jobs_lock(require_cross_process=True):
+        lock_path, lock_fd = jobs._jobs_lock_state.custody
+        held = os.fstat(lock_fd.fileno())
+        child = subprocess.run(
+            [sys.executable, "-c", child_code], cwd=_REPO_ROOT,
+            env=dict(os.environ, PYTHONPATH=_REPO_ROOT),
+            capture_output=True, text=True, timeout=60, check=True,
+        )
+        observation = json.loads(child.stdout)
+        current = lock_path.stat()
+        assert jobs._jobs_lock_state.cross_process
+        assert (held.st_dev, held.st_ino) == (current.st_dev, current.st_ino)
+        assert observation["cross_process"] is False
+        assert observation["elapsed"] >= jobs._JOBS_LOCK_TIMEOUT_SECONDS
+        assert registry.read_bytes() == before, observation
+        assert "cross-process lock required" in observation["error"]
+
+    # Once custody is available, the same public saver works inside an ordinary
+    # nested critical section. A refused attempt must not poison later writes.
+    with jobs._jobs_lock():
+        row["name"] = "legitimate-nested-write"
+        jobs.save_jobs([row], replace=True)
+    assert json.loads(registry.read_bytes())["jobs"] == [row]
+
+
+@pytest.mark.linux_only
+@pytest.mark.parametrize("failure", ["no_backend", "timeout", "denied"])
+def test_degraded_registry_savers_preserve_bytes(tmp_path, monkeypatch, failure):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    rows = [{"id": "fixture-only", "name": "before"}]
+    jobs.save_jobs(rows, replace=True)
+    registry = jobs._current_cron_store().jobs_file
+    before = registry.read_bytes()
+    if failure == "no_backend":
+        monkeypatch.setattr(jobs, "fcntl", None)
+        monkeypatch.setattr(jobs, "msvcrt", None)
+    else:
+        def unavailable(*args):
+            if failure == "denied":
+                raise PermissionError("fixture lock inaccessible")
+            return False
+        monkeypatch.setattr(jobs, "_acquire_flock", unavailable)
+
+    rows[0]["name"] = "must-not-land"
+    with pytest.raises(RuntimeError, match="cross-process lock required"):
+        jobs.save_jobs(rows, replace=True)
+    assert registry.read_bytes() == before
+    with jobs._jobs_lock():
+        assert jobs._jobs_lock_state.cross_process is False
+        assert jobs.load_jobs() == [{"id": "fixture-only", "name": "before"}]
+        for saver in (jobs.save_jobs, jobs._save_jobs_unlocked):
+            with pytest.raises(RuntimeError, match="cross-process lock required"):
+                saver(rows, replace=True)
+            assert registry.read_bytes() == before
+    assert not list(registry.parent.glob(".jobs_*.tmp"))

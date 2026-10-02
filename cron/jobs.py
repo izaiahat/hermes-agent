@@ -16,7 +16,7 @@ import re
 import uuid
 
 # Cross-process advisory locking for jobs.json: fcntl (Unix) or msvcrt (Windows). If both are
-# absent, _jobs_lock() degrades to in-process locking rather than failing.
+# absent, _jobs_lock() permits in-process reads, but registry saves fail closed.
 try:
     import fcntl
 except ImportError:  # pragma: no cover - non-Unix
@@ -306,8 +306,8 @@ def _jobs_lock(*, require_cross_process: bool = False):
     threads) plus a cross-process flock on ``<cron dir>/.jobs.lock`` (gateway vs. CLI writes —
     otherwise a `cron pause` could be clobbered and keep firing). Nested calls in one thread
     reuse the held lock. Without a flock backend, or on flock timeout (logged loudly), it
-    degrades to in-process-only locking: a briefly torn cross-process write beats a dead
-    scheduler. ``require_cross_process`` is for explicit safety-critical maintenance: never
+    permits in-process-only reads; the saver refuses writes without the cross-process lock.
+    ``require_cross_process`` is for explicit safety-critical maintenance: never
     degrade and never accept a nested section whose outer lock was degraded."""
     depth = getattr(_jobs_lock_state, "depth", 0)
     if depth:
@@ -342,14 +342,14 @@ def _jobs_lock(*, require_cross_process: bool = False):
                     logger.error(
                         "Timed out after %.0fs waiting for the cron "
                         "jobs lock (%s) — another process is holding "
-                        "it. Proceeding with in-process locking only "
-                        "so the scheduler stays alive (#60703).",
+                        "it. Reads may proceed with in-process locking "
+                        "only; registry writes will be refused (#60703).",
                         _JOBS_LOCK_TIMEOUT_SECONDS, _jobs_lock_file())
                     with contextlib.suppress(OSError):
                         lock_fd.close()
                     lock_fd = None
             except (OSError, IOError) as e:
-                # Ordinary scheduler writes retain their historical degraded behavior.
+                # Read-only sections may degrade; the registry saver fails closed.
                 logger.warning("jobs.json cross-process lock unavailable (%s)", e)
             try:
                 if require_cross_process and not _jobs_lock_state.cross_process:
@@ -1510,9 +1510,12 @@ def _save_jobs_unlocked(
     jobs: List[Dict[str, Any]], *, removed_ids: Optional[Collection[str]] = None,
     replace: bool = False,
 ):
-    """Save all jobs; caller must hold _jobs_lock(). ``removed_ids`` = intentional deletes;
-    ``replace=True`` skips the shrink-merge guard (wholesale rewrite for tests/disaster
+    """Save all jobs; caller must hold a nondegraded _jobs_lock(). ``removed_ids`` = intentional
+    deletes; ``replace=True`` skips the shrink-merge guard (wholesale rewrite for tests/disaster
     recovery)."""
+    # A nested save must not turn a timed-out outer section into an unlocked write.
+    if not getattr(_jobs_lock_state, "cross_process", False):
+        raise RuntimeError("Cron jobs cross-process lock required")
     jobs_file = _current_cron_store().jobs_file
     ensure_dirs()
     # Owner snapshot BEFORE replace so a root writer can hand the file back to the gateway user.

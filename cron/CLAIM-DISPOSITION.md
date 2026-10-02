@@ -77,15 +77,27 @@ These checks are drift detection, **not arbitrary-writer exclusion**. The operat
 caller/reviewer must establish and retain its maintained namespace/source-writer
 exclusion for the whole call, including commit and acknowledgement: exclude cleanup,
 restore, installer and direct writers that could rename controls, lockfiles or their
-ancestors, as well as ordinary writers that allow degraded locking. Native flock
+ancestors, as well as old resident writers that still allow degraded saves. Native flock
 excludes participating lock users only; it cannot stop same-UID/root renames or close
 a check-to-syscall race. If that external exclusion is unavailable or unproven, do
 not apply. This source patch neither creates a new maintenance gate nor proves that
 runtime prerequisite on the receiving host.
 
 Lock order: native per-job fire fence → strict native jobs registry lock → ledger
-`BEGIN IMMEDIATE` → actual work locks. A narrow optional strict mode was added to
-`_jobs_lock`; ordinary scheduler callers retain their existing fallback behavior.
+`BEGIN IMMEDIATE` → actual work locks. Ordinary `_jobs_lock` sections retain their
+bounded read fallback, but the native registry saver requires an acquired cross-process
+lock before staging or replacing bytes, including inside nested degraded sections.
+Timeout or unavailable locking raises instead of reporting a successful write. Uncontended
+and nested writes under an acquired lock retain the normal save/merge behavior.
+
+This excludes cooperating writers running the repaired saver on the same lock inode.
+It does not upgrade already-loaded code or exclude arbitrary namespace writers. Before
+live use, the authorized owner must drain/retire relevant old registry writers and their
+launch paths, adopt reviewed bytes, and establish fresh resident import provenance while
+retaining the namespace/source and payload-worker exclusion above through acknowledgement.
+Replacing files on disk, global dispatch pause, or a short operation is not that boundary.
+Independent receiving acceptance and rollout remain separate from this source correction.
+
 No ledger schema/data update or prune occurs during disposition, and no scheduler execution
 is started. The native `create_execution` admission path takes the same SQLite writer
 boundary before checking for an unacknowledged intent; direct `claim_job_for_fire`
