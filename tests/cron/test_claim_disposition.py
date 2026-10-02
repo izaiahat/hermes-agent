@@ -409,6 +409,149 @@ def test_prefire_attempt_queued_at_intent_is_refused_after_uncertain_save(interr
 
 
 @pytest.mark.linux_only
+@pytest.mark.parametrize("control", ["jobs.json", "executions.db", "cron", "claim-dispositions"])
+def test_control_alias_cannot_admit_another_profile(interrupted, tmp_path, control):
+    from cron import claim_disposition as d
+    request, before, _ = interrupted
+    home = Path(request["home"])
+    path = home / "cron" if control == "cron" else home / "cron" / control
+    if control == "claim-dispositions":
+        path.mkdir()
+    other = tmp_path / "other-profile"
+    other.mkdir()
+    target = other / path.name
+    path.rename(target)
+    path.symlink_to(target, target_is_directory=target.is_dir())
+    registry = target / "jobs.json" if control == "cron" else home / "cron" / "jobs.json"
+    preimage = registry.read_bytes()
+    with pytest.raises(ValueError, match="control"):
+        d.dispose_claim(request, apply=True)
+    assert path.is_symlink()
+    assert registry.read_bytes() == preimage
+    assert d._jobs() == before
+    assert not list(home.glob("cron/claim-dispositions/*.jsonl"))
+
+
+@pytest.mark.linux_only
+@pytest.mark.parametrize("which", ["registry", "fire"])
+@pytest.mark.parametrize("boundary", ["intent", "hash", "save"])
+def test_native_lock_replacement_revokes_disposition(interrupted, monkeypatch, which, boundary):
+    import fcntl
+    import uuid
+    from cron import jobs, executions, claim_disposition as d
+
+    request, before, _ = interrupted
+    home = Path(request["home"])
+    key = f"{home / 'cron'}::{request['job']['id']}"
+    path = (jobs._jobs_lock_file() if which == "registry" else
+            home / "cron" / f".fire-{uuid.uuid5(uuid.NAMESPACE_URL, key).hex}.lock")
+    append, digest, save = d._append, d.hashlib.file_digest, jobs.save_jobs
+    held, hashes, saves = [], [], []
+
+    def replace():
+        path.rename(path.with_suffix(".retired"))
+        path.touch()
+        fd = os.open(path, os.O_RDONLY)
+        held.append(fd)
+        # A different owner really owns the replacement throughout disposition.
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+    def append_then_replace(*args, **kwargs):
+        append(*args, **kwargs)
+        if kwargs.get("first") and boundary == "intent":
+            replace()
+
+    def hash_then_replace(*args, **kwargs):
+        result = digest(*args, **kwargs)
+        hashes.append(1)
+        if len(hashes) == 2 and boundary == "hash":
+            replace()
+        return result
+
+    def save_then_replace(rows):
+        saves.append(1)
+        save(rows)
+        if boundary == "save":
+            replace()
+
+    monkeypatch.setattr(d, "_append", append_then_replace)
+    monkeypatch.setattr(d.hashlib, "file_digest", hash_then_replace)
+    monkeypatch.setattr(jobs, "save_jobs", save_then_replace)
+    try:
+        with pytest.raises((ValueError, RuntimeError), match="lock.*(moved|replaced)"):
+            d.dispose_claim(request, apply=True)
+        assert held
+        assert len(saves) == (1 if boundary == "save" else 0)
+        if boundary != "save":
+            assert d._jobs() == before
+        journal = d._journal_path(home, request["execution"]["id"])
+        assert [json.loads(line)["event"] for line in journal.read_text().splitlines()] == ["intent"]
+        with pytest.raises(ValueError, match="pending disposition"):
+            d.require_no_pending_disposition(request["job"]["id"], home / "cron")
+        assert executions.get_execution(request["execution"]["id"]) == request["execution"]
+    finally:
+        for fd in held:
+            os.close(fd)
+    with pytest.raises(ValueError, match="intent exists"):
+        d.dispose_claim(request, apply=True)
+
+
+@pytest.mark.linux_only
+@pytest.mark.parametrize("delay", ["none", "clock", "real"])
+def test_post_intent_hash_cannot_outlive_evidence(interrupted, monkeypatch, delay):
+    import time
+    from cron import jobs, executions, claim_disposition as d
+    request, before, _ = interrupted
+    now = datetime.now(timezone.utc)
+    expiry = now + timedelta(seconds=1 if delay == "real" else 10)
+    request["created_at"], request["expires_at"] = now.isoformat(), expiry.isoformat()
+    clock = [now]
+
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return clock[0]
+
+    if delay == "clock":
+        monkeypatch.setattr(d, "datetime", Clock)
+    digest, save = d.hashlib.file_digest, jobs.save_jobs
+    hashes, saves = [], []
+
+    def delayed_hash(*args, **kwargs):
+        result = digest(*args, **kwargs)
+        hashes.append(1)
+        if len(hashes) == 2:
+            if delay == "clock":
+                clock[0] = expiry + timedelta(seconds=1)
+            elif delay == "real":
+                time.sleep(max(0, (expiry - datetime.now(timezone.utc)).total_seconds()) + 0.05)
+        return result
+
+    def tracked_save(rows):
+        saves.append(1)
+        save(rows)
+
+    monkeypatch.setattr(d.hashlib, "file_digest", delayed_hash)
+    monkeypatch.setattr(jobs, "save_jobs", tracked_save)
+    if delay == "none":
+        assert d.dispose_claim(request, apply=True)["status"] == "disposed"
+        assert len(saves) == 1
+    else:
+        with pytest.raises(ValueError, match="evidence window"):
+            d.dispose_claim(request, apply=True)
+        assert len(hashes) == 2
+        assert not saves
+        assert d._jobs() == before
+        journal = d._journal_path(Path(request["home"]), request["execution"]["id"])
+        assert [json.loads(line)["event"] for line in journal.read_text().splitlines()] == ["intent"]
+        with pytest.raises(ValueError, match="pending disposition"):
+            executions.create_execution(request["job"]["id"], source="direct")
+        with pytest.raises(ValueError, match="intent exists"):
+            d.dispose_claim(request, apply=True)
+    assert executions.get_execution(request["execution"]["id"]) == request["execution"]
+
+
+@pytest.mark.linux_only
 @pytest.mark.parametrize("failure", [False, None, "denied", "nested"])
 def test_strict_registry_lock_cannot_degrade(interrupted, monkeypatch, failure):
     from cron import jobs

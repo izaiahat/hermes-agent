@@ -270,6 +270,36 @@ def _release_flock(lock_fd) -> None:
         lock_fd.close()
 
 
+def _require_lock_custody(custody, expected_path):
+    """Check the actual held descriptor, not a second pathname-only snapshot.
+
+    Native lockfiles are permanent: cooperating writers must never unlink/replace
+    them. Maintenance must separately exclude nonparticipating namespace writers.
+    This detects replacement; advisory flock cannot prevent a hostile rename.
+    """
+    import stat
+
+    if custody is None or custody[0] != expected_path:
+        raise RuntimeError("Native lock custody unavailable or profile moved")
+    path, fd = custody
+    held, current = os.fstat(fd.fileno()), path.lstat()
+    if (not stat.S_ISREG(current.st_mode) or current.st_nlink != 1 or
+            path.resolve() != path or
+            (held.st_dev, held.st_ino) != (current.st_dev, current.st_ino)):
+        raise RuntimeError("Native lock identity moved/replaced: " + str(path))
+
+
+def _require_disposition_lock_custody(job_id):
+    """Validate both native locks while the disposition's outer sections hold them."""
+    if not getattr(_jobs_lock_state, "cross_process", False):
+        raise RuntimeError("Cron jobs cross-process lock required")
+    _require_lock_custody(getattr(_jobs_lock_state, "custody", None), _jobs_lock_file())
+    cron_dir = _current_cron_store().cron_dir
+    key = f"{cron_dir.resolve()}::{job_id}"
+    path = cron_dir / f".fire-{uuid.uuid5(uuid.NAMESPACE_URL, key).hex}.lock"
+    _require_lock_custody(getattr(_fire_fence_lock_state, "custody", {}).get(key), path)
+
+
 @contextlib.contextmanager
 def _jobs_lock(*, require_cross_process: bool = False):
     """Serialize a load_jobs→modify→save_jobs critical section: in-process RLock (parallel tick
@@ -302,10 +332,12 @@ def _jobs_lock(*, require_cross_process: bool = False):
         try:
             try:
                 ensure_dirs()
-                lock_fd = open(_jobs_lock_file(), "a+", encoding="utf-8")
+                lock_path = _jobs_lock_file()
+                lock_fd = open(lock_path, "a+", encoding="utf-8")
                 lock_fd.seek(0)
                 result = _acquire_flock(lock_fd, _JOBS_LOCK_TIMEOUT_SECONDS)
                 _jobs_lock_state.cross_process = result is True
+                _jobs_lock_state.custody = (lock_path, lock_fd) if result is True else None
                 if result is False:
                     logger.error(
                         "Timed out after %.0fs waiting for the cron "
@@ -329,6 +361,7 @@ def _jobs_lock(*, require_cross_process: bool = False):
         finally:
             _jobs_lock_state.depth = 0
             _jobs_lock_state.cross_process = False
+            _jobs_lock_state.custody = None
             _jobs_lock_state.load_stamp = None
 
 
@@ -373,9 +406,12 @@ def _fire_job_lock(job_id: str):
             logger.error("Cron fire fence unavailable for %s: %s", job_id, exc)
 
         held_locks[lock_key] = acquired
+        custody = _fire_fence_lock_state.__dict__.setdefault("custody", {})
+        custody[lock_key] = (lock_path, lock_fd) if acquired else None
         try:
             yield acquired
         finally:
+            custody.pop(lock_key, None)
             held_locks.pop(lock_key, None)
             if lock_fd is not None:
                 if acquired:

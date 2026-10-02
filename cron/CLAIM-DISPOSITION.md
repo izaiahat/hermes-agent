@@ -59,6 +59,30 @@ Preview performs the same lock/admission checks but never saves job/ledger recor
 or creates a disposition journal. The native lock helpers may create their normal
 lockfiles. Linux/POSIX flock and directory fsync are required; no degraded mode.
 
+Control files must be regular, single-link files in the selected canonical profile;
+control directories (including `cron` and `claim-dispositions`) must not be symlinks.
+This includes the ledger and any existing SQLite sidecars, not only `jobs.json`.
+Directory/ledger/journal identities are retained across the operation; only the
+native jobs save is allowed to replace `jobs.json`. A cross-profile alias is refused,
+not followed or repaired.
+
+Native `.jobs.lock` and per-job `.fire-*.lock` files are permanent namespace objects:
+the maintained lock helpers open and retain them, never unlink/replace them on
+release. Custody checks compare the **held descriptors** with the current paths
+before intent, after intent/hash preparation, and at save/readback/acknowledgement
+boundaries. Replacement before save leaves the claim intact; detected replacement
+after save leaves the durable intent unacknowledged and admission held.
+
+These checks are drift detection, **not arbitrary-writer exclusion**. The operational
+caller/reviewer must establish and retain its maintained namespace/source-writer
+exclusion for the whole call, including commit and acknowledgement: exclude cleanup,
+restore, installer and direct writers that could rename controls, lockfiles or their
+ancestors, as well as ordinary writers that allow degraded locking. Native flock
+excludes participating lock users only; it cannot stop same-UID/root renames or close
+a check-to-syscall race. If that external exclusion is unavailable or unproven, do
+not apply. This source patch neither creates a new maintenance gate nor proves that
+runtime prerequisite on the receiving host.
+
 Lock order: native per-job fire fence → strict native jobs registry lock → ledger
 `BEGIN IMMEDIATE` → actual work locks. A narrow optional strict mode was added to
 `_jobs_lock`; ordinary scheduler callers retain their existing fallback behavior.
@@ -72,8 +96,11 @@ verified journals: the original UNKNOWN survives the ordinary history limit.
 
 Apply fsyncs a create-exclusive per-execution intent under
 `<home>/cron/claim-dispositions/`, rechecks preimages/evidence/lock identities,
-sends a **copy** to the native saver and compares the entire job list plus ledger
-rows afterward. The sole job-record delta is `fire_claim: null`; UNKNOWN, pause,
+rechecks the clock after all hashing and lock/path preparation immediately before
+native save, sends a **copy** to the native saver and compares the entire job list
+plus ledger rows afterward. Expiry crossed during hashing leaves the old claim
+intact and the durable intent latched; it is not permission to refresh and retry.
+The sole job-record delta is `fire_claim: null`; UNKNOWN, pause,
 schedules, cursors, counters, pins and unrelated records stay unchanged.
 
 ## Uncertain outcomes and repeats

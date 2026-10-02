@@ -65,6 +65,48 @@ def _journal_path(home, execution_id):
     return home / "cron" / "claim-dispositions" / (execution_id + ".jsonl")
 
 
+def _control_namespace(home, journal):
+    """Admit only unaliased native control paths; return stable namespace identities.
+
+    The authorized maintenance caller must exclude namespace writers throughout this
+    operation. Path checks detect drift; they are not a defense against a hostile UID
+    able to rename an ancestor between two syscalls.
+    """
+    cron = home / "cron"
+    directories = [*reversed(home.parents), home, cron, journal.parent]
+    files = [cron / "jobs.json", cron / "executions.db", journal]
+    optional = {journal.parent, journal}
+    # SQLite may open these itself. Reject aliases before it can touch another DB.
+    for suffix in ("-wal", "-shm", "-journal"):
+        path = cron / ("executions.db" + suffix)
+        files.append(path)
+        optional.add(path)
+    identities = {}
+    for path in directories + files:
+        try:
+            info = path.lstat()
+        except FileNotFoundError:
+            _require(path in optional, "missing control path")
+            continue
+        directory = path in directories
+        _require(stat.S_ISDIR(info.st_mode) if directory else
+                 stat.S_ISREG(info.st_mode) and info.st_nlink == 1,
+                 "unsafe control path: " + str(path))
+        # Sidecars legitimately come and go under SQLite's writer transaction.
+        if directory or path in files[:3]:
+            identities[path] = (info.st_dev, info.st_ino)
+    return identities
+
+
+def _check_control_namespace(home, journal, before, *, saved=False):
+    current = _control_namespace(home, journal)
+    for path, identity in before.items():
+        if saved and path == home / "cron" / "jobs.json":
+            continue  # The native atomic save intentionally replaces this inode.
+        _require(current.get(path) == identity, "control namespace moved")
+    return current
+
+
 def disposition_paths(cron_dir):
     """Retain every exact intent, including damaged or unacknowledged ones."""
     directory = Path(cron_dir) / "claim-dispositions"
@@ -124,6 +166,14 @@ def _jobs():
     return rows
 
 
+def _validate_window(request):
+    created, expires = _clock(request["created_at"]), _clock(request["expires_at"])
+    finished = _clock(request["execution"]["finished_at"])
+    now = datetime.now(timezone.utc)
+    _require(finished <= created <= now < expires and 0 < (expires - created).total_seconds() <= 900,
+             "stale or invalid evidence window")
+
+
 def _validate(request, rows, ledger_rows):
     job, execution = request["job"], request["execution"]
     _require(next((row for row in rows if row["id"] == job["id"]), None) == job,
@@ -162,10 +212,7 @@ def _validate(request, rows, ledger_rows):
         raise ValueError("owner PID still exists")
     from cron.scheduler import is_job_running
     _require(not is_job_running(job["id"], home=Path(request["home"])), "in-process work active")
-    now = datetime.now(timezone.utc)
-    created, expires = _clock(request["created_at"]), _clock(request["expires_at"])
-    _require(finished <= created <= now < expires and 0 < (expires - created).total_seconds() <= 900,
-             "stale or invalid evidence window")
+    _validate_window(request)
     _require(isinstance(request.get("reason"), str) and request["reason"].strip(), "reason required")
     _require(isinstance(request.get("evidence"), list) and request["evidence"], "evidence required")
     for item in request["evidence"]:
@@ -237,31 +284,48 @@ def dispose_claim(request: dict, *, apply: bool = False) -> dict:
     home = _home()
     _require(request["home"] == str(home), "request/profile mismatch")
     journal = _journal_path(home, request["execution"]["id"])
+    namespace = _control_namespace(home, journal)
     with jobs._fire_job_lock(request["job"]["id"]) as held:
         _require(held, "fire fence unavailable")
         _require(not journal.exists(), "disposition intent exists; inspect, never retry")
         with jobs._jobs_lock(require_cross_process=True), _ledger(home) as conn, _work_locks(request):
             _require(not journal.exists(), "disposition intent exists; inspect, never retry")
+            namespace = _check_control_namespace(home, journal, namespace)
+            jobs._require_disposition_lock_custody(request["job"]["id"])
             rows = _jobs()
             ledger_rows = _rows(conn, request["job"]["id"])
             _validate(request, rows, ledger_rows)
             after = copy.deepcopy(rows)
             next(row for row in after if row["id"] == request["job"]["id"])["fire_claim"] = None
+            _check_control_namespace(home, journal, namespace)
+            jobs._require_disposition_lock_custody(request["job"]["id"])
+            _validate_window(request)
             if not apply:
                 return {"status": "ready", "request_sha256": _digest(request)}
             intent = {"event": "intent", "at": datetime.now(timezone.utc).isoformat(),
                       "request": request, "before_jobs_sha256": _digest(rows),
                       "after_jobs_sha256": _digest(after)}
             _append(journal, intent, first=True)
+            namespace = _check_control_namespace(home, journal, namespace)
+            jobs._require_disposition_lock_custody(request["job"]["id"])
             # Recheck after durable intent: a slow fsync is not permission to use stale evidence.
             _require(_jobs() == rows, "jobs preimage moved")
             _validate(request, rows, _rows(conn, request["job"]["id"]))
+            _check_control_namespace(home, journal, namespace)
+            jobs._require_disposition_lock_custody(request["job"]["id"])
             # No rollback/retry after this point, including if save returns an exception.
             # Native saver can mutate its input; retain an independent comparison oracle.
-            jobs.save_jobs(copy.deepcopy(after))
+            save_rows = copy.deepcopy(after)
+            # Last admission check: hashing, fsync and lock/path checks may block.
+            _validate_window(request)
+            jobs.save_jobs(save_rows)
+            _check_control_namespace(home, journal, namespace, saved=True)
+            jobs._require_disposition_lock_custody(request["job"]["id"])
             _fsync_dir(home / "cron")
             _require(_jobs() == after and _rows(conn, request["job"]["id"]) == ledger_rows,
                      "save/readback uncertain; inspect disposition, never retry")
+            _check_control_namespace(home, journal, namespace, saved=True)
+            jobs._require_disposition_lock_custody(request["job"]["id"])
             _append(journal, {"event": "verified", "at": datetime.now(timezone.utc).isoformat(),
                               "request_sha256": _digest(request)})
             return {"status": "disposed", "journal": str(journal), "execution_status": "unknown"}
@@ -275,6 +339,7 @@ def inspect_disposition(execution_id: str) -> dict:
     """
     home = _home()
     journal = _journal_path(home, execution_id)
+    namespace = _control_namespace(home, journal)
     events = [_json(line) for line in journal.read_text().splitlines()]
     _require(bool(events), "incomplete disposition intent")
     intent = events[0]
@@ -292,6 +357,8 @@ def inspect_disposition(execution_id: str) -> dict:
                 status = "applied"
             elif exact and current == intent["before_jobs_sha256"]:
                 status = "not_applied"
+            _check_control_namespace(home, journal, namespace)
+            jobs._require_disposition_lock_custody(request["job"]["id"])
             return {"status": status, "journal": str(journal), "retry_allowed": False}
 
 
