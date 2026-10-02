@@ -31,7 +31,7 @@ from tools.delegate_tool_child_run import (  # noqa: F401
 from tools.delegate_tool_config import (  # noqa: F401
     _DEFAULT_MAX_CONCURRENT_CHILDREN, _get_child_timeout, _get_max_async_children, _get_max_concurrent_children,
     _get_max_spawn_depth, _get_oneshot_max_children, _get_orchestrator_enabled, _get_subagent_approval_callback, _get_worktree_isolation,
-    _inherit_parent_capabilities, _load_config, _merge_request_overrides, _resolve_child_credential_pool,
+    WORKER_TASK_EFFORTS, _inherit_parent_capabilities, _load_config, _merge_request_overrides, _resolve_child_credential_pool,
     _resolve_child_runtime, _resolve_delegation_credentials,
     _get_max_background_batches, _get_max_total_descendants, _try_reserve_descendants,
     active_descendant_count, _reset_descendant_budget_for_tests, _DescendantLease,
@@ -200,9 +200,8 @@ def _build_child_agent(
     subagent_id = f"sa-{task_index}-{_uuid.uuid4().hex[:8]}"
     parent_subagent_id = getattr(parent_agent, "_subagent_id", None)
 
-    # General delegation behavior (reasoning, compression, capabilities) stays
-    # global. Only fallback policy follows the owner of a per-call route such
-    # as auxiliary.review.
+    # Per-call routing owns effort and fallback; delegation behavior limits
+    # and compression remain global.
     delegation_cfg = _load_config()
     child_toolsets, child_disabled_toolsets = _resolve_child_toolsets(parent_agent, toolsets, effective_role)
     child_prompt = _build_child_system_prompt(
@@ -263,6 +262,12 @@ def _build_child_agent(
                     from hermes_state_registry import release_or_close
                     release_or_close(child_session_db)
             raise
+    child._worker_route = (routing_cfg or {}).get("_worker_route")
+    child._delegate_resolved_route = {
+        "model": rt["model"], "provider": rt["provider"],
+        "reasoning_effort": (rt.get("reasoning_config") or {}).get("effort"),
+        "speed": (routing_cfg or {}).get("speed"), "task_kind": (routing_cfg or {}).get("task_kind"),
+    }
     child._print_fn = getattr(parent_agent, "_print_fn", None)
     _apply_child_cache_ttl(child)
     if child_session_db is not None:
@@ -442,7 +447,7 @@ def _build_children(
         except BaseException:
             _release_partial_children(parent_agent, children)
             raise
-        setattr(child, "_delegate_requested_route", {k: t.get(k) for k in ("model", "provider", "reasoning_effort")})
+        setattr(child, "_delegate_requested_route", {k: t.get(k) for k in ("model", "provider", "reasoning_effort", "speed", "task_kind")})
         if _task_schema is not None:
             with _quiet("Could not attach output schema to child %d", i):
                 child._delegate_output_schema = _task_schema
@@ -467,25 +472,61 @@ def _build_children(
 
 
 def _resolve_task_routes(task_list, routing_cfg, parent_agent, default_creds):
-    """Resolve every requested route through the official provider resolver before building children."""
+    """Task fields > route config > opt-in policy > legacy coordinator inheritance."""
     from hermes_constants import parse_reasoning_effort
+    from tools.delegate_tool_config import resolve_worker_route, validate_worker_effort, worker_request_overrides
     for task in task_list:
-        for key in ("model", "provider", "reasoning_effort"):
+        for key in ("model", "provider", "reasoning_effort", "speed", "task_kind"):
             if key in task and (not isinstance(task[key], str) or not task[key].strip()):
                 raise ValueError(f"task {key} must be a nonempty string")
         if "reasoning_effort" in task and parse_reasoning_effort(task["reasoning_effort"]) is None:
             raise ValueError(f"Unknown task reasoning_effort {task['reasoning_effort']!r}")
-        if not any(key in task for key in ("model", "provider")):
-            task["_resolved_route"] = default_creds
-            continue
         cfg = dict(routing_cfg)
         if task.get("provider") and task["provider"] != cfg.get("provider"):
             # Endpoint, static key, transport and mode belong to the OLD route.
             for key in ("model", "base_url", "api_key", "api_mode", "command", "args", "request_overrides"):
                 cfg.pop(key, None)
-        cfg.update({k: task[k] for k in ("model", "provider") if k in task})
+        cfg.update({k: task[k] for k in ("model", "provider", "reasoning_effort", "speed", "task_kind") if k in task})
+        policy = resolve_worker_route(cfg, inherited_provider=getattr(parent_agent, "provider", None))
+        if policy is not None:
+            cfg = policy
+        if policy is None and not any(key in task for key in ("model", "provider")):
+            route = dict(default_creds)
+        else:
+            route = _resolve_delegation_credentials(cfg, parent_agent)
+        effective_provider = route.get("provider") or getattr(parent_agent, "provider", None)
+        effective_model = route.get("model") or parent_agent.model
+        overrides = worker_request_overrides(route.get("request_overrides"), cfg) if policy is not None else dict(route.get("request_overrides") or {})
+        speed = cfg.get("speed")
+        if speed:
+            from agent.reasoning_effort import is_astra_model
+            speed = str(speed).strip().lower()
+            if speed not in ("fast", "standard") or effective_provider != "openai-codex":
+                raise ValueError("Native worker speed requires openai-codex and fast or standard")
+            if speed == "fast" and (is_astra_model(effective_model) or str(effective_model).rsplit("/", 1)[-1] != "gpt-6.1-sol"):
+                raise ValueError(f"Worker Fast priority is not supported for {effective_model}")
+            overrides["service_tier"] = "priority" if speed == "fast" else "default"
+            overrides.pop("speed", None)
+            extra = overrides.get("extra_body")
+            if isinstance(extra, dict):
+                overrides["extra_body"] = {k: v for k, v in extra.items() if k not in ("service_tier", "speed")}
+        if policy is not None or "reasoning_effort" in task:
+            effort = cfg.get("reasoning_effort")
+            parsed = parse_reasoning_effort(effort)
+            effort = parsed.get("effort") if parsed.get("enabled", True) else "none"
+            validate_worker_effort(effective_provider, overrides.get("model") or effective_model, effort,
+                                   api_mode=route.get("api_mode") or getattr(parent_agent, "api_mode", None),
+                                   base_url=route.get("base_url") or getattr(parent_agent, "base_url", None))
+            # A task effort outranks a configured raw wire effort too.
+            for key in ("reasoning", "reasoning_effort"):
+                overrides.pop(key, None)
+            if isinstance(overrides.get("extra_body"), dict):
+                overrides["extra_body"] = {k: v for k, v in overrides["extra_body"].items()
+                                           if k not in ("reasoning", "reasoning_effort")}
+        route["request_overrides"] = overrides
         task["_routing_cfg"] = cfg
-        task["_resolved_route"] = _resolve_delegation_credentials(cfg, parent_agent)
+        task["_resolved_route"] = route
+
 
 
 def _oneshot_spawn_budget(parent_agent: Any, requested: int) -> Optional[str]:
@@ -563,7 +604,9 @@ def delegate_task(
     # the route and its fallback policy together through child construction.
     routing_cfg = credentials_cfg if credentials_cfg is not None else cfg
     try:
-        creds = _resolve_delegation_credentials(routing_cfg, parent_agent)
+        from tools.delegate_tool_config import resolve_worker_route
+        default_route = resolve_worker_route(routing_cfg, inherited_provider=getattr(parent_agent, "provider", None))
+        creds = _resolve_delegation_credentials(default_route or routing_cfg, parent_agent)
     except ValueError as exc:
         # Explicit-pin preflight failures (e.g. pinned delegation.command missing from PATH) refuse the
         # spawn loudly (#80450).
@@ -720,7 +763,7 @@ _DESCRIPTION_HEAD = (
     "the parent applies the transition.\n"
 )
 _DESCRIPTION_TAIL = (
-    "- Task model/provider/reasoning_effort overrides inherit delegation.provider/model or parent; auth uses Hermes."
+    "- Task model/provider/reasoning_effort/speed/task_kind > route config > enabled worker policy > parent. Auth uses Hermes; Astra needs an explicit model override."
 )
 
 def _build_tasks_param_description() -> str:
@@ -800,7 +843,9 @@ DELEGATE_TASK_SCHEMA = {
                         ),
                         "model": _p("string", "Optional child model override supported by the selected provider."),
                         "provider": _p("string", "Optional child provider resolved via Hermes configured provider/auth."),
-                        "reasoning_effort": _p("string", "Optional child effort: none, minimal, low, medium, high, xhigh, max or ultra; may clamp to route support."),
+                        "reasoning_effort": _p("string", "Explicit effort override; unsupported levels are refused. Ultra requires official Codex Ultra and is refused here."),
+                        "speed": _p("string", "Override worker speed; Fast sends Codex Sol6.1 priority, Standard explicitly sends default.", enum=["fast", "standard"]),
+                        "task_kind": _p("string", "Task difficulty for opt-in automatic effort; explicit reasoning_effort wins.", enum=list(WORKER_TASK_EFFORTS)),
                         "output_schema": _p(
                             "object",
                             "Optional JSON Schema this child's final answer must validate against (told to the "

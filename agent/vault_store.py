@@ -369,6 +369,49 @@ class VaultStore:
             self._write_all(items)
         return self._meta(record)
 
+    def bind_login(
+        self, source_id: str, origin: str, label: str, *, identifier: str,
+    ) -> VaultItemMeta:
+        """Bind an explicitly authorized login password to one new exact HTTPS origin.
+
+        Server-side only: return metadata, never the password. The caller must verify
+        that the destination and credential reuse are authorized; this is not wildcard
+        autofill. Existing destination logins are never replaced. A site's TOTP seed is
+        deliberately NOT reusable at a different site.
+        """
+        parts = urlsplit(origin)
+        if (parts.scheme != "https" or not parts.hostname or "*" in parts.netloc
+                or parts.username or parts.password or parts.path or parts.query
+                or parts.fragment or normalize_origin(origin) != origin):
+            raise VaultError("destination must be an exact canonical HTTPS origin")
+        label = (label or "").strip()
+        if not label or not identifier:
+            raise VaultError("label and identifier are required")
+        with self._locked():
+            items = self._read_all()
+            source = next((r for r in items if r.get("id") == source_id), None)
+            if source is None or source.get("kind") != "login":
+                raise VaultError("reuse requires an existing local login handle")
+            if source.get("identifier") != identifier:
+                raise VaultError("source login identifier does not match the requested identity")
+            password = (source.get("secret") or {}).get("password")
+            if not isinstance(password, str) or not password:
+                raise VaultError("source login has no usable password")
+            existing = [r for r in items if r.get("kind") == "login" and r.get("origin") == origin]
+            if any(r.get("identifier") != identifier for r in existing):
+                raise VaultError("destination has an existing different login; nothing replaced")
+            if existing:
+                return self._meta(existing[0])
+            record = {
+                "id": f"vault_{uuid.uuid4().hex[:12]}", "kind": "login", "label": label,
+                "origin": origin, "created_at": datetime.now(timezone.utc).isoformat(),
+                "identifier_type": source.get("identifier_type"), "identifier": identifier,
+                "secret": {"password": password},
+            }
+            items.append(record)
+            self._write_all(items)
+            return self._meta(record)
+
     def list_items(self) -> List[VaultItemMeta]:
         """Metadata-only listing. Secret payloads are never included."""
         with self._locked():

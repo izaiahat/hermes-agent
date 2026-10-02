@@ -1207,6 +1207,31 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
     # ``invalid_grant``. These helpers adopt the fresher pair from wherever the
     # provider's token authority lives, clearing stale exhaustion state.
 
+    def _sync_codex_pool_from_store(self) -> None:
+        """Adopt Codex pool edits and rotations made by another process.
+
+        Called with the auth-store lock held; an old gateway must not refresh a
+        removed row or replay a consumed manual:device_code refresh token.
+        """
+        if self.provider != "openai-codex":
+            return
+        rows = read_credential_pool(self.provider)
+        if not isinstance(rows, list):
+            return
+        current = {entry.id: entry for entry in self._entries}
+        refreshed = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            stored = PooledCredential.from_dict(self.provider, row)
+            old = current.get(stored.id)
+            if old is not None and old.access_token == stored.access_token and old.refresh_token == stored.refresh_token and old.last_status == stored.last_status:
+                stored = replace(stored, request_count=old.request_count)
+            refreshed.append(stored)
+        self._entries = sorted(refreshed, key=lambda entry: entry.priority)
+        if self._current_id not in {entry.id for entry in refreshed}:
+            self._current_id = None
+
     def _sync_anthropic_entry_from_credentials_file(self, entry: PooledCredential) -> PooledCredential:
         """Sync a claude_code entry from ~/.claude/.credentials.json if tokens differ."""
         if self.provider != "anthropic" or entry.source != "claude_code":
@@ -1488,6 +1513,14 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
         # the winner's rotated token and skips the POST.
         with _auth_store_lock(timeout_seconds=self._single_use_refresh_lock_timeout()):
             if self.provider == "openai-codex":
+                with self._lock:
+                    self._sync_codex_pool_from_store()
+                    synced_row = self._find(lambda e: e.id == entry.id)
+                if synced_row is None:
+                    return None
+                if synced_row.access_token != entry.access_token and not self._entry_needs_refresh(synced_row):
+                    return synced_row
+                entry = synced_row
                 synced = self._sync_entry_from_auth_store(entry)
                 if synced is not entry and not force and not self._entry_needs_refresh(synced):
                     return synced
@@ -1939,6 +1972,9 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
     # ---- selection ---------------------------------------------------------
 
     def select(self, *, model: Optional[str] = None) -> Optional[PooledCredential]:
+        if self.provider == "openai-codex":
+            with self._lock, _auth_store_lock():
+                self._sync_codex_pool_from_store()
         entry, pending_refresh = self._select_under_lock(model=model)
         if pending_refresh:
             self._refresh_pending_entries(pending_refresh)
@@ -2239,6 +2275,9 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
         model: Optional[str] = None,
     ) -> Optional[PooledCredential]:
         with self._lock:
+            if self.provider == "openai-codex":
+                with _auth_store_lock():
+                    self._sync_codex_pool_from_store()
             identity_supplied = bool(credential_id or api_key_hint)
             entry = self._identify_failed_entry(credential_id, api_key_hint)
             if entry is None and identity_supplied:

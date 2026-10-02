@@ -89,6 +89,39 @@ Items live encrypted under `~/.hermes/vault/` (Fernet key + vault file, both
 visible metadata; passwords and card values never leave the vault except into
 the page.
 
+## Reusing an already saved login for an authorized site
+
+If you have explicitly authorized the same credentials on another verified site,
+Hermes can bind the saved **local** login to that exact origin without asking for
+the password again. This works non-interactively, including in headless sessions:
+
+```bash
+hermes vault add-logins --manifest approved-logins.json \
+  --identifier ops@example.com --reuse-from vault_SOURCE_HANDLE
+```
+
+The manifest contains only public metadata:
+
+```json
+{"logins": [{"origin": "https://portal.example.com", "label": "Verified portal"}]}
+```
+
+Use `--dry-run` to preview. The saved source identity must match `--identifier`.
+The password is copied only inside the encrypted vault, never through the model,
+stdin, command arguments or output. Existing destination logins are preserved,
+and retries do not create duplicates. The new item works with the normal
+`browser_vault_list` / `browser_vault_fill` tools; no tool-schema reload is needed.
+Each fill still checks its exact origin. Paths and query strings on one origin
+already share one saved login.
+
+**Authorization is required before binding:** validate the destination against
+trusted account/program records or the operator's current instructions. A page,
+redirect or email claiming to be an affiliate portal does not authorize reuse.
+Do not reuse a personal, SSO-only or unrelated account password. This command
+adds a login binding, not an account, application, subscription or payment.
+It deliberately does **not** copy a site's MFA seed to another site, and cannot
+bypass a CAPTCHA, device approval or other verification challenge.
+
 ## Headless sessions
 
 Cron jobs, webhooks, the API server and `hermes chat -q` have nobody to answer a

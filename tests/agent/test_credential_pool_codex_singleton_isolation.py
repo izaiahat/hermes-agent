@@ -104,3 +104,30 @@ def test_same_account_alias_adopts_only_a_newer_singleton(home, monkeypatch):
                  {"access_token": alias_at, "refresh_token": "rt-alias", "last_refresh": _iso(now - 60)})
     synced = load_pool("openai-codex")._sync_entry_from_auth_store(alias)
     assert (synced.access_token, synced.refresh_token) == (fresh_at, "rt-fresh")
+
+
+def test_long_lived_codex_pool_adopts_peer_rotation_and_removal(home, monkeypatch):
+    now = time.time()
+    old = _jwt("acct-B", "user-B", now + 60)
+    fresh = _jwt("acct-B", "user-B", now + 8 * 3600)
+    _write_store(home, {"access_token": _jwt("acct-A", "user-A", now + 8 * 3600),
+                        "refresh_token": "rt-A"}, _iso(now - 3600),
+                 {"access_token": old, "refresh_token": "rt-consumed"})
+    pool = load_pool("openai-codex")
+    stale = next(e for e in pool.entries() if e.id == "manual")
+    store = json.loads((home / "auth.json").read_text())
+    rows = store["credential_pool"]["openai-codex"]
+    rows[1].update(access_token=fresh, refresh_token="rt-rotated", last_status="ok")
+    (home / "auth.json").write_text(json.dumps(store))
+    posted = []
+    _stub_refresh(monkeypatch, fresh, "rt-unwanted", posted)
+
+    adopted = pool._refresh_entry(stale, force=True)
+    assert adopted is not None and adopted.access_token == fresh
+    assert posted == []
+    selected = pool.select()
+    assert selected is not None and selected.id == "seeded"
+    rows.pop(1)
+    (home / "auth.json").write_text(json.dumps(store))
+    assert pool._refresh_entry(stale, force=True) is None
+    assert [e.id for e in pool.entries()] == ["seeded"]

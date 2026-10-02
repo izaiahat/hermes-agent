@@ -1,7 +1,7 @@
 """Auto-generate short session titles from the user's opening message.
 
 Two stages, both off the critical path: an **instant** deterministic title (written before the model
-is called, cannot fail), then an **upgrade** from one small-model call (cheap tier, thinking off,
+is called, cannot fail), then an **upgrade** from one auxiliary call (thinking off by default,
 JSON-constrained). Storage enforces provenance ``derived < llm < user``: stage 2 only replaces stage 1
 and neither replaces a name the user typed."""
 
@@ -442,6 +442,8 @@ def generate_title(
         # and reject explicit temperature values, causing the daemon title
         # thread to fail with "Unsupported value: 'temperature'".
         # See: #72351, #51083, #51157
+        from agent.auxiliary_client import _auxiliary_worker_route
+        worker_route = _auxiliary_worker_route("title_generation", main_runtime=main_runtime)
         response = call_llm(
             task="title_generation",
             messages=[{"role": "system", "content": prompt}, {"role": "user", "content": user_snippet}],
@@ -458,7 +460,9 @@ def generate_title(
             # bills thought tokens against max_tokens=64 — the JSON payload
             # never lands, and the prose fallback stores the opening fence
             # ("```json") as the session title (#91927).
-            reasoning_config={"enabled": False},
+            # Sol6.1 cannot disable reasoning; the opt-in worker policy selects
+            # supported effort instead of silently translating this legacy default.
+            reasoning_config=None if worker_route is not None else {"enabled": False},
         )
         message = response.choices[0].message
         title = _clean_title(_extract_title_text(message.content or "") or _title_from_reasoning(message))
