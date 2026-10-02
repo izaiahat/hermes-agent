@@ -271,15 +271,18 @@ def _release_flock(lock_fd) -> None:
 
 
 @contextlib.contextmanager
-def _jobs_lock():
+def _jobs_lock(*, require_cross_process: bool = False):
     """Serialize a load_jobs→modify→save_jobs critical section: in-process RLock (parallel tick
     threads) plus a cross-process flock on ``<cron dir>/.jobs.lock`` (gateway vs. CLI writes —
     otherwise a `cron pause` could be clobbered and keep firing). Nested calls in one thread
     reuse the held lock. Without a flock backend, or on flock timeout (logged loudly), it
     degrades to in-process-only locking: a briefly torn cross-process write beats a dead
-    scheduler."""
+    scheduler. ``require_cross_process`` is for explicit safety-critical maintenance: never
+    degrade and never accept a nested section whose outer lock was degraded."""
     depth = getattr(_jobs_lock_state, "depth", 0)
     if depth:
+        if require_cross_process and not getattr(_jobs_lock_state, "cross_process", False):
+            raise RuntimeError("Cron jobs cross-process lock required")
         _jobs_lock_state.depth = depth + 1
         try:
             yield
@@ -289,6 +292,7 @@ def _jobs_lock():
 
     with _jobs_file_lock:
         _jobs_lock_state.depth = 1
+        _jobs_lock_state.cross_process = False
         # jobs.json stamp as of this section's load_jobs(): lets _save_jobs_unlocked skip the
         # shrink-merge parse when the file provably hasn't changed. Reset on entry/exit so stale
         # stamps from unlocked loads or prior sections can never suppress a needed merge.
@@ -300,7 +304,9 @@ def _jobs_lock():
                 ensure_dirs()
                 lock_fd = open(_jobs_lock_file(), "a+", encoding="utf-8")
                 lock_fd.seek(0)
-                if _acquire_flock(lock_fd, _JOBS_LOCK_TIMEOUT_SECONDS) is False:
+                result = _acquire_flock(lock_fd, _JOBS_LOCK_TIMEOUT_SECONDS)
+                _jobs_lock_state.cross_process = result is True
+                if result is False:
                     logger.error(
                         "Timed out after %.0fs waiting for the cron "
                         "jobs lock (%s) — another process is holding "
@@ -311,16 +317,18 @@ def _jobs_lock():
                         lock_fd.close()
                     lock_fd = None
             except (OSError, IOError) as e:
-                # A locking failure must never take down cron writes — in-process lock still held.
-                logger.warning("jobs.json cross-process lock unavailable (%s); "
-                               "proceeding with in-process lock only", e)
+                # Ordinary scheduler writes retain their historical degraded behavior.
+                logger.warning("jobs.json cross-process lock unavailable (%s)", e)
             try:
+                if require_cross_process and not _jobs_lock_state.cross_process:
+                    raise RuntimeError("Cron jobs cross-process lock required")
                 yield
             finally:
                 if lock_fd is not None:
                     _release_flock(lock_fd)
         finally:
             _jobs_lock_state.depth = 0
+            _jobs_lock_state.cross_process = False
             _jobs_lock_state.load_stamp = None
 
 
@@ -2675,6 +2683,9 @@ def claim_job_for_fire(
     clears the claim). Otherwise stamp ``fire_claim`` and, for recurring jobs, advance
     ``next_run_at`` so a stale re-delivery cannot re-fire."""
     def apply(jobs, _i, job):
+        from cron.claim_disposition import require_no_pending_disposition
+
+        require_no_pending_disposition(job_id, _current_cron_store().cron_dir)
         if is_terminal_job(job) and not _is_recoverable_error_job(job):
             return False
         # Both enabled and pause markers must clear — a half-paused record must not claim. ``force``

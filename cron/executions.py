@@ -171,10 +171,16 @@ def _claim_age_seconds(claimed_at: str) -> float:
 
 
 def _prune_unlocked(conn: sqlite3.Connection) -> None:
+    from cron.claim_disposition import disposition_paths
+
+    cron_dir = Path(conn.execute("PRAGMA database_list").fetchone()[2]).parent
+    protected = {path.stem for path in disposition_paths(cron_dir)}
+    conn.create_function("cron_disposition_held", 1, protected.__contains__)
     conn.execute(
         """DELETE FROM executions WHERE id IN (
              SELECT id FROM executions
              WHERE status IN ('completed','failed','unknown')
+               AND NOT cron_disposition_held(id)
              ORDER BY finished_at DESC, claimed_at DESC, id DESC LIMIT -1 OFFSET ?
            )""",
         (max(0, int(MAX_TERMINAL_EXECUTIONS)),),
@@ -186,11 +192,17 @@ def create_execution(
 ) -> Dict[str, Any]:
     """Persist a claimed attempt before executor/provider dispatch."""
     from cron.occurrences import scheduled_instant as canonical_instant
+    from cron.claim_disposition import require_no_pending_disposition
 
     now = _hermes_now().isoformat()
     execution_id = uuid.uuid4().hex
     pid = os.getpid()
     with _transaction() as conn:
+        # Providers create attempts BEFORE taking the fire fence. Serialize admission with
+        # exact disposition's ledger boundary, then check the durable intent before INSERT.
+        conn.execute("BEGIN IMMEDIATE")
+        cron_dir = Path(conn.execute("PRAGMA database_list").fetchone()[2]).parent
+        require_no_pending_disposition(str(job_id), cron_dir)
         conn.execute(
             """INSERT INTO executions
                (id, job_id, source, process_id, pid, process_started_at,
