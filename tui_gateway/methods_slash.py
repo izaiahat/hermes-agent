@@ -324,7 +324,9 @@ _FAST_TIERS = {"fast": "priority", "on": "priority", "normal": None, "off": None
 def _mirror_fast(sid, session, agent, arg) -> None:
     if agent:
         if arg.lower() in _FAST_TIERS:
-            agent.service_tier = _FAST_TIERS[arg.lower()]
+            # Share config.set's cleanup: the next request consumes overrides, not the badge.
+            _set_fast(None, {"session_id": sid}, "fast", arg, session)
+            return
         _emit("session.info", sid, _session_info(agent, session))
 
 

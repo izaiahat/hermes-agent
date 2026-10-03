@@ -539,6 +539,150 @@ def _resolve_child_fallback_chain(parent_agent, routing_cfg: Any, pinned: bool) 
 
 
 
+# Explicit task classification avoids guessing difficulty from prose or promoting
+# effort merely because the coordinator is running a larger model.
+WORKER_TASK_EFFORTS = {
+    "mechanical": "low", "simple_check": "low",
+    "implementation": "medium", "research": "medium", "synthesis": "medium", "routine_review": "medium",
+    "complex_integration": "high", "debugging": "high", "independent_review": "high",
+    "difficult": "xhigh", "unresolved": "xhigh", "safety": "max",
+}
+
+
+def validate_worker_effort(provider, model, effort, *, api_mode=None, base_url=None):
+    """Strict worker validation, unlike the legacy interactive transport clamp."""
+    from agent.reasoning_effort import codex_supported_efforts
+    from providers import get_provider_profile
+    if effort == "ultra":
+        raise ValueError("Ultra requires the official Codex Ultra path; native workers cannot alias it to Max")
+    profile = get_provider_profile(provider or "")
+    supported = profile.supported_reasoning_efforts(model) if profile else None
+    if api_mode == "codex_responses":
+        from agent.transports.codex import _codex_efforts_for_route, _profile_declared_efforts
+        supported = _profile_declared_efforts(provider, model, base_url)
+        if supported is None:
+            supported = _codex_efforts_for_route(model, base_url, is_codex_backend=provider == "openai-codex")
+    elif provider == "openai-codex":
+        supported = codex_supported_efforts(model)
+    if supported is not None and effort not in supported:
+        raise ValueError(f"Worker route {provider}/{model} does not support effort {effort!r}; supported: {supported}")
+
+
+def resolve_worker_route(route, *, inherited_provider=None, config=None, task_kind="implementation"):
+    """Opt-in default-profile Codex worker policy; None leaves legacy routing intact.
+
+    Caller overlays task fields on its route config first. Dedicated speed beats
+    legacy request_overrides.service_tier; otherwise model-specific policy wins
+    over that generic wire default. Model/effort wire overrides remain explicit
+    unless the corresponding route/task field is present. No coordinator effort
+    or speed is inherited. Non-Codex routes and named profiles remain unchanged.
+    """
+    from hermes_constants import get_hermes_home, profile_name_for_home, parse_reasoning_effort
+    if config is None:
+        from hermes_cli.config import load_config_readonly
+        config = load_config_readonly()
+    if not is_truthy_value((config.get("worker_routing") or {}).get("enabled"), default=False):
+        return None
+    if profile_name_for_home(get_hermes_home()) != "default":
+        return None
+    provider = str(route.get("provider") or "").strip().lower()
+    if provider in ("", "auto", "main"):
+        main = config.get("model") or {}
+        provider = inherited_provider or (main.get("provider") if isinstance(main, dict) else None)
+    if provider != "openai-codex" or route.get("command"):
+        return None
+    if route.get("base_url"):
+        from urllib.parse import urlsplit
+        endpoint = urlsplit(route["base_url"])
+        if (endpoint.scheme != "https" or endpoint.hostname != "chatgpt.com"
+                or endpoint.path.rstrip("/") not in ("/backend-api/codex", "/backend-api/codex/v1")):
+            return None
+    import copy
+    result = copy.deepcopy(route)
+    overrides = result.get("request_overrides") or {}
+    extra = overrides.get("extra_body") or {}
+    model = result.get("model") or extra.get("model") or overrides.get("model") or "gpt-6.1-sol"
+    if model == "auto":
+        model = "gpt-6.1-sol"
+    kind = result.get("task_kind") or task_kind
+    if kind not in WORKER_TASK_EFFORTS:
+        raise ValueError(f"Unknown worker task_kind {kind!r}; choose from {tuple(WORKER_TASK_EFFORTS)}")
+    wire_reasoning = extra.get("reasoning") or overrides.get("reasoning") or {}
+    effort = result.get("reasoning_effort")
+    if effort is None or effort == "":
+        effort = ("none" if wire_reasoning.get("enabled") is False else
+                  wire_reasoning.get("effort") or extra.get("reasoning_effort") or
+                  overrides.get("reasoning_effort") or WORKER_TASK_EFFORTS[kind])
+    parsed = parse_reasoning_effort(effort)
+    if parsed is None:
+        raise ValueError(f"Unknown worker reasoning_effort {effort!r}")
+    effort = parsed.get("effort") if parsed.get("enabled", True) else "none"
+    mode = result.get("api_mode") or "codex_responses"
+    if mode != "codex_responses":
+        raise ValueError("Default-profile Codex worker policy requires the Responses transport")
+    validate_worker_effort(provider, model, effort, api_mode=mode)
+    speed = str(result.get("speed") or ("fast" if str(model).rsplit("/", 1)[-1] == "gpt-6.1-sol" else "standard")).strip().lower()
+    if speed not in ("fast", "standard"):
+        raise ValueError(f"Unknown worker speed {speed!r}; choose fast or standard")
+    # Operator 2026-10-03: Fast (priority tier) is allowed for Astra as well as Sol6.1.
+    if speed == "fast" and str(model).rsplit("/", 1)[-1] not in ("gpt-6.1-sol", "gpt-6-astra-900k"):
+        raise ValueError(f"Worker Fast priority is only supported for the included Codex Sol6.1/Astra routes, not {model}")
+    # Put reasoning through the selected transport rather than letting a stale
+    # wire override bypass its model-specific vocabulary.
+    for container in (overrides, extra):
+        for key in ("model", "reasoning", "reasoning_effort", "service_tier", "speed"):
+            container.pop(key, None)
+    if extra:
+        overrides["extra_body"] = extra
+    else:
+        overrides.pop("extra_body", None)
+    overrides["service_tier"] = "priority" if speed == "fast" else "default"
+    result.update(provider=provider, model=model, reasoning_effort=effort, speed=speed,
+                  task_kind=kind, api_mode=mode, request_overrides=overrides,
+                  _worker_route={"provider": provider, "model": model, "reasoning_effort": effort,
+                                 "speed": speed, "task_kind": kind})
+    return result
+
+
+def worker_request_overrides(runtime_overrides, route):
+    """Semantic worker choices outrank raw provider defaults, including SDK extra_body."""
+    import copy
+    runtime = copy.deepcopy(runtime_overrides or {})
+    for container in (runtime, runtime.get("extra_body") or {}):
+        for key in ("model", "reasoning", "reasoning_effort", "service_tier", "speed"):
+            container.pop(key, None)
+    return _merge_request_overrides(runtime, route["request_overrides"])
+
+
+def record_worker_wire(agent, kwargs):
+    """Metadata of actual attempted Responses sends, never prompts or credentials."""
+    route = getattr(agent, "_worker_route", None)
+    if not route and not hasattr(agent, "_delegate_requested_route"):
+        return
+    # SDK extra_body fields override top-level body fields at serialization.
+    controls = {**kwargs, **(kwargs.get("extra_body") or {})}
+    reasoning = controls.get("reasoning") or {}
+    effort = reasoning.get("effort")
+    provider = getattr(agent, "provider", None)
+    validate_worker_effort(provider, controls.get("model"), effort, api_mode="codex_responses",
+                           base_url=getattr(agent, "base_url", None))
+    if route:
+        tier = "priority" if route["speed"] == "fast" else "default"
+        from agent.codex_responses_adapter import _wire_model_identity
+        if (provider != route["provider"] or effort != route["reasoning_effort"] or controls.get("service_tier") != tier
+                or controls.get("model") != _wire_model_identity(str(route["model"]).rsplit("/", 1)[-1])):
+            raise ValueError("Worker wire model/effort/speed differs from the resolved route; refusing silent rewrite")
+    receipt = {"provider": provider, "api_mode": "codex_responses", "model": controls.get("model"),
+               "reasoning_effort": effort, "reasoning": dict(reasoning), "service_tier": controls.get("service_tier"),
+               "stream": kwargs.get("stream", False)}
+    attempts = getattr(agent, "_worker_wire_requests", None)
+    if attempts is None:
+        agent._worker_wire_requests = attempts = []
+    agent._worker_wire_attempt_count = getattr(agent, "_worker_wire_attempt_count", 0) + 1
+    if not attempts or attempts[-1] != receipt:
+        attempts.append(receipt)
+
+
 def _clamp_child_reasoning(reasoning: Any, provider: Any, model: Any) -> Any:
     """Clamp a child's reasoning effort onto what its own route actually supports.
 
@@ -660,7 +804,7 @@ def _resolve_child_runtime(
     # YAML ``false`` must disable thinking, not coerce to "" and inherit.
     child_reasoning = getattr(parent_agent, "reasoning_config", None)
     try:
-        delegation_effort = delegation_cfg.get("reasoning_effort")
+        delegation_effort = (delegation_cfg if routing_cfg is None else routing_cfg).get("reasoning_effort")
         if delegation_effort or delegation_effort is False:
             from hermes_constants import parse_reasoning_effort
             parsed = parse_reasoning_effort(delegation_effort)
@@ -680,7 +824,17 @@ def _resolve_child_runtime(
     # pinned to a different provider/model may not support the level the parent
     # (or delegation.reasoning_effort) asked for, and an unsupported effort makes
     # the provider reject every one of that child's requests.
-    child_reasoning = _clamp_child_reasoning(child_reasoning, effective_provider, effective_model)
+    owner = delegation_cfg if routing_cfg is None else routing_cfg
+    if isinstance(owner, dict) and owner.get("_worker_route"):
+        from hermes_constants import parse_reasoning_effort
+        child_reasoning = parse_reasoning_effort(owner["reasoning_effort"])
+    effort = ((child_reasoning.get("effort") if child_reasoning.get("enabled", True) else "none")
+              if isinstance(child_reasoning, dict) else None)
+    if effort == "ultra" or task_reasoning_effort is not None or owner.get("_worker_route"):
+        validate_worker_effort(effective_provider, effective_model, effort,
+                               api_mode=effective_api_mode, base_url=effective_base_url)
+    else:
+        child_reasoning = _clamp_child_reasoning(child_reasoning, effective_provider, effective_model)
 
     kwargs: Dict[str, Any] = {
         "base_url": effective_base_url, "api_key": override_api_key or parent_api_key, "model": effective_model,
