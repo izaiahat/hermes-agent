@@ -264,7 +264,11 @@ def _expected_export_group(output_root: Path) -> tuple[int, str]:
 
 
 def _can_assign_gid(expected_gid: int) -> bool:
-    if os.geteuid() == 0:
+    get_euid = getattr(os, "geteuid", None)
+    get_egid = getattr(os, "getegid", None)
+    if get_euid is None or get_egid is None:
+        raise ExporterError("Runtime exports require POSIX group ownership support")
+    if get_euid() == 0:
         return True
     gids = set()
     try:
@@ -272,7 +276,7 @@ def _can_assign_gid(expected_gid: int) -> bool:
     except OSError:
         pass
     try:
-        gids.add(os.getegid())
+        gids.add(get_egid())
     except OSError:
         pass
     return expected_gid in gids

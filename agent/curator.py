@@ -973,6 +973,7 @@ class _ReviewRuntimeBinding(NamedTuple):
     explicit_api_key: Optional[str]
     explicit_base_url: Optional[str]
     request_overrides: Dict[str, Any]
+    worker_route: Optional[dict] = None
 
 
 def _merge_request_overrides(runtime_overrides: Any, slot_extra_body: Any) -> Dict[str, Any]:
@@ -994,6 +995,15 @@ def _resolve_review_runtime(cfg: Dict[str, Any]) -> _ReviewRuntimeBinding:
         return _ReviewRuntimeBinding(provider, model, api_key, base_url, _merge_request_overrides({}, slot.get("extra_body")))
 
     task = _subdict(cfg, "auxiliary", "curator")
+    from tools.delegate_tool_config import resolve_worker_route
+    legacy = _subdict(cfg, "curator", "auxiliary")
+    selected_slot = legacy if (legacy.get("provider") and legacy.get("model")
+                               and not (task.get("provider") not in (None, "", "auto") and task.get("model"))) else task
+    policy = resolve_worker_route({**selected_slot, "request_overrides": {"extra_body": selected_slot.get("extra_body") or {}}},
+                                  config=cfg, task_kind="synthesis")
+    if policy is not None:
+        return _ReviewRuntimeBinding(policy["provider"], policy["model"], policy.get("api_key"), policy.get("base_url"),
+                                     policy["request_overrides"], policy["_worker_route"])
     task_provider = (task.get("provider") or "").strip() or None
     task_model = (task.get("model") or "").strip() or None
     if task_provider and task_provider != "auto" and task_model:
@@ -1011,11 +1021,13 @@ def _resolve_review_provider() -> tuple:
     explicit provider/model hits an auto-resolution path that fails for OAuth-only providers and pooled credentials
     (HTTP 400 "No models provided"). Never raises."""
     rp: Dict[str, Any] = {}
+    cfg: Dict[str, Any] = {}
     overrides, provider, model_name, binding = {}, None, "", None
     try:
         from hermes_cli.config import load_config_readonly
         from hermes_cli.runtime_provider import resolve_runtime_provider
-        binding = _resolve_review_runtime(load_config_readonly())
+        cfg = load_config_readonly()
+        binding = _resolve_review_runtime(cfg)
         model_name = binding.model
         rp = resolve_runtime_provider(
             requested=binding.provider, target_model=binding.model,
@@ -1023,9 +1035,17 @@ def _resolve_review_provider() -> tuple:
         )
         provider = rp.get("provider") or binding.provider
         overrides = _merge_request_overrides(rp.get("request_overrides"), binding.request_overrides.get("extra_body"))
+        if binding.worker_route is not None:
+            from tools.delegate_tool_config import worker_request_overrides
+            overrides = worker_request_overrides(rp.get("request_overrides"), {"request_overrides": binding.request_overrides})
+            rp["_worker_route"] = binding.worker_route
         if isinstance(rp.get("model"), str) and rp["model"].strip():
             model_name = rp["model"].strip()
     except Exception as e:
+        if ((binding is not None and binding.worker_route is not None)
+                or (binding is None and isinstance(e, ValueError) and (cfg.get("worker_routing") or {}).get("enabled"))):
+            rp["_worker_route_error"] = str(e)
+            return rp, model_name, provider, overrides
         logger.warning("curator: auxiliary.curator.provider '%s' (model '%s') could not be resolved: %s — the review "
                        "runs on the main model instead", getattr(binding, "provider", None), model_name, e)
     return rp, model_name, provider, overrides
@@ -1042,6 +1062,9 @@ def _run_llm_review(prompt: str) -> Dict[str, Any]:
         return result_meta
     rp, model_name, provider, request_overrides = _resolve_review_provider()
     result_meta["model"], result_meta["provider"] = model_name, provider or ""
+    if rp.get("_worker_route_error"):
+        result_meta["error"] = result_meta["summary"] = rp["_worker_route_error"]
+        return result_meta
     review_agent = None
     try:
         agent_kwargs: Dict[str, Any] = {}
@@ -1049,7 +1072,10 @@ def _run_llm_review(prompt: str) -> Dict[str, Any]:
         if isinstance(acp_command, str) and acp_command:
             agent_kwargs.update(acp_command=acp_command, acp_args=list(rp.get("args") or []))
         from hermes_cli.config import load_config_readonly
-        from hermes_constants import resolve_reasoning_config
+        from hermes_constants import resolve_reasoning_config, parse_reasoning_effort
+        worker_route = rp.get("_worker_route")
+        reasoning = (parse_reasoning_effort(worker_route["reasoning_effort"]) if worker_route
+                     else resolve_reasoning_config(load_config_readonly(), model_name))
 
         review_agent = AIAgent(
             model=model_name, provider=provider, api_key=rp.get("api_key"), base_url=rp.get("base_url"),
@@ -1057,7 +1083,7 @@ def _run_llm_review(prompt: str) -> Dict[str, Any]:
             request_overrides=request_overrides, **agent_kwargs,
             # Same chokepoint as every other surface: without it ``agent.reasoning_effort`` never reaches
             # the review fork and the transport applies its default effort (a 400 on non-reasoning models).
-            reasoning_config=resolve_reasoning_config(load_config_readonly(), model_name),
+            reasoning_config=reasoning,
             # No ``terminal``: a shell mv/cp/rm under the skills tree writes bytes
             # with NO ledger entry, so rollback would restore a hollow skill. Every
             # mutation goes through ledgered skill_manage; dropping the toolset
@@ -1067,6 +1093,7 @@ def _run_llm_review(prompt: str) -> Dict[str, Any]:
             max_iterations=9999,
             quiet_mode=True, platform="curator", skip_context_files=True, skip_memory=True,
         )
+        review_agent._worker_route = worker_route
         # Disable recursive nudges — the curator must never spawn its own review.
         review_agent._memory_nudge_interval = 0
         review_agent._skill_nudge_interval = 0
@@ -1088,6 +1115,9 @@ def _run_llm_review(prompt: str) -> Dict[str, Any]:
              contextlib.redirect_stdout(devnull), contextlib.redirect_stderr(devnull):
             conv_result = review_agent.run_conversation(user_message=prompt)
         final = str(conv_result.get("final_response") or "").strip() if isinstance(conv_result, dict) else ""
+        if worker_route is not None:
+            result_meta["route"] = {"resolved": worker_route,
+                                   "wire_requests": list(getattr(review_agent, "_worker_wire_requests", []) or [])}
         result_meta["final"] = final
         result_meta["summary"] = (final[:240] + "…") if len(final) > 240 else (final or "no change")
         # Tool calls for the report; arguments truncated to 400 chars so a giant skill_manage create doesn't blow it up.

@@ -47,7 +47,12 @@ def _route_receipt(child: Any) -> dict:
     return {
         "requested": {k: v if isinstance(v, str) else None for k, v in requested.items()}
                      if isinstance(requested, dict) else None,
+        "resolved": getattr(child, "_delegate_resolved_route", None),
+        "wire_requests": list(getattr(child, "_worker_wire_requests", []) or []),
+        "wire_attempt_count": _num(getattr(child, "_worker_wire_attempt_count", 0)),
         "effective": {
+            "speed": {"priority": "fast", "default": "standard"}.get(
+                (getattr(child, "request_overrides", None) or {}).get("service_tier")),
             "model": _str_or_none(getattr(child, "model", None)),
             "provider": _str_or_none(getattr(child, "provider", None)),
             "reasoning_effort": (_str_or_none(reasoning.get("effort")) if reasoning.get("enabled", True)

@@ -81,13 +81,13 @@ def _state(cfg):
     path = Path(cfg['state_path']).expanduser()
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     fd = os.open(str(path) + '.lock', os.O_CREAT | os.O_RDWR, 0o600)
-    with os.fdopen(fd, 'a') as lock:
+    with os.fdopen(fd, 'a', encoding='utf-8') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
-        data = json.loads(path.read_text()) if path.exists() else {'attempts': {}, 'used': []}
+        data = json.loads(path.read_text(encoding='utf-8')) if path.exists() else {'attempts': {}, 'used': []}
         yield data
         outfd, tmp = tempfile.mkstemp(dir=path.parent, prefix='.otp-state-')
         try:
-            with os.fdopen(outfd, 'w') as out:
+            with os.fdopen(outfd, 'w', encoding='utf-8') as out:
                 json.dump(data, out)
                 out.flush()
                 os.fsync(out.fileno())
