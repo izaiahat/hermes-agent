@@ -624,8 +624,9 @@ def resolve_worker_route(route, *, inherited_provider=None, config=None, task_ki
     speed = str(result.get("speed") or ("fast" if str(model).rsplit("/", 1)[-1] == "gpt-6.1-sol" else "standard")).strip().lower()
     if speed not in ("fast", "standard"):
         raise ValueError(f"Unknown worker speed {speed!r}; choose fast or standard")
-    if speed == "fast" and str(model).rsplit("/", 1)[-1] != "gpt-6.1-sol":
-        raise ValueError(f"Worker Fast priority is only supported for the included Codex Sol6.1 route, not {model}")
+    # Operator 2026-10-03: Fast (priority tier) is allowed for Astra as well as Sol6.1.
+    if speed == "fast" and str(model).rsplit("/", 1)[-1] not in ("gpt-6.1-sol", "gpt-6-astra-900k"):
+        raise ValueError(f"Worker Fast priority is only supported for the included Codex Sol6.1/Astra routes, not {model}")
     # Put reasoning through the selected transport rather than letting a stale
     # wire override bypass its model-specific vocabulary.
     for container in (overrides, extra):
