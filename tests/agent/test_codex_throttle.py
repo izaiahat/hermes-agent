@@ -277,23 +277,24 @@ def test_policy_cannot_raise_hard_ceiling_above_five(monkeypatch, tmp_path):
     )
     snapshot = throttle.runtime_config()
     assert snapshot["max_concurrency"] == 5
-    assert snapshot["max_delegates"] == 5
+    # Delegate ceiling matches the 8-slot host admission cap; request concurrency stays 5.
+    assert snapshot["max_delegates"] == 8
     # Oversized batch must not report phantom active leases.
-    leases, active, limit = throttle.try_acquire_codex_delegate_slots(6)
-    assert leases is None and (active, limit) == (0, 5)
+    leases, active, limit = throttle.try_acquire_codex_delegate_slots(9)
+    assert leases is None and (active, limit) == (0, 8)
     isolated_gate = tmp_path / "delegate-slots"
     isolated_gate.mkdir()
     monkeypatch.setattr(throttle, "_gate_dir", lambda: isolated_gate)
-    leases, active, limit = throttle.try_acquire_codex_delegate_slots(5)
-    assert leases is not None and (active, limit) == (0, 5)
+    leases, active, limit = throttle.try_acquire_codex_delegate_slots(8)
+    assert leases is not None and (active, limit) == (0, 8)
     try:
         refused, active, limit = throttle.try_acquire_codex_delegate_slots(1)
-        assert refused is None and (active, limit) == (5, 5)
+        assert refused is None and (active, limit) == (8, 8)
     finally:
         for lease in leases:
             lease.release()
     rolling, active, limit = throttle.try_acquire_codex_delegate_slots(1)
-    assert rolling is not None and (active, limit) == (0, 5)
+    assert rolling is not None and (active, limit) == (0, 8)
     rolling[0].release()
 
 

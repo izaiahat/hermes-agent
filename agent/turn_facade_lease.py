@@ -292,10 +292,10 @@ def admit_durable_turn_lease(
         nonlocal waited
         waited = True
         agent._emit_status(
-            "⏳ Another Hermes process is using this session; "
+            "⏳ Session storage is busy with a turn or database write; "
             "waiting for it to finish before starting your turn..."
             if elapsed < 1.0 else
-            f"⏳ Still waiting for the other Hermes process on this session ({int(elapsed)}s)..."
+            f"⏳ Still waiting for session storage ({int(elapsed)}s)..."
         )
 
     if not db.acquire_session_turn_lease(

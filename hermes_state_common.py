@@ -581,6 +581,8 @@ CREATE INDEX IF NOT EXISTS idx_async_delegations_delivery
 """
 
 # Indexes on later-added columns must run AFTER _reconcile_columns(), or executescript fails on legacy DBs.
+# Peer MIN(id) lookups must use the identity index: SQLite's MIN(rowid) shortcut otherwise
+# scans the session-id index per removed row, making rewrites quadratic in archived history.
 DEFERRED_INDEX_SQL = """
 CREATE INDEX IF NOT EXISTS idx_messages_session_active
     ON messages(session_id, active, timestamp);
@@ -623,7 +625,7 @@ BEGIN
       AND display_identity = new.display_identity
       AND (new.active = 1 OR new.compacted = 1);
     UPDATE messages SET display_order = (
-        SELECT MIN(peer.id) FROM messages AS peer
+        SELECT MIN(peer.id) FROM messages AS peer INDEXED BY idx_messages_display_identity
         WHERE peer.session_id = old.session_id AND (peer.active = 1 OR peer.compacted = 1)
           AND peer.display_identity = old.display_identity
     ) WHERE session_id = old.session_id AND (active = 1 OR compacted = 1)
@@ -653,7 +655,7 @@ CREATE TRIGGER IF NOT EXISTS messages_display_identity_delete
 AFTER DELETE ON messages WHEN old.active = 1 OR old.compacted = 1
 BEGIN
     UPDATE messages SET display_order = (
-        SELECT MIN(peer.id) FROM messages AS peer
+        SELECT MIN(peer.id) FROM messages AS peer INDEXED BY idx_messages_display_identity
         WHERE peer.session_id = old.session_id AND (peer.active = 1 OR peer.compacted = 1)
           AND peer.display_identity = old.display_identity
     ) WHERE session_id = old.session_id AND (active = 1 OR compacted = 1)

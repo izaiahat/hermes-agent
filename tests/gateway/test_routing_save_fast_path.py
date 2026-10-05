@@ -10,6 +10,7 @@ sessions.json mirror lagged behind (or never existed).
 from __future__ import annotations
 
 import json
+import sqlite3
 import threading
 
 import hermes_state
@@ -44,6 +45,42 @@ def _make_store(tmp_path, monkeypatch, **config_kwargs) -> SessionStore:
 def _routing_row(store: SessionStore, session_key: str) -> dict:
     rows = store._db.load_gateway_routing_entries(scope=store._routing_scope())
     return json.loads(rows[session_key])
+
+
+def test_busy_upsert_falls_back_without_retrying_same_locked_database(tmp_path, monkeypatch):
+    """One exhausted write budget is enough; JSON survives and later writes recover."""
+    store = _make_store(tmp_path, monkeypatch)
+    entry = store.get_or_create_session(_source())
+    db = store._db
+    monkeypatch.setattr(db, "_WRITE_PATIENCE_S", 0.01)
+    full_writes = []
+    original = db.replace_gateway_routing_entries
+
+    def record_full_write(*args, **kwargs):
+        full_writes.append(True)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(db, "replace_gateway_routing_entries", record_full_write)
+    blocker = sqlite3.connect(db.db_path, timeout=0)
+    try:
+        blocker.execute("BEGIN IMMEDIATE")
+        candidate = entry.to_dict()
+        candidate["last_prompt_tokens"] = 123
+        store._save_entry(entry.session_key, entry_data=candidate)
+        assert not full_writes
+        mirror = json.loads((store.sessions_dir / "sessions.json").read_text())
+        assert mirror[entry.session_key]["last_prompt_tokens"] == 123
+        assert _routing_row(store, entry.session_key)["last_prompt_tokens"] != 123
+        store.update_session(entry.session_key, last_prompt_tokens=234)
+        assert not full_writes
+        mirror = json.loads((store.sessions_dir / "sessions.json").read_text())
+        assert mirror[entry.session_key]["last_prompt_tokens"] == 234
+        blocker.rollback()
+        store.update_session(entry.session_key, last_prompt_tokens=456)
+        assert _routing_row(store, entry.session_key)["last_prompt_tokens"] == 456
+    finally:
+        blocker.close()
+        db.close()
 
 
 class TestChangedValuesAlwaysPersist:

@@ -16,7 +16,7 @@ import re
 import uuid
 
 # Cross-process advisory locking for jobs.json: fcntl (Unix) or msvcrt (Windows). If both are
-# absent, _jobs_lock() degrades to in-process locking rather than failing.
+# absent, _jobs_lock() permits in-process reads, but registry saves fail closed.
 try:
     import fcntl
 except ImportError:  # pragma: no cover - non-Unix
@@ -270,16 +270,49 @@ def _release_flock(lock_fd) -> None:
         lock_fd.close()
 
 
+def _require_lock_custody(custody, expected_path):
+    """Check the actual held descriptor, not a second pathname-only snapshot.
+
+    Native lockfiles are permanent: cooperating writers must never unlink/replace
+    them. Maintenance must separately exclude nonparticipating namespace writers.
+    This detects replacement; advisory flock cannot prevent a hostile rename.
+    """
+    import stat
+
+    if custody is None or custody[0] != expected_path:
+        raise RuntimeError("Native lock custody unavailable or profile moved")
+    path, fd = custody
+    held, current = os.fstat(fd.fileno()), path.lstat()
+    if (not stat.S_ISREG(current.st_mode) or current.st_nlink != 1 or
+            path.resolve() != path or
+            (held.st_dev, held.st_ino) != (current.st_dev, current.st_ino)):
+        raise RuntimeError("Native lock identity moved/replaced: " + str(path))
+
+
+def _require_disposition_lock_custody(job_id):
+    """Validate both native locks while the disposition's outer sections hold them."""
+    if not getattr(_jobs_lock_state, "cross_process", False):
+        raise RuntimeError("Cron jobs cross-process lock required")
+    _require_lock_custody(getattr(_jobs_lock_state, "custody", None), _jobs_lock_file())
+    cron_dir = _current_cron_store().cron_dir
+    key = f"{cron_dir.resolve()}::{job_id}"
+    path = cron_dir / f".fire-{uuid.uuid5(uuid.NAMESPACE_URL, key).hex}.lock"
+    _require_lock_custody(getattr(_fire_fence_lock_state, "custody", {}).get(key), path)
+
+
 @contextlib.contextmanager
-def _jobs_lock():
+def _jobs_lock(*, require_cross_process: bool = False):
     """Serialize a load_jobs→modify→save_jobs critical section: in-process RLock (parallel tick
     threads) plus a cross-process flock on ``<cron dir>/.jobs.lock`` (gateway vs. CLI writes —
     otherwise a `cron pause` could be clobbered and keep firing). Nested calls in one thread
     reuse the held lock. Without a flock backend, or on flock timeout (logged loudly), it
-    degrades to in-process-only locking: a briefly torn cross-process write beats a dead
-    scheduler."""
+    permits in-process-only reads; the saver refuses writes without the cross-process lock.
+    ``require_cross_process`` is for explicit safety-critical maintenance: never
+    degrade and never accept a nested section whose outer lock was degraded."""
     depth = getattr(_jobs_lock_state, "depth", 0)
     if depth:
+        if require_cross_process and not getattr(_jobs_lock_state, "cross_process", False):
+            raise RuntimeError("Cron jobs cross-process lock required")
         _jobs_lock_state.depth = depth + 1
         try:
             yield
@@ -289,6 +322,7 @@ def _jobs_lock():
 
     with _jobs_file_lock:
         _jobs_lock_state.depth = 1
+        _jobs_lock_state.cross_process = False
         # jobs.json stamp as of this section's load_jobs(): lets _save_jobs_unlocked skip the
         # shrink-merge parse when the file provably hasn't changed. Reset on entry/exit so stale
         # stamps from unlocked loads or prior sections can never suppress a needed merge.
@@ -298,29 +332,36 @@ def _jobs_lock():
         try:
             try:
                 ensure_dirs()
-                lock_fd = open(_jobs_lock_file(), "a+", encoding="utf-8")
+                lock_path = _jobs_lock_file()
+                lock_fd = open(lock_path, "a+", encoding="utf-8")
                 lock_fd.seek(0)
-                if _acquire_flock(lock_fd, _JOBS_LOCK_TIMEOUT_SECONDS) is False:
+                result = _acquire_flock(lock_fd, _JOBS_LOCK_TIMEOUT_SECONDS)
+                _jobs_lock_state.cross_process = result is True
+                _jobs_lock_state.custody = (lock_path, lock_fd) if result is True else None
+                if result is False:
                     logger.error(
                         "Timed out after %.0fs waiting for the cron "
                         "jobs lock (%s) — another process is holding "
-                        "it. Proceeding with in-process locking only "
-                        "so the scheduler stays alive (#60703).",
+                        "it. Reads may proceed with in-process locking "
+                        "only; registry writes will be refused (#60703).",
                         _JOBS_LOCK_TIMEOUT_SECONDS, _jobs_lock_file())
                     with contextlib.suppress(OSError):
                         lock_fd.close()
                     lock_fd = None
             except (OSError, IOError) as e:
-                # A locking failure must never take down cron writes — in-process lock still held.
-                logger.warning("jobs.json cross-process lock unavailable (%s); "
-                               "proceeding with in-process lock only", e)
+                # Read-only sections may degrade; the registry saver fails closed.
+                logger.warning("jobs.json cross-process lock unavailable (%s)", e)
             try:
+                if require_cross_process and not _jobs_lock_state.cross_process:
+                    raise RuntimeError("Cron jobs cross-process lock required")
                 yield
             finally:
                 if lock_fd is not None:
                     _release_flock(lock_fd)
         finally:
             _jobs_lock_state.depth = 0
+            _jobs_lock_state.cross_process = False
+            _jobs_lock_state.custody = None
             _jobs_lock_state.load_stamp = None
 
 
@@ -365,9 +406,12 @@ def _fire_job_lock(job_id: str):
             logger.error("Cron fire fence unavailable for %s: %s", job_id, exc)
 
         held_locks[lock_key] = acquired
+        custody = _fire_fence_lock_state.__dict__.setdefault("custody", {})
+        custody[lock_key] = (lock_path, lock_fd) if acquired else None
         try:
             yield acquired
         finally:
+            custody.pop(lock_key, None)
             held_locks.pop(lock_key, None)
             if lock_fd is not None:
                 if acquired:
@@ -1466,9 +1510,12 @@ def _save_jobs_unlocked(
     jobs: List[Dict[str, Any]], *, removed_ids: Optional[Collection[str]] = None,
     replace: bool = False,
 ):
-    """Save all jobs; caller must hold _jobs_lock(). ``removed_ids`` = intentional deletes;
-    ``replace=True`` skips the shrink-merge guard (wholesale rewrite for tests/disaster
+    """Save all jobs; caller must hold a nondegraded _jobs_lock(). ``removed_ids`` = intentional
+    deletes; ``replace=True`` skips the shrink-merge guard (wholesale rewrite for tests/disaster
     recovery)."""
+    # A nested save must not turn a timed-out outer section into an unlocked write.
+    if not getattr(_jobs_lock_state, "cross_process", False):
+        raise RuntimeError("Cron jobs cross-process lock required")
     jobs_file = _current_cron_store().jobs_file
     ensure_dirs()
     # Owner snapshot BEFORE replace so a root writer can hand the file back to the gateway user.
@@ -2675,6 +2722,9 @@ def claim_job_for_fire(
     clears the claim). Otherwise stamp ``fire_claim`` and, for recurring jobs, advance
     ``next_run_at`` so a stale re-delivery cannot re-fire."""
     def apply(jobs, _i, job):
+        from cron.claim_disposition import require_no_pending_disposition
+
+        require_no_pending_disposition(job_id, _current_cron_store().cron_dir)
         if is_terminal_job(job) and not _is_recoverable_error_job(job):
             return False
         # Both enabled and pause markers must clear — a half-paused record must not claim. ``force``

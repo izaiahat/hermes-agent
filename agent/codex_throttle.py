@@ -175,7 +175,7 @@ _LOADED_THROTTLE_ENV_FILE = _load_throttle_env()
 # an unavailable-gate error, never an implicit bypass.
 _DISABLED = _env_bool("HERMES_CODEX_GATE_DISABLED", False)
 _MAX_CONCURRENCY = min(5, max(1, _env_int("HERMES_CODEX_MAX_CONCURRENCY", 5)))
-_MAX_DELEGATES = min(5, max(1, _env_int("HERMES_CODEX_MAX_DELEGATES", 5)))
+_MAX_DELEGATES = min(8, max(1, _env_int("HERMES_CODEX_MAX_DELEGATES", 5)))
 # AIMD adaptive concurrency: the gate keeps a shared "permit" in [MIN, MAX] that grows
 # additively while healthy and shrinks multiplicatively on a 429/503.  When MAX == MIN
 # (e.g. both 1) the permit is fixed and the gate behaves like the old static semaphore.

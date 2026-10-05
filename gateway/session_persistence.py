@@ -433,7 +433,9 @@ class SessionPersistenceMixin:
         self._reconcile_recovered_routing_locked()
         return self._entries_as_dicts(), self._next_routing_generation_locked()
 
-    def _persist_routing_data(self, data: Dict[str, Any], generation: int) -> None:
+    def _persist_routing_data(
+        self, data: Dict[str, Any], generation: int, *, skip_db: bool = False,
+    ) -> None:
         """Serialize all whole-index writers through one durable write lock."""
         with self._lazy("_save_lock", threading.Lock):
             if generation <= getattr(self, "_persisted_routing_generation", 0):
@@ -446,7 +448,7 @@ class SessionPersistenceMixin:
                     if revision > generation:
                         data[key] = json.loads(entry_json)
             db_saved = False
-            replacer = self._routing_db_method("replace_gateway_routing_entries")
+            replacer = None if skip_db else self._routing_db_method("replace_gateway_routing_entries")
             if replacer is not None:
                 try:
                     replacer({k: json.dumps(v) for k, v in data.items()}, scope=self._routing_scope())
@@ -501,6 +503,7 @@ class SessionPersistenceMixin:
             # The O(n) full snapshot is deferred to the fallback branch.
             entry_json, revision = json.dumps(serialized), self._next_routing_generation_locked()
         saver = self._routing_db_method("save_gateway_routing_entry")
+        db_busy = False
         if saver is not None:
             try:
                 with self._lazy("_save_lock", threading.Lock):
@@ -514,14 +517,24 @@ class SessionPersistenceMixin:
                     fast_persisted[session_key] = (revision, entry_json)
                 return
             except Exception as exc:
+                from hermes_state_errors import classify_persistence_error
+
+                db_busy = classify_persistence_error(exc) == "locked"
                 logger.warning(
                     "gateway.session: single-entry routing save failed for %r (%s); falling back "
-                    "to full index rewrite", session_key, exc)
-        if entry_data is not None:
+                    "to %s", session_key, exc,
+                    "sessions.json while state.db is busy" if db_busy else "full index rewrite")
+        if entry_data is not None or db_busy:
             # Full-snapshot fallback carrying the candidate transition.
             with guard:
-                fallback_data = self._entries_as_dicts()
-            fallback_data[session_key] = dict(entry_data)
-            self._persist_routing_data(fallback_data, revision)
+                if entry_data is None:
+                    fallback_data, revision = self._snapshot_routing_locked()
+                else:
+                    fallback_data = self._entries_as_dicts()
+            if entry_data is not None:
+                fallback_data[session_key] = dict(entry_data)
+            # The upsert already exhausted the write-lock budget. A larger write to the
+            # same locked database cannot rescue it; persist the fallback without waiting twice.
+            self._persist_routing_data(fallback_data, revision, skip_db=db_busy)
         else:
             self._save_entries()
