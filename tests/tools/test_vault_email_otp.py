@@ -115,3 +115,65 @@ def test_tool_routes_email_only_to_secret_fill(cfg):
     assert json.loads(result)['source']=='gmail'
     assert '123456' not in result
     assert secret.call_count==1
+
+
+@pytest.mark.parametrize('takeover', [False, True], ids=['agent-control', 'takeover-during-arm'])
+def test_registered_request_rechecks_lease_after_mailbox_baseline(cfg, monkeypatch, tmp_path, takeover):
+    from pathlib import Path
+    import socket
+    import subprocess
+    from tools import browser_tool, browser_supervisor, browser_vault_tool as tool
+    from tools.bot_desktop import lease, runtime
+    from tools.registry import registry
+
+    monkeypatch.setenv('HERMES_HOME', str(tmp_path / 'hermes'))
+    def denied(*args, **kwargs):
+        raise AssertionError('This regression forbids network and browser subprocesses')
+    monkeypatch.setattr(socket.socket, 'connect', denied)
+    monkeypatch.setattr(subprocess, 'Popen', denied)
+    monkeypatch.setattr(runtime, 'published_env', lambda: {'DISPLAY': ':fixture'})
+    monkeypatch.setattr(browser_tool, '_last_session_key', lambda task: task)
+    monkeypatch.setattr(browser_tool, '_active_sessions', {'request-task': {'features': {'local': True}}})
+    meta = SimpleNamespace(kind='login', origin=cfg['origin'], identifier=cfg['identifier'])
+    monkeypatch.setattr('agent.vault_backends.backend_for_handle', lambda handle: SimpleNamespace(get_meta=lambda h: meta))
+    monkeypatch.setattr(tool, '_current_page_origin', lambda task: cfg['origin'])
+    monkeypatch.setattr(otp, 'configured', lambda *args: dict(cfg))
+    monkeypatch.setattr(otp, '_gmail', lambda config: None)
+    baselines = []
+    def baseline(*args):
+        baselines.append(True)
+        if takeover:
+            lease.acquire('fixture-human')
+        return ['baseline-message']
+    monkeypatch.setattr(otp, '_ids', baseline)
+    actions = []
+    class Supervisor:
+        browser_exec_target_id = 'fixture-target'
+        def evaluate_runtime(self, expression):
+            click = 'button.click()' in expression
+            if click:
+                assert Path(cfg['state_path']).exists()  # Real arm committed before dispatch.
+            actions.append({'click': click, 'human_holds': lease.human_holds()})
+            return {'ok': True, 'result': True}
+    supervisor = Supervisor()
+    monkeypatch.setattr(browser_supervisor.SUPERVISOR_REGISTRY, 'get', lambda task: supervisor)
+    args = {'handle': cfg['handle'], 'action': 'request',
+            'request_selector': '#request', 'identifier_selector': '#identifier'}
+    result = json.loads(registry.dispatch('browser_vault_enter_code', args, task_id='request-task'))
+    assert baselines == [True]
+    state_path = Path(cfg['state_path'])
+    armed = state_path.read_bytes()
+    attempt = json.loads(armed)['attempts'][cfg['origin']]
+    assert attempt['handle'] == cfg['handle'] and attempt['task_id'] == 'request-task'
+    assert attempt['baseline'] == ['baseline-message'] and attempt['target_nonce']
+    assert attempt['consumed'] is False
+    assert actions == ([{'click': False, 'human_holds': False}] if takeover else
+                       [{'click': False, 'human_holds': False}, {'click': True, 'human_holds': False}])
+    if takeover:
+        assert result['code'] == 'human_has_control' and lease.human_holds()
+    else:
+        assert result['success'] is True and result['source'] == 'gmail'
+    # A refused write must not erase/re-arm the pending attempt or allow replay.
+    with pytest.raises(otp.EmailOTPError, match='email_otp_attempt_pending'):
+        otp.arm({**cfg, 'target_nonce': 'replacement-nonce'}, 'request-task')
+    assert state_path.read_bytes() == armed

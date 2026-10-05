@@ -388,6 +388,15 @@ def _request_email_code(handle: str, task_id: str, request_selector: str, identi
         arm(cfg, task_id)
         click = ("if (id.dataset.hermesRequest !== %s || button.dataset.hermesRequest !== %s) return false; "
                  "sessionStorage.setItem('__hermes_vault_attempt', %s); button.click(); return true;") % ((json.dumps(nonce),) * 3)
+        # arm() waits for the mailbox baseline. Re-admit at the click, not just
+        # at handler entry: the outer epoch fence cannot undo a DOM effect.
+        # Leave the armed attempt pending on refusal; never reset it for replay.
+        if _bot_desktop_browser_session(task_id):
+            from tools.bot_desktop import lease as _bd_lease
+            try:
+                _bd_lease.assert_agent_may_act()
+            except _bd_lease.HumanHasControl as exc:
+                return json.dumps({'success': False, 'error_type': 'human_has_control', 'error': str(exc)})
         result = _eval_js(task_id, preflight % (*args, click))
         return json.dumps({'success': bool(result.get('success') and result.get('result') is True),
                            'action': 'request', 'origin': origin, 'source': 'gmail',
