@@ -835,6 +835,71 @@ def test_consume_codex_stream_bounds_output_items_before_callback(event_type):
     assert len(callbacks) == 1
 
 
+def test_consume_codex_stream_bounds_combined_pending_and_done_before_callbacks():
+    from agent.codex_runtime import _consume_codex_event_stream
+
+    pending = dict(type="function_call", id="pending", call_id="same", name="fixture", arguments="{}")
+    done = dict(pending, id="different-done")
+    added_event = dict(type="response.output_item.added", item=pending, output_index=0)
+    done_event = dict(type="response.output_item.done", item=done, output_index=0)
+    commentary_event = SimpleNamespace(
+        type="response.output_item.done",
+        item=SimpleNamespace(type="message", id="commentary", phase="commentary",
+                             content=[SimpleNamespace(type="output_text", text="must not publish")]),
+    )
+    # Index/call_id/field equality do not collapse distinct assembler entries;
+    # a later announcement of an already-done id is retained as a new pending call.
+    for events in ([added_event, done_event], [done_event, added_event],
+                   [added_event, commentary_event],
+                   [dict(type="response.output_item.done", item=pending), added_event]):
+        callbacks, commentary = [], []
+        with pytest.raises(RuntimeError, match="output-item limit exceeded"):
+            _consume_codex_event_stream(
+                [*events, dict(type="response.completed", response=dict(status="completed"))],
+                model="offline-fixture", max_output_items=1,
+                on_event=callbacks.append, on_commentary_message=commentary.append,
+            )
+        assert callbacks == events[:1]
+        assert commentary == []
+
+
+def test_consume_codex_stream_combined_budget_preserves_assembler_transitions():
+    from agent.codex_runtime import _consume_codex_event_stream
+
+    added = dict(type="function_call", id="same", call_id="call", name="fixture", arguments="")
+    # Separate SDK-style/dict objects, not object identity. Done of any type
+    # removes the pending entry by item id; no-id announcements are not retained.
+    for announcement, completed in (
+        (added, SimpleNamespace(**dict(added, arguments="{}"))),
+        (added, dict(type="reasoning", id="same", summary=[])),
+        (dict(type="function_call", name="fixture"), dict(type="function_call", name="fixture")),
+    ):
+        callbacks = []
+        result = _consume_codex_event_stream(
+            [dict(type="response.output_item.added", item=announcement),
+             SimpleNamespace(type="response.output_item.done", item=completed),
+             dict(type="response.completed", response=dict(status="completed"))],
+            model="offline-fixture", max_output_items=1, on_event=callbacks.append,
+        )
+        assert result.output == [completed]
+        assert result.output[0] is completed
+        assert len(callbacks) == 3
+
+    # At the exact combined bound, pending settlement and protocol order survive.
+    completed = dict(type="message", content=[])
+    result = _consume_codex_event_stream(
+        [dict(type="response.output_item.added", item=added, output_index=1),
+         dict(type="response.function_call_arguments.delta", item_id="same", delta='{"x":1}'),
+         dict(type="response.output_item.done", item=completed, output_index=0),
+         dict(type="response.completed", response=dict(status="completed"))],
+        model="offline-fixture", max_output_items=2,
+    )
+    assert len(result.output) == 2
+    assert result.output[0] is completed
+    assert result.output[1].id == "same"
+    assert result.output[1].arguments == '{"x":1}'
+
+
 @pytest.mark.parametrize("event_type", ["response.output_item.added", "response.output_item.done"])
 def test_consume_codex_stream_bounds_output_item_bytes_before_callback(event_type):
     from agent.codex_runtime import _consume_codex_event_stream

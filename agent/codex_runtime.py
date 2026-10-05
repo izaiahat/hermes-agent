@@ -1048,6 +1048,17 @@ def _consume_codex_event_stream(
                 item_counts[event_type] += 1
                 if item_counts[event_type] > max_output_items:
                     raise RuntimeError("Codex Responses stream output-item limit exceeded")
+                # Project the assembler's combined population before any callback.
+                # Done appends one item but removes a pending call by id; added
+                # retains only id-bearing function calls (index/call_id are not keys).
+                output_count = len(assembler.output_items) + len(assembler.pending_function_calls)
+                item_id = str(_event_field(item, "id", ""))
+                if event_type == "response.output_item.done":
+                    output_count += 1 - int(item_id in assembler.pending_function_calls)
+                elif item_id and "function_call" in str(_event_field(item, "type", "")):
+                    output_count += int(item_id not in assembler.pending_function_calls)
+                if output_count > max_output_items:
+                    raise RuntimeError("Codex Responses stream output-item limit exceeded")
                 # Both announced function calls and completed items are retained.
                 # Guard before callbacks and before the assembler can publish them.
                 retained_output_item_bytes += _codex_output_item_size(
