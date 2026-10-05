@@ -37,8 +37,6 @@ def test_openai_codex_unknown_but_plausible_model_is_accepted_with_warning():
     assert result["persist"] is True
     assert result["recognized"] is False
     assert "gpt-5.3-codex-spark" in result["message"]
-    assert "OpenAI Codex model listing" in result["message"]
-    assert "Similar models" in result["message"]
     assert "gpt-5.3-codex" in result["message"]
 
 

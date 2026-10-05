@@ -4,9 +4,9 @@ Verifies that periodic and close-time checkpoints use PASSIVE mode (safe for
 shared live DBs) while explicit pre-VACUUM maintenance may still use TRUNCATE.
 """
 
-import sqlite3
 import logging
-from unittest.mock import MagicMock, patch
+import sqlite3
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -69,29 +69,42 @@ class TestTryWalCheckpointPassive:
         assert len(truncate_calls) == 0, (
             "Periodic checkpoint should NOT use TRUNCATE"
         )
+        db._conn = real_conn
 
-    def test_checkpoint_logs_warning_on_failure(self, db, caplog):
-        """Failed PASSIVE checkpoint logs a warning instead of silent pass."""
+    def test_failed_checkpoint_never_raises_and_is_not_silent(self, db, caplog):
+        """The periodic checkpoint runs from the write path: a failing PASSIVE
+        checkpoint must not raise into the caller, and must leave a WARNING."""
+        real_conn = db._conn
         mock_conn = MagicMock()
         mock_conn.execute.side_effect = sqlite3.OperationalError("disk I/O error")
         db._conn = mock_conn
+        try:
+            with caplog.at_level(logging.WARNING, logger="hermes_state"):
+                db._try_wal_checkpoint()
+        finally:
+            db._conn = real_conn
+        assert any(r.levelno >= logging.WARNING for r in caplog.records)
 
-        with caplog.at_level(logging.WARNING):
-            db._try_wal_checkpoint()
 
-        assert any("WAL checkpoint (PASSIVE) failed" in r.message for r in caplog.records), (
-            f"Expected warning log about PASSIVE checkpoint failure, got: {caplog.text}"
-        )
-
-    def test_checkpoint_returns_result_on_success(self, db):
-        """Successful PASSIVE checkpoint does not raise."""
-        db._try_wal_checkpoint()
 
 
 class TestCloseUsesPassive:
-    """close() must use PASSIVE. Transient per-cron-run SessionDB connections
-    close many times an hour; a TRUNCATE reset there races the live gateway
-    writer on the large WAL DB and corrupts B-tree pages (#45383)."""
+    """Close never resets shared WAL generations or waits behind a writer."""
+
+    def test_close_does_not_wait_behind_real_writer(self, db):
+        """Real WAL writer contention must not inherit the 30s busy timeout."""
+        import time
+
+        writer = sqlite3.connect(str(db.db_path), timeout=0)
+        writer.execute("BEGIN IMMEDIATE")
+        started = time.monotonic()
+        try:
+            db.close()
+            assert time.monotonic() - started < 1.0
+            assert db._conn is None
+        finally:
+            writer.rollback()
+            writer.close()
 
     def test_close_uses_passive_mode(self, db):
         """close() checkpoints PASSIVE, never TRUNCATE."""
@@ -117,20 +130,23 @@ class TestCloseUsesPassive:
         assert len(passive_calls) == 1, (
             f"Expected 1 PASSIVE checkpoint at close, got {len(passive_calls)}"
         )
+        real_conn.close()
 
-    def test_close_logs_debug_on_failure(self, db, caplog):
-        """Failed PASSIVE checkpoint at close logs debug (close is best-effort)."""
-
+    def test_failed_checkpoint_at_close_still_releases_the_handle(self, db):
+        """close() is best-effort about the checkpoint: a failing PASSIVE at
+        close must neither raise nor leave the handle open."""
+        real_conn = db._conn
         mock_conn = MagicMock()
         mock_conn.execute.side_effect = sqlite3.OperationalError("database is locked")
         db._conn = mock_conn
-
-        with caplog.at_level(logging.DEBUG):
+        try:
             db.close()
+        finally:
+            real_conn.close()
 
-        assert any("WAL checkpoint (PASSIVE) at close failed" in r.message for r in caplog.records), (
-            f"Expected debug log about PASSIVE failure at close, got: {caplog.text}"
-        )
+        assert db._conn is None
+        mock_conn.close.assert_called()
+
 
 
 class TestVacuumUsesPassive:

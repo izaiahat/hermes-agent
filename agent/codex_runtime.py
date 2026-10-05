@@ -8,6 +8,7 @@ import contextvars
 import json
 import logging
 import os
+import sys
 import threading
 import time
 from contextlib import suppress
@@ -755,16 +756,50 @@ def _output_text_of(item: Any) -> str:
 # threaten the host.
 _CODEX_STREAM_MAX_EVENTS = 250_000
 _CODEX_STREAM_MAX_RETAINED_CHARS = 16 * 1024 * 1024
+_CODEX_STREAM_MAX_OUTPUT_ITEMS = 4_096
+_CODEX_STREAM_MAX_OUTPUT_ITEM_BYTES = 64 * 1024 * 1024
 
 
 def _codex_stream_event_text_size(event: Any) -> int:
     """Characters this event contributes to retained stream text (0 when none)."""
     total = 0
     for field in ("delta", "text", "arguments"):
-        value = getattr(event, field, None)
+        value = _event_field(event, field, None)
         if isinstance(value, str):
             total += len(value)
     return total
+
+
+def _codex_output_item_size(item: Any, remaining: int) -> int:
+    """Bound an SDK/raw-JSON object graph without serializing a second giant copy.
+
+    Charge each item conservatively (including a repeated announced/done item).
+    Per-item cycle detection avoids a response-wide id set retaining stale ids.
+    Iterator frames keep traversal memory proportional to depth, not fanout.
+    """
+    frames = [iter((item,))]
+    seen: set[int] = set()
+    size = 0
+    while frames:
+        try:
+            value = next(frames[-1])
+        except StopIteration:
+            frames.pop()
+            continue
+        if id(value) in seen:
+            continue
+        seen.add(id(value))
+        size += sys.getsizeof(value)
+        if size > remaining:
+            raise RuntimeError("Codex Responses stream output-item byte limit exceeded")
+        if isinstance(value, dict):
+            frames.append(iter(value.keys()))
+            frames.append(iter(value.values()))
+        elif isinstance(value, (list, tuple, set, frozenset)):
+            frames.append(iter(value))
+        elif isinstance(attributes := getattr(value, "__dict__", None), dict):
+            frames.append(iter((attributes,)))
+    return size
 
 
 class _CodexResponseAssembler:
@@ -977,6 +1012,8 @@ def _consume_codex_event_stream(
     on_first_delta=None, on_event=None, interrupt_check=None,
     max_events: int = _CODEX_STREAM_MAX_EVENTS,
     max_retained_chars: int = _CODEX_STREAM_MAX_RETAINED_CHARS,
+    max_output_items: int = _CODEX_STREAM_MAX_OUTPUT_ITEMS,
+    max_output_item_bytes: int = _CODEX_STREAM_MAX_OUTPUT_ITEM_BYTES,
 ) -> SimpleNamespace:
     """Consume a Codex Responses SSE stream into a Response-shaped ``SimpleNamespace`` (see
     :class:`_CodexResponseAssembler`; ``status`` is ``completed`` when the stream ended with content but no
@@ -992,6 +1029,8 @@ def _consume_codex_event_stream(
                                         on_commentary_message=on_commentary_message, on_first_delta=on_first_delta)
     event_count = 0
     retained_chars = 0
+    retained_output_item_bytes = 0
+    item_counts = {"response.output_item.added": 0, "response.output_item.done": 0}
     for event in event_iter:
         event_count += 1
         retained_chars += _codex_stream_event_text_size(event)
@@ -1002,6 +1041,18 @@ def _consume_codex_event_stream(
                 "Codex stream exceeded its retention budget "
                 f"(events={event_count}/{max_events}, chars={retained_chars}/{max_retained_chars})"
             )
+        event_type = _event_field(event, "type", "")
+        if isinstance(event_type, str) and event_type in item_counts:
+            item = _event_field(event, "item")
+            if item is not None:
+                item_counts[event_type] += 1
+                if item_counts[event_type] > max_output_items:
+                    raise RuntimeError("Codex Responses stream output-item limit exceeded")
+                # Both announced function calls and completed items are retained.
+                # Guard before callbacks and before the assembler can publish them.
+                retained_output_item_bytes += _codex_output_item_size(
+                    item, max_output_item_bytes - retained_output_item_bytes,
+                )
         if on_event is not None:
             try:
                 on_event(event)

@@ -80,6 +80,10 @@ function Harness({
 describe('stale parent own-echo during deferred key-burst flush', () => {
   beforeEach(() => {
     vi.useFakeTimers({ toFake: ['setTimeout', 'setInterval', 'Date'] })
+    // Clearing TMUX alone does not identify a non-multiplexed terminal:
+    // remote tmux advertises TERM=tmux-256color even without TMUX.
+    vi.stubEnv('TERM', 'xterm-256color')
+    vi.stubEnv('HERMES_TUI_TERMUX_MODE', '0')
     // useStdout() resolves to process.stdout (not the FakeTty passed to
     // renderSync), so the fast-echo bypass has to be armed on the real stream.
     ;(process.stdout as { isTTY?: boolean }).isTTY = true
@@ -177,14 +181,19 @@ describe('stale parent own-echo during deferred key-burst flush', () => {
         await tick()
       }
 
+      // Real setImmediate ticks commit React work without advancing the fake
+      // 16ms clock. Prove the burst path is actually armed, not synchronous.
+      expect(values).toEqual(['a'])
       vi.advanceTimersByTime(16)
       await tick()
       await tick()
+      expect(values).toEqual(['a', 'abc'])
 
       // "d" arms a new deferred flush; history navigation then replaces the
       // draft before that flush fires.
       stdin.send('d')
       await tick()
+      expect(values).toEqual(['a', 'abc'])
       setValueRef.current?.('history draft')
       await tick()
       await tick()

@@ -9,7 +9,6 @@ from types import SimpleNamespace
 import pytest
 
 import tools.async_delegation as ad
-from agent.tool_executor import _record_async_artifact_access
 from tools.process_registry import ProcessRegistry
 
 
@@ -88,6 +87,22 @@ def test_consumed_artifact_completion_is_acknowledged_exactly_once(tmp_path):
     )
     row = ad.get_durable_delegation(event["delegation_id"])
     assert row["delivery_attempts"] == 1
+
+
+def test_artifact_observations_are_bounded(monkeypatch, tmp_path):
+    monkeypatch.setattr(ad, "_MAX_ARTIFACT_OBSERVATIONS_PER_SESSION", 2)
+    artifacts = [tmp_path / f"result-{i}.md" for i in range(3)]
+    for i, artifact in enumerate(artifacts):
+        artifact.write_text("done", encoding="utf-8")
+        os.utime(artifact, (100.0, 100.0))
+        ad.record_parent_artifact_access(
+            session_keys=["session-a"], tool_name="read_file",
+            args={"path": str(artifact)}, result=_full_read_result(),
+            observed_at=200.0 + i,
+        )
+    assert set(ad._artifact_observations["session-a"]) == {str(p) for p in artifacts[1:]}
+    assert ad.redundant_completion_reason(_event(artifacts[0])) is None
+    assert ad.redundant_completion_reason(_event(artifacts[-1])) == "artifact-consumed"
 
 
 def test_unseen_artifact_preserves_completion(tmp_path):
@@ -299,8 +314,9 @@ def test_empty_success_is_suppressed_but_summary_only_success_is_preserved():
 
 
 def test_tool_executor_records_only_successful_parent_file_access(monkeypatch):
+    from agent.tool_executor import _record_async_artifact_access
     import agent.delegation_context as delegation_context
-    import tools.approval as approval
+    import tools.approval_context as approval
 
     calls = []
     monkeypatch.setattr(approval, "get_current_session_key", lambda default="": "route-a")

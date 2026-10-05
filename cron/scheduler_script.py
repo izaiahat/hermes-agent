@@ -361,7 +361,10 @@ def _run_job_script(
     if argv is None:
         return False, err
 
+    from cron import script_integrity
+    descriptors: tuple[int, ...] = ()
     try:
+        argv, descriptors, f13_lane = script_integrity.prepare(path, job, argv)
         from tools.environments.local import build_subprocess_env
         # Lossy decode only: keep the platform-default (locale) encoding — gating ``encoding=``
         # to win32 was deliberate (#66566: unconditional UTF-8 leaked into POSIX) — but
@@ -389,6 +392,12 @@ def _run_job_script(
         # process env itself — no raw copy at the spawn site (test_subprocess_env_guard).
         env = build_subprocess_env(strip_launch_profile=True)
         env.update(env_overlay)
+        if f13_lane:
+            for key in script_integrity._F13_PYTHON_STARTUP_ENV_KEYS:
+                env.pop(key, None)
+        if descriptors:
+            popen_kwargs["pass_fds"] = descriptors
+        argv = script_integrity.contained_argv(path, job, script_timeout, argv, descriptors, env)
         # Subprocess cwd only (default: scripts-dir parent). NEVER os.chdir() the process.
         # Use the job's workdir as the subprocess cwd when configured, otherwise default to the scripts-dir
         # parent (back-compat). NEVER mutate the Python process cwd — that would leak into concurrent
@@ -443,6 +452,9 @@ def _run_job_script(
         return True, stdout
     except Exception as exc:
         return False, f"Script execution failed: {exc}"
+    finally:
+        for descriptor in descriptors:
+            os.close(descriptor)
 
 
 def _start_heartbeat_thread(loop_fn, name: str, fail_log) -> Optional[threading.Thread]:

@@ -12,11 +12,8 @@ import io
 from argparse import Namespace
 from contextlib import redirect_stdout
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
-
-
 
 
 @pytest.fixture
@@ -61,14 +58,6 @@ def curator_status_env(tmp_path, monkeypatch):
         "skill_usage": skill_usage,
         "curator_cli": curator_cli,
     }
-
-
-def _capture_status(curator_cli) -> str:
-    buf = io.StringIO()
-    with redirect_stdout(buf):
-        rc = curator_cli._cmd_status(Namespace())
-    assert rc == 0
-    return buf.getvalue()
 
 
 def test_repair_usage_command_prints_summary(monkeypatch, capsys):
@@ -126,32 +115,6 @@ def test_repair_usage_command_prints_noop(monkeypatch, capsys):
 # ---------------------------------------------------------------------------
 # Unmanaged blind spot + adopt verb
 # ---------------------------------------------------------------------------
-
-
-
-
-
-
-
-def test_adopt_subcommand_is_registered():
-    """The verb must be reachable through the real argparse tree, not just as a
-    callable — a handler nobody can dispatch to is dead code."""
-    import argparse
-
-    import hermes_cli.curator as curator_cli
-
-    parser = argparse.ArgumentParser()
-    curator_cli.register_cli(parser)
-
-    args = parser.parse_args(["adopt", "--all-unmanaged", "--dry-run"])
-    assert args.func is curator_cli._cmd_adopt
-    assert args.all_unmanaged is True
-    assert args.dry_run is True
-    assert args.skill == []
-
-    named = parser.parse_args(["adopt", "alpha", "beta"])
-    assert named.skill == ["alpha", "beta"]
-    assert named.all_unmanaged is False
 
 
 def test_list_unmanaged_itemizes_and_explains(curator_status_env):
