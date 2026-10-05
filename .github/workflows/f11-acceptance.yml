@@ -1,0 +1,63 @@
+name: F11 exact-head acceptance
+
+# Narrow F11 source acceptance; does not enable the broad CI workflow.
+# Push supplies the real branch head, not GitHub's synthetic PR merge commit.
+on:
+  push:
+    branches:
+      - fix/f11-exact-claim-disposition-20261002
+      - fix/f11-registry-writer-exclusion-20261002
+
+permissions:
+  contents: read
+
+concurrency:
+  group: f11-acceptance-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  acceptance:
+    name: F11 canonical acceptance (7 files)
+    if: github.repository == 'izaiahat/hermes-agent'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout exact push head
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Verify exact head
+        env:
+          EXPECTED_HEAD: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          actual_head="$(git rev-parse HEAD)"
+          test "$actual_head" = "$EXPECTED_HEAD"
+          printf 'F11 acceptance checkout: %s\n' "$actual_head"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # 8.2.0
+        with:
+          version: "0.9.28"
+          enable-cache: false
+
+      - name: Set up Python 3.11
+        run: uv python install 3.11
+
+      - name: Install locked dependencies
+        # Match the maintained Python CI dependency set without changing pins.
+        run: uv sync --locked --python 3.11 --extra all --extra dev --extra anthropic --extra mistral --extra fal --extra modal --extra daytona --extra hindsight --extra parallel-web
+
+      - name: Run only F11 canonical acceptance group
+        run: |
+          scripts/run_tests.sh -j 1 \
+            tests/cron/test_claim_disposition.py \
+            tests/cron/test_execution_ledger.py \
+            tests/cron/test_jobs_crossprocess_lock.py \
+            tests/cron/test_file_permissions.py \
+            tests/cron/test_dead_owner_claim_reclaim.py \
+            tests/cron/test_restart_safe_worker.py \
+            tests/cron/test_fire_claim_lost_after_delivery.py \
+            --file-retries 0

@@ -221,6 +221,7 @@ def _format_batch_delegation(evt: dict, deleg_id: str, completed_at: float) -> s
         r_goal = goals[idx] if idx < len(goals) else r.get("goal", "")
         icon = "⚠" if r_truncated else ("✓" if r_status in _DONE else "✗")
         header = (f"--- {icon} TASK {idx + 1}/{n}" + (f": {r_goal}" if r_goal else "") + f"  (status={r_status}"
+                  + (f", model={r['model']}" if r.get("model") and r["model"] != evt.get("model") else "")
                   + (f", api_calls={r['api_calls']}" if r.get("api_calls") else "")
                   + (f", {r['duration_seconds']}s" if r.get("duration_seconds") is not None else "")
                   + (", TRUNCATED: hit max_iterations — work may be incomplete" if r_truncated else ""))
