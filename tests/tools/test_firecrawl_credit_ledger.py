@@ -5,6 +5,24 @@ import pytest
 from tools import firecrawl_ledger as bridge
 
 
+def test_bridge_sdk_mcp_receipts_and_ambiguous_failure(monkeypatch):
+    records = []
+    adapter = SimpleNamespace(record_operation=lambda *a, **kw: records.append(kw))
+    monkeypatch.setattr(bridge, '_adapter', lambda: adapter)
+    response = {'id':'job-1','creditsUsed':2,'success':True,'data':{'web':[]}}
+    assert bridge.sdk_call('sdk.search','/v2/search',lambda **kw: response,query='fixture')==response
+    result=SimpleNamespace(isError=False,content=[SimpleNamespace(text=json.dumps(response))])
+    op=bridge.begin('mcp.search','mcp/firecrawl_search',{'query':'fixture'})
+    bridge.finish(op,'mcp.search','mcp/firecrawl_search',{'query':'fixture'},result)
+    assert [r['outcome'] for r in records]==['started','success','started','success']
+    assert records[-1]['payload']['creditsUsed']==2
+    def failed(**kw):
+        raise TimeoutError('fixture ambiguity')
+    with pytest.raises(TimeoutError):
+        bridge.sdk_call('sdk.search','/v2/search',failed,query='fixture')
+    assert records[-1]['outcome']=='ambiguous_transport_error'
+
+
 def test_sdk_and_mcp_share_ledger_without_secret_retention(tmp_path,monkeypatch):
     client=Path('/home/ubuntu/business/.worktrees/firecrawl-integration-20261007/scripts/firecrawl_client.py')
     if not client.exists():
