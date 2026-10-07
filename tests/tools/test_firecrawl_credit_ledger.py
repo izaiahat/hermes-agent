@@ -8,7 +8,7 @@ from tools import firecrawl_ledger as bridge
 def test_bridge_sdk_mcp_receipts_and_ambiguous_failure(monkeypatch):
     records = []
     adapter = SimpleNamespace(record_operation=lambda *a, **kw: records.append(kw))
-    monkeypatch.setattr(bridge, '_adapter', lambda: adapter)
+    monkeypatch.setattr(bridge, '_client', lambda: adapter)
     response = {'id':'job-1','creditsUsed':2,'success':True,'data':{'web':[]}}
     assert bridge.sdk_call('sdk.search','/v2/search',lambda **kw: response,query='fixture')==response
     result=SimpleNamespace(isError=False,content=[SimpleNamespace(text=json.dumps(response))])
