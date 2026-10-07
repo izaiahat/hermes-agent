@@ -251,7 +251,8 @@ async def _scrape_one(url: str, formats: List[str], format: Optional[str]) -> Di
     try:
         logger.info("Firecrawl scraping: %s", url)
         try:
-            scrape_result = await asyncio.wait_for(asyncio.to_thread(_get_firecrawl_client().scrape, url=url, formats=formats), timeout=60)
+            from tools.firecrawl_ledger import sdk_call
+            scrape_result = await asyncio.wait_for(asyncio.to_thread(sdk_call, 'hermes.web_extract', '/v2/scrape', _get_firecrawl_client().scrape, url=url, formats=formats), timeout=60)
         except asyncio.TimeoutError:
             logger.warning("Firecrawl scrape timed out for %s", url)
             return _error_entry(url, _SCRAPE_TIMEOUT_MSG)
@@ -297,7 +298,8 @@ class FirecrawlWebSearchProvider(BaseWebSearchProvider):
         logger.info("Firecrawl search: '%s' (limit=%d)", query, limit)
         client = _get_firecrawl_client()
         try:
-            web_results = _extract_web_search_results(client.search(query=query, limit=limit))
+            from tools.firecrawl_ledger import sdk_call
+            web_results = _extract_web_search_results(sdk_call('hermes.web_search', '/v2/search', client.search, query=query, limit=limit))
             logger.info("Firecrawl: found %d search results", len(web_results))
             return search_ok(web_results)
         except Exception as exc:  # noqa: BLE001
