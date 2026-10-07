@@ -41,3 +41,21 @@ def test_sdk_and_mcp_share_ledger_without_secret_retention(tmp_path,monkeypatch)
     assert all(r['creditsUsed']==1 for r in rows if r['outcome']=='success')
     assert 'PRIVATE QUERY' not in ledger.read_text()
     assert '/private' not in ledger.read_text()
+
+
+def test_sdk4493_search_and_redirect_metadata(monkeypatch):
+    import asyncio
+    from firecrawl.v2.types import Document, DocumentMetadata, SearchData, SearchResultWeb
+    from plugins.web.firecrawl import provider
+    search = SearchData(web=[SearchResultWeb(url='https://www.fda.gov/', title='FDA')])
+    assert provider._extract_web_search_results(search)[0]['url'] == 'https://www.fda.gov/'
+    document = Document(markdown='fixture', metadata=DocumentMetadata(
+        source_url='https://redirect.example.invalid/', title='Redirect', credits_used=1))
+    monkeypatch.setattr(provider, '_get_firecrawl_client', lambda: SimpleNamespace(scrape=lambda **kw: document))
+    monkeypatch.setattr(provider, 'check_website_access', lambda url: None)
+    monkeypatch.setattr(provider, 'is_safe_url', lambda url: url != 'https://redirect.example.invalid/')
+    monkeypatch.setattr(bridge, '_client', lambda: None)
+    result = asyncio.run(provider._scrape_one('https://www.fda.gov/', ['markdown'], 'markdown'))
+    assert result['url'] == 'https://redirect.example.invalid/'
+    assert result['error'] == provider._UNSAFE_REDIRECT_MSG
+    assert result['content'] == ''

@@ -261,7 +261,8 @@ async def _scrape_one(url: str, formats: List[str], format: Optional[str]) -> Di
         # SDK may return a typed object for metadata (raw __dict__ here, unlike _to_plain_object).
         if not isinstance(metadata, dict):
             metadata = metadata.model_dump() if hasattr(metadata, "model_dump") else getattr(metadata, "__dict__", {})
-        title, final_url = metadata.get("title", ""), metadata.get("sourceURL", url)
+        title = metadata.get("title") or ""
+        final_url = metadata.get("url") or metadata.get("sourceURL") or metadata.get("source_url") or url
         if not is_safe_url(final_url):
             logger.info("Blocked redirected web_extract for unsafe final URL: %s", final_url)
             return _error_entry(final_url, _UNSAFE_REDIRECT_MSG, title=title, raw=True)
