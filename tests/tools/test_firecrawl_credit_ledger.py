@@ -230,4 +230,3 @@ def test_accounting_boundary_overrides_wrapped_transport(monkeypatch, native_dis
     assert 'outcome unknown; do not replay' in result['error']
     assert result['retry'] is False
     assert effects == [] and reconnects == [] and recovered == []
-
