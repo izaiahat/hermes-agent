@@ -12,6 +12,18 @@ import uuid
 _CLIENT = None
 
 
+class CompletedEffectAccountingError(RuntimeError):
+    """Provider returned; terminal persistence failed. Never reconnect or replay.
+
+    Cause/context may contain transport-looking bookkeeping errors, but they
+    describe accounting, not the already completed provider invocation.
+    """
+
+    def __init__(self):
+        super().__init__('Firecrawl terminal accounting failed; outcome unknown; do not replay')
+
+
+
 def _client():
     global _CLIENT
     if _CLIENT is None:
@@ -67,7 +79,7 @@ def finish(operation, caller, endpoint, options, result=None, failed=False):
     except Exception:
         # Never expose bookkeeping as a reconnectable/auth transport error.
         # The existing started receipt remains uncertain; no operation replay.
-        raise RuntimeError('Firecrawl terminal accounting failed; outcome unknown; do not replay') from None
+        raise CompletedEffectAccountingError() from None
 
 
 def finish_failed(operation, caller, endpoint, options):

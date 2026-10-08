@@ -119,3 +119,115 @@ def test_original_cancel_survives_terminal_accounting_failure(monkeypatch, path,
     assert outcomes == ['started', 'success' if effect == 'completed' else 'ambiguous_transport_error']
     assert server._pending_call_context is None
     assert not server._inflight_tasks
+
+
+@pytest.fixture
+def native_dispatch(monkeypatch):
+    import asyncio
+    from tools import mcp_tool_handlers as handlers
+    effects, outcomes, reconnects = [], [], []
+
+    async def rpc(*args, **kwargs):
+        effects.append('completed')
+        return SimpleNamespace(content=[], isError=False)
+
+    server = SimpleNamespace(
+        _rpc_lock=asyncio.Lock(), session=SimpleNamespace(call_tool=rpc),
+        _pending_call_context=None, _inflight_tasks=set(), _reconnecting=False)
+    monkeypatch.setattr(handlers, '_trust_gate_check', lambda *a: None)
+    monkeypatch.setattr(handlers, '_check_circuit_breaker', lambda *a: None)
+    monkeypatch.setattr(handlers, '_acquire_call_server', lambda *a: (server, None))
+    monkeypatch.setattr(handlers, '_tool_is_read_only', lambda *a: True)
+    monkeypatch.setattr(handlers._loop, '_run_on_mcp_loop', lambda call, **kw: asyncio.run(call()))
+    monkeypatch.setattr(handlers, '_core', SimpleNamespace(
+        _bump_server_error=lambda *a, **kw: None, _reset_server_error=lambda *a: None,
+        _STDIO_RESPAWN_WAIT_SEC=15))
+    monkeypatch.setattr(handlers, '_lookup_reconnectable_server', lambda *a, **kw: server)
+    monkeypatch.setattr(handlers, '_mcp_loop_running', lambda: True)
+
+    def reconnect(*a, **kw):
+        reconnects.append('requested')
+        server._stdio_children_dead = lambda: False
+        return True
+
+    monkeypatch.setattr(handlers._loop, '_signal_reconnect', reconnect)
+    monkeypatch.setattr(handlers._loop, '_signal_reconnect_and_wait', reconnect)
+    return server, effects, outcomes, reconnects
+
+
+@pytest.mark.parametrize('fault_kind', ['broken-pipe', 'session-expired', '401-message', '401-typed'])
+def test_completed_terminal_accounting_never_recovers(monkeypatch, native_dispatch, fault_kind):
+    import httpx
+    from tools import mcp_tool_handlers as handlers
+    fault = {
+        'broken-pipe': BrokenPipeError('broken pipe'),
+        'session-expired': RuntimeError('session expired'),
+        '401-message': OSError('HTTP 401 Unauthorized'),
+        '401-typed': httpx.HTTPStatusError('HTTP 401 Unauthorized',
+            request=httpx.Request('POST', 'https://example.invalid/'), response=httpx.Response(401)),
+    }[fault_kind]
+    server, effects, outcomes, reconnects = native_dispatch
+
+    def record(*a, **kw):
+        outcomes.append(kw['outcome'])
+        if kw['outcome'] != 'started':
+            raise fault
+
+    monkeypatch.setattr(bridge, '_client', lambda: SimpleNamespace(record_operation=record))
+    result = json.loads(handlers._make_tool_handler('firecrawl', 'firecrawl_scrape', 30)({}))
+    assert 'outcome unknown; do not replay' in result['error']
+    assert (effects, outcomes, reconnects) == (['completed'], ['started', 'success'], [])
+    assert result['outcome_uncertain'] is True and result['retry'] is False
+    assert server._pending_call_context is None and not server._inflight_tasks
+
+
+def test_genuine_pre_effect_stdio_death_still_recovers(native_dispatch):
+    from tools import mcp_tool_handlers as handlers
+    server, effects, outcomes, reconnects = native_dispatch
+    server._stdio_children_dead = lambda: True
+    result = json.loads(handlers._make_tool_handler('offline-control', 'fixture', 30)({}))
+    assert 'error' not in result
+    assert effects == ['completed'] and reconnects == ['requested'] and not outcomes
+    assert server._pending_call_context is None and not server._inflight_tasks
+
+
+@pytest.mark.parametrize('wrapper', ['context', 'cause', 'group'])
+def test_accounting_boundary_overrides_wrapped_transport(monkeypatch, native_dispatch, wrapper):
+    from tools import mcp_tool_errors as errors
+    from tools import mcp_tool_handlers as handlers
+    _, effects, _, reconnects = native_dispatch
+    fault = BrokenPipeError('broken pipe')
+    boundary = None
+    try:
+        raise fault
+    except Exception:
+        try:
+            # Use the maintained producer to obtain a real retained-context accounting error.
+            monkeypatch.setattr(bridge, '_client', lambda: SimpleNamespace(
+                record_operation=lambda *a, **kw: (_ for _ in ()).throw(fault)))
+            bridge.finish('started-id', 'fixture', 'mcp/fixture', {})
+        except Exception as exc:
+            boundary = exc
+    assert boundary is not None
+    assert boundary.__context__ is fault
+    if wrapper == 'group':
+        outer = ExceptionGroup('session expired', [RuntimeError('broken pipe'), boundary])
+    else:
+        outer = RuntimeError('session expired')
+        setattr(outer, '__' + wrapper + '__', boundary)
+    assert errors._is_session_expired_error(outer) is False
+    assert errors._is_auth_error(outer) is False
+
+    async def raise_outer():
+        raise outer
+
+    recovered = []
+    def must_not_recover(*a):
+        recovered.append(True)
+        return '{}'
+    result = json.loads(handlers._dispatch('firecrawl', native_dispatch[0], 'fixture', raise_outer, 30,
+                                         (must_not_recover,), lambda *a: None))
+    assert 'outcome unknown; do not replay' in result['error']
+    assert result['retry'] is False
+    assert effects == [] and reconnects == [] and recovered == []
+
