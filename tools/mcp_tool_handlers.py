@@ -579,8 +579,8 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                     result = await _call_tool_racing_stdio_death(server, server_name, tool_name, args)
                 except BaseException:
                     if operation is not None:
-                        from tools.firecrawl_ledger import finish
-                        finish(operation, 'hermes.mcp.' + tool_name, 'mcp/' + tool_name, args, failed=True)
+                        from tools.firecrawl_ledger import finish_failed
+                        finish_failed(operation, 'hermes.mcp.' + tool_name, 'mcp/' + tool_name, args)
                     raise
                 finally:
                     server._pending_call_context = None

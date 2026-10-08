@@ -61,8 +61,28 @@ def finish(operation, caller, endpoint, options, result=None, failed=False):
     if 'metadata' in payload and 'data' not in payload:
         payload = {'success': True, 'data': payload}
     outcome = 'ambiguous_transport_error' if failed else 'provider_error' if (payload.get('success') is False or getattr(result, 'isError', False)) else 'success'
-    _client().record_operation(caller, endpoint, options, payload=payload, outcome=outcome,
-                              operation_id=operation, run_id=os.environ.get('HERMES_SESSION_ID'))
+    try:
+        _client().record_operation(caller, endpoint, options, payload=payload, outcome=outcome,
+                                   operation_id=operation, run_id=os.environ.get('HERMES_SESSION_ID'))
+    except Exception:
+        # Never expose bookkeeping as a reconnectable/auth transport error.
+        # The existing started receipt remains uncertain; no operation replay.
+        raise RuntimeError('Firecrawl terminal accounting failed; outcome unknown; do not replay') from None
+
+
+def finish_failed(operation, caller, endpoint, options):
+    """Best-effort terminal accounting while an original exception unwinds.
+
+    The durable started receipt already records uncertainty. A bookkeeping
+    failure cannot replace cancellation or reclassify the original transport.
+    """
+    try:
+        finish(operation, caller, endpoint, options, failed=True)
+    except Exception as exc:
+        import logging
+        logging.getLogger(__name__).warning(
+            'Firecrawl terminal accounting failed (%s); original failure preserved',
+            type(exc).__name__)
 
 
 def sdk_call(caller, endpoint, method, **options):
@@ -70,7 +90,7 @@ def sdk_call(caller, endpoint, method, **options):
     try:
         result = method(**options)
     except BaseException:
-        finish(operation, caller, endpoint, options, failed=True)
+        finish_failed(operation, caller, endpoint, options)
         raise
     finish(operation, caller, endpoint, options, result)
     return result

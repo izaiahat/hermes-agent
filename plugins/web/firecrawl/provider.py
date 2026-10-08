@@ -262,13 +262,18 @@ async def _scrape_one(url: str, formats: List[str], format: Optional[str]) -> Di
         if not isinstance(metadata, dict):
             metadata = metadata.model_dump() if hasattr(metadata, "model_dump") else getattr(metadata, "__dict__", {})
         title = metadata.get("title") or ""
+        candidates = list(dict.fromkeys([url] + [metadata[key] for key in
+            ('url', 'sourceURL', 'source_url', 'og:url') if metadata.get(key)]))
         final_url = metadata.get("url") or metadata.get("sourceURL") or metadata.get("source_url") or url
-        if not is_safe_url(final_url):
-            logger.info("Blocked redirected web_extract for unsafe final URL: %s", final_url)
-            return _error_entry(final_url, _UNSAFE_REDIRECT_MSG, title=title, raw=True)
-        if final_blocked := check_website_access(final_url):
-            logger.info("Blocked redirected web_extract for %s by rule %s", final_blocked["host"], final_blocked["rule"])
-            return _error_entry(final_url, final_blocked["message"], title=title, raw=True, blocked=final_blocked)
+        # Every supplied redirect alias is evidence of a destination: a safe
+        # preferred alias must never mask a denied network or website candidate.
+        for candidate in candidates:
+            if not is_safe_url(candidate):
+                logger.info("Blocked redirected web_extract for unsafe final URL: %s", candidate)
+                return _error_entry(candidate, _UNSAFE_REDIRECT_MSG, title=title, raw=True)
+            if final_blocked := check_website_access(candidate):
+                logger.info("Blocked redirected web_extract for %s by rule %s", final_blocked["host"], final_blocked["rule"])
+                return _error_entry(candidate, final_blocked["message"], title=title, raw=True, blocked=final_blocked)
         markdown, html = payload.get("markdown"), payload.get("html")
         content = markdown if format == "markdown" or (format is None and markdown) else html or markdown or ""
         return {"url": final_url, "title": title, "content": content, "raw_content": content, "metadata": metadata}
