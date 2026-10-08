@@ -12,6 +12,7 @@ import re
 from typing import Any, List, Optional
 from urllib.parse import urlparse
 from tools.mcp_tool_common import _sanitize_error, _core
+from tools.firecrawl_ledger import CompletedEffectAccountingError
 
 logger = logging.getLogger("tools.mcp_tool")
 
@@ -388,6 +389,9 @@ def _exc_children(exc: BaseException) -> List[BaseException]:
     """A group's sub-exceptions (if any) followed by ``__cause__``/``__context__`` when they are exceptions — a
     group raised inside an ``except`` block carries the caught error as ``__context__``, so the chain is never
     skipped."""
+    if isinstance(exc, CompletedEffectAccountingError):
+        # Its cause/context describes local persistence, not provider transport.
+        return []
     nested = getattr(exc, "exceptions", None) or ()
     return [*nested, *(c for c in (exc.__cause__, exc.__context__) if isinstance(c, BaseException))]
 
@@ -409,6 +413,16 @@ def _iter_exception_nodes(exc: BaseException) -> List[BaseException]:
         ordered.append(current)
         stack.extend(reversed(_exc_children(current)))
     return ordered
+
+
+def _completed_effect_accounting_error(exc: BaseException) -> Optional[CompletedEffectAccountingError]:
+    """Find the non-recoverable boundary, including wrapper groups/cause/context.
+
+    Any sibling transport error must not authorize replay of a completed effect.
+    The normal bounded, cycle-safe walker stops at the accounting boundary.
+    """
+    return next((node for node in _iter_exception_nodes(exc)
+                 if isinstance(node, CompletedEffectAccountingError)), None)
 
 
 def _format_connect_error(exc: BaseException) -> str:
@@ -479,6 +493,8 @@ def _get_auth_error_types() -> tuple:
 
 def _is_auth_error(exc: BaseException) -> bool:
     """True if ``exc`` indicates an MCP OAuth failure; ``HTTPStatusError`` counts only with status 401."""
+    if _completed_effect_accounting_error(exc) is not None:
+        return False
     auth_types, http_types = _get_auth_error_types()
     if not isinstance(exc, auth_types):
         return False
@@ -500,6 +516,8 @@ def _is_session_expired_error(exc: BaseException) -> bool:
     refresh. Every node ``_iter_exception_nodes`` reaches is inspected so an InterruptedError anywhere overrides
     transport markers; the chain walk matters because SDK wrappers raise a generic RuntimeError *from* a
     message-less ClosedResourceError."""
+    if _completed_effect_accounting_error(exc) is not None:
+        return False
     # AnyIO stream exceptions are often message-less, so type checks complement marker matching.
     transport_error_types = tuple(_optional_types("anyio", "BrokenResourceError", "ClosedResourceError", "EndOfStream"))
     found = False
