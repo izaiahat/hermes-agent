@@ -61,8 +61,10 @@ def _first_env(*names: str) -> str:
 
 
 def _is_oauth_token(key: str) -> bool:
-    """True for Anthropic OAuth/setup tokens (sk-ant-*, eyJ JWTs, cc-); False for sk-ant-api* Console keys."""
-    if not key or key.startswith("sk-ant-api"):
+    """True for Anthropic OAuth/setup tokens (sk-ant-*, eyJ JWTs, cc-); False for Console keys: legacy
+    sk-ant-api*, identity-linked personal/service-account sk-ant-usr*, and sk-ant-admin* (the claude-code
+    OAuth beta reroutes those to subscription billing and 400s 'credit balance too low')."""
+    if not key or key.startswith(("sk-ant-api", "sk-ant-usr", "sk-ant-admin")):
         return False
     return key.startswith(("sk-ant-", "eyJ", "cc-"))
 
