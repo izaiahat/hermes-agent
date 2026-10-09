@@ -850,6 +850,9 @@ def _resolve_child_runtime(
     child_max_tokens = getattr(parent_agent, "max_tokens", None)
     if isinstance(child_max_tokens, int):
         kwargs["max_tokens"] = child_max_tokens
+    from agent.anthropic_credit_guard import enforce_anthropic_credit_floor
+    enforce_anthropic_credit_floor(provider=effective_requested_provider or effective_provider,
+                                  base_url=effective_base_url, api_key=kwargs['api_key'])
     return kwargs
 
 
