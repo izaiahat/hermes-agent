@@ -294,6 +294,11 @@ class TestLightpandaFallbackWarning:
 class TestEngineOverride:
     """Verify _engine_override bypasses the cached engine."""
 
+    @pytest.fixture(autouse=True)
+    def _isolated_socket_root(self, tmp_path):
+        with patch("tools.browser_tool._socket_safe_tmpdir", return_value=str(tmp_path)):
+            yield
+
     @patch("tools.browser_tool_session._get_session_info")
     @patch("tools.browser_tool_install._find_agent_browser", return_value="/usr/bin/agent-browser")
     @patch("tools.browser_tool_cloud._is_local_mode", return_value=True)
@@ -329,10 +334,10 @@ class TestEngineOverride:
              patch("os.close"), \
              patch("os.unlink"), \
              patch("os.makedirs"), \
-             patch("builtins.open", MagicMock(return_value=MagicMock(
+             patch("tools.browser_tool_session.open", MagicMock(return_value=MagicMock(
                  __enter__=MagicMock(return_value=MagicMock(read=MagicMock(return_value='{"success": true, "data": {}}'))),
                  __exit__=MagicMock(return_value=False),
-             ))), \
+             )), create=True), \
              patch("tools.interrupt.is_interrupted", return_value=False), \
              patch("tools.browser_tool_lifecycle._write_owner_pid"):
             bt_session._run_browser_command("task1", "snapshot", [], _engine_override="auto")
@@ -349,7 +354,7 @@ class TestEngineOverride:
     @patch("tools.browser_tool_cdp._get_cdp_override", return_value="")
     @patch("tools.browser_tool._is_camofox_mode", return_value=False)
     def test_no_override_uses_cached_engine(
-        self, _camofox, _cdp, _cloud, _chromium, _local, _find, _session
+        self, _camofox, _cdp, _cloud, _chromium, _local, _find, _session, tmp_path
     ):
         """Lightpanda gets neither auto-injected nor inherited Chrome arguments."""
         import tools.browser_tool as bt
@@ -368,23 +373,19 @@ class TestEngineOverride:
         def capture_popen(cmd, **kwargs):
             captured_cmds.append(cmd)
             captured_envs.append(kwargs["env"])
+            # Write only the spawned command's output, not every open() in
+            # the interpreter (which includes psutil's binary /proc reads).
+            os.write(kwargs["stdout"], mock_stdout.encode())
             return mock_proc
 
         # Return a substantive snapshot so the LP fallback does NOT trigger.
         mock_stdout = '{"success": true, "data": {"snapshot": "- heading \\"Hello\\" [ref=e1]", "refs": {"e1": {}}}}'
         with patch("subprocess.Popen", side_effect=capture_popen), \
-             patch("os.open", return_value=99), \
-             patch("os.close"), \
-             patch("os.unlink"), \
-             patch("os.makedirs"), \
-             patch("builtins.open", MagicMock(return_value=MagicMock(
-                 __enter__=MagicMock(return_value=MagicMock(read=MagicMock(return_value=mock_stdout))),
-                 __exit__=MagicMock(return_value=False),
-             ))), \
+             patch("tools.browser_tool._socket_safe_tmpdir", return_value=str(tmp_path)), \
              patch("tools.interrupt.is_interrupted", return_value=False), \
              patch("tools.browser_tool_session._needs_chromium_sandbox_bypass", return_value=True), \
              patch("tools.browser_tool_lifecycle._write_owner_pid"), \
-             patch.dict(os.environ, {}, clear=True):
+             patch.dict(os.environ, {"HERMES_HOME": str(tmp_path), "HERMES_TEST_ISOLATION": "1"}, clear=True):
             # AppArmor/root detection would normally auto-inject Chromium args.
             bt_session._run_browser_command("task1", "snapshot", [])
 
@@ -436,10 +437,10 @@ class TestEngineOverride:
              patch("os.close"), \
              patch("os.unlink"), \
              patch("os.makedirs"), \
-             patch("builtins.open", MagicMock(return_value=MagicMock(
+             patch("tools.browser_tool_session.open", MagicMock(return_value=MagicMock(
                  __enter__=MagicMock(return_value=MagicMock(read=MagicMock(return_value=mock_stdout))),
                  __exit__=MagicMock(return_value=False),
-             ))), \
+             )), create=True), \
              patch("tools.interrupt.is_interrupted", return_value=False), \
              patch("tools.browser_tool_lifecycle._write_owner_pid"):
             bt_session._run_browser_command("task::local", "snapshot", [])

@@ -1228,6 +1228,10 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
             if old is not None and old.access_token == stored.access_token and old.refresh_token == stored.refresh_token and old.last_status == stored.last_status:
                 stored = replace(stored, request_count=old.request_count)
             refreshed.append(stored)
+        # Disk-safe singleton rows may contain only a borrowed-source reference.
+        # Hydrate from the authoritative provider block exactly as load_pool does;
+        # never restore a removed manual row from our stale in-memory copy.
+        _seed_from_singletons(self.provider, refreshed)
         self._entries = sorted(refreshed, key=lambda entry: entry.priority)
         if self._current_id not in {entry.id for entry in refreshed}:
             self._current_id = None

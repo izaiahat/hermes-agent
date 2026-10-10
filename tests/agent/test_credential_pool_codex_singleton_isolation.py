@@ -131,3 +131,22 @@ def test_long_lived_codex_pool_adopts_peer_rotation_and_removal(home, monkeypatc
     (home / "auth.json").write_text(json.dumps(store))
     assert pool._refresh_entry(stale, force=True) is None
     assert [e.id for e in pool.entries()] == ["seeded"]
+
+
+def test_codex_sync_hydrates_metadata_only_singleton_reference(home):
+    now = time.time()
+    token = _jwt("acct-A", "user-A", now + 8 * 3600)
+    (home / "auth.json").parent.mkdir(parents=True, exist_ok=True)
+    store = {"version": 1, "providers": {"openai-codex": {
+        "tokens": {"access_token": token, "refresh_token": "fixture-root-refresh"},
+    }}, "credential_pool": {"openai-codex": [{
+        "id": "reference", "source": "device_code", "auth_type": "oauth",
+    }]}}
+    (home / "auth.json").write_text(json.dumps(store))
+    pool = load_pool("openai-codex")
+    for _ in range(3):
+        selected = pool.select()
+        assert selected is not None and selected.access_token == token
+    # Removing the provider AND its persisted row must not resurrect memory.
+    (home / "auth.json").write_text(json.dumps({"version": 1, "providers": {}, "credential_pool": {"openai-codex": []}}))
+    assert pool.select() is None

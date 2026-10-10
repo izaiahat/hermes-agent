@@ -166,6 +166,12 @@ class TestMissedSteerRetention:
         from tools.delegate_tool import delegate_task
 
         parent = MagicMock()
+        parent.reasoning_config = None
+        parent.provider = "custom"
+        parent.base_url = "https://fixture.invalid/v1"
+        parent.api_key = "fixture-only"
+        parent.api_mode = "chat_completions"
+        parent.request_overrides = {}
         parent._delegate_depth = 0
         parent.model = "test-model"
         parent.interactive_mode = False
@@ -203,6 +209,12 @@ class TestMissedSteerRetention:
         from tools.delegate_tool import delegate_task
 
         parent = MagicMock()
+        parent.reasoning_config = None
+        parent.provider = "custom"
+        parent.base_url = "https://fixture.invalid/v1"
+        parent.api_key = "fixture-only"
+        parent.api_mode = "chat_completions"
+        parent.request_overrides = {}
         parent._delegate_depth = 0
         parent.model = "test-model"
         parent.interactive_mode = False

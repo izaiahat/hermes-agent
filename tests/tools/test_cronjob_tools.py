@@ -10,8 +10,8 @@ from tools.cronjob_tools import (
 )
 
 
-def test_registered_handler_forwards_script_timeout_seconds(monkeypatch):
-    """The public registry path must not drop the per-job timeout on update."""
+def test_registered_handler_keeps_cli_timeout_pin_out_of_model_args(monkeypatch):
+    """Model dispatch must not alter the operator-owned script timeout pin."""
     from tools import cronjob_tools
     from tools.registry import registry
 
@@ -22,7 +22,7 @@ def test_registered_handler_forwards_script_timeout_seconds(monkeypatch):
         return json.dumps({"success": True})
 
     monkeypatch.setattr(cronjob_tools, "cronjob", fake_cronjob)
-    raw = registry.dispatch("cronjob", {
+    raw = registry.dispatch("cronjob_manage", {
         "action": "update",
         "job_id": "job-1",
         "script_timeout_seconds": 2400,
@@ -33,7 +33,7 @@ def test_registered_handler_forwards_script_timeout_seconds(monkeypatch):
     assert result["success"] is True
     assert captured["action"] == "update"
     assert captured["job_id"] == "job-1"
-    assert captured["script_timeout_seconds"] == 2400
+    assert "script_timeout_seconds" not in captured
 
 
 # =========================================================================
@@ -312,7 +312,8 @@ class TestUnifiedCronjobTool:
             prompt="Check server status",
             schedule="every 1h",
             name="Disabled until bound",
-            initially_enabled=False,
+            paused=True,
+            paused_reason="initial control-plane binding",
         ))
         assert created["success"] is True
         assert created["job"]["enabled"] is False

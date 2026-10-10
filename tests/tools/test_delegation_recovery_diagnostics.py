@@ -12,7 +12,10 @@ import pytest
 def test_unfinished_delegation_recovery_keeps_transcript_locator(tmp_path, split, missing_writer):
     repo = str(Path(__file__).resolve().parents[2])
     handle_path = tmp_path / "dispatch.json"
-    env = {**os.environ, "HERMES_HOME": str(tmp_path), "PYTHONPATH": repo,
+    from tests.tools.conftest import write_healthy_proc_root
+    proc_root = tmp_path / 'proc'
+    write_healthy_proc_root(proc_root)
+    env = {**os.environ, "HERMES_PROC_ROOT": str(proc_root), "HERMES_HOME": str(tmp_path), "PYTHONPATH": repo,
            "REPRO_HANDLE": str(handle_path), "REPRO_SPLIT": str(int(split)),
            "REPRO_MISSING": str(int(missing_writer))}
     (tmp_path / 'config.yaml').write_text('delegation:\n  independent_completions: true\n', encoding='utf-8')
@@ -21,6 +24,13 @@ import json, os, threading
 from pathlib import Path
 from unittest.mock import MagicMock
 import tools.delegate_tool as dt
+import tools.delegation_admission as admission
+# Preserve the actual reservation owner's kernel tick in the healthy /proc fixture.
+owner = Path(os.environ['HERMES_PROC_ROOT']) / str(os.getpid())
+owner.mkdir()
+(owner / 'stat').write_text(Path(f'/proc/{os.getpid()}/stat').read_text())
+# The diagnostic owns mocked children and a scratch ledger, not host leases.
+admission._budget_path = lambda: Path(os.environ["HERMES_HOME"]) / "test-host-budget.json"
 parent = MagicMock()
 parent._delegate_depth = 0
 parent.session_id = "diagnostic-parent"
@@ -33,7 +43,8 @@ def child(**kw):
     started.set()
     blocked.wait(60)
 def build(**kw):
-    c = MagicMock()
+    c = MagicMock(model="m", reasoning_config=None,
+                  _delegate_requested_route=None, _delegate_resolved_route=None)
     c._delegate_role = "leaf"
     c._subagent_id = "diagnostic-child"
     return c
@@ -52,7 +63,7 @@ if os.environ['REPRO_MISSING'] == '1':
     live.create_live_transcripts = missing
 kwargs = {'tasks': [{'goal': 'first diagnostic task'}, {'goal': 'second diagnostic task'}]} if os.environ['REPRO_SPLIT'] == '1' else {'goal': 'unfinished diagnostic task'}
 handle = json.loads(dt.delegate_task(**kwargs, background=True, parent_agent=parent))
-assert handle["status"] == "dispatched", handle
+assert handle.get("status") == "dispatched", handle
 assert started.wait(10), "child did not start"
 Path(os.environ["REPRO_HANDLE"]).write_text(json.dumps(handle), encoding="utf-8")
 os._exit(0)

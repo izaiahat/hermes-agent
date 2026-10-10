@@ -1831,3 +1831,12 @@ def test_unsupported_inline_image_subtype_downgrades_to_text_for_anthropic(monke
     assert blocks[0]["source"] == {"type": "base64", "media_type": "image/png", "data": "iVBORw0KGgo="}
     assert "image/svg+xml" in blocks[1]["text"]
     assert blocks[2]["source"]["media_type"] == "image/jpeg"
+
+
+def test_identity_linked_console_keys_are_not_oauth():
+    """Regression: sk-ant-usr* personal/service-account keys got the claude-code OAuth beta and 400'd."""
+    from agent.anthropic_credentials import _is_oauth_token
+    assert not _is_oauth_token("sk-ant-usr-abc")
+    assert not _is_oauth_token("sk-ant-admin01-abc")
+    assert not _is_oauth_token("sk-ant-api03-abc")
+    assert _is_oauth_token("sk-ant-oat01-abc")

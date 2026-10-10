@@ -40,7 +40,8 @@ class TestParseEnvVar:
 class TestImportTimeEnvParsing:
     """Module-level env parsing should never make terminal_tool unimportable."""
 
-    def test_invalid_foreground_timeout_falls_back_to_default(self):
+    def test_invalid_foreground_timeout_falls_back_to_default(self, monkeypatch):
+        monkeypatch.delenv("TERMINAL_MAX_FOREGROUND_TIMEOUT", raising=False)
         default = importlib.reload(_tt_mod).FOREGROUND_MAX_TIMEOUT
         try:
             with patch.dict("os.environ", {"TERMINAL_MAX_FOREGROUND_TIMEOUT": "5m"}, clear=False):
@@ -49,7 +50,8 @@ class TestImportTimeEnvParsing:
         finally:
             importlib.reload(_tt_mod)
 
-    def test_invalid_disk_warning_threshold_falls_back_to_default(self):
+    def test_invalid_disk_warning_threshold_falls_back_to_default(self, monkeypatch):
+        monkeypatch.delenv("TERMINAL_DISK_WARNING_GB", raising=False)
         default = importlib.reload(_tt_mod).DISK_USAGE_WARNING_THRESHOLD_GB
         try:
             with patch.dict("os.environ", {"TERMINAL_DISK_WARNING_GB": "huge"}, clear=False):

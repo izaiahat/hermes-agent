@@ -34,8 +34,15 @@ def _codex_entry(entry_id: str = "codex-1") -> PooledCredential:
     )
 
 
-def test_select_does_not_hold_pool_lock_during_deferred_refresh(monkeypatch):
-    pool = CredentialPool("openai-codex", [_codex_entry()])
+def test_select_does_not_hold_pool_lock_during_deferred_refresh(monkeypatch, tmp_path):
+    import json
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    entry = _codex_entry()
+    # Codex selection re-reads persisted authority, including peer removals.
+    (tmp_path / "auth.json").write_text(json.dumps({
+        "version": 1, "credential_pool": {"openai-codex": [entry.to_dict()]},
+    }))
+    pool = CredentialPool("openai-codex", [entry])
     lock_free_during_refresh = {}
 
     def _fake_refresh(entry, *, force):
