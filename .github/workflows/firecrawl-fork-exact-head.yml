@@ -15,13 +15,16 @@ jobs:
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
+      - uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39
+        with:
+          version: '0.12.13'
       - name: Exact SDK and bridge contract
         env:
           EXPECTED_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
         run: |
           test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD"
-          python3 -m venv .venv
-          .venv/bin/python -m pip install -e '.[all,dev,firecrawl,mcp,anthropic,mistral,fal,modal,daytona,parallel-web,bedrock]'
+          uv python install 3.11
+          uv sync --locked --python 3.11 --extra all --extra dev --extra firecrawl --extra anthropic --extra mistral --extra fal --extra modal --extra daytona --extra parallel-web --extra bedrock
           .venv/bin/python -m pytest -q tests/tools/test_firecrawl_credit_ledger.py
           .venv/bin/python -c "from importlib.metadata import version; from firecrawl import Firecrawl; assert version('firecrawl-py')=='4.49.3'; c=Firecrawl(api_key='fixture-only'); assert all(hasattr(c,n) for n in ('search','scrape','gov_search','parse','find_tools'))"
           git diff --exit-code
