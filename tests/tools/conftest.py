@@ -79,8 +79,12 @@ def _neutral_capacity_admission(request, tmp_path):
         yield
         return
     # Keep genuine reservation logic, but never read or edit the operator's
-    # host-wide lease ledger from a unit test with mocked children.
+    # host-wide lease ledger from a unit test with mocked children. Model a
+    # healthy eight-slot host; RAM/CPU-dependent limits remain exercised by
+    # real_capacity_admission tests, not unrelated delegation UI fixtures.
     with patch.object(admission, "admission_problem", lambda: None), \
+         patch.object(admission, "mem_available_kb", lambda: 32 * 1024 * 1024), \
+         patch.object(admission, "host_child_limit", lambda: 8), \
          patch.object(admission, "_budget_path", lambda: tmp_path / "host-budget.json"):
         yield
 
