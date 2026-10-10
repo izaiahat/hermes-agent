@@ -21,7 +21,8 @@ from tools.mcp_tool_content import (
     _MCP_HARD_RESULT_CAP_CHARS, _cache_mcp_audio_block, _cache_mcp_image_block,
     _render_mcp_dropped_block_notice, _render_mcp_resource_block, _strip_reserved_meta_keys,
     _truncate_mcp_text_result)
-from tools.mcp_tool_errors import _is_auth_error, _is_session_expired_error
+from tools.mcp_tool_errors import (
+    _completed_effect_accounting_error, _is_auth_error, _is_session_expired_error)
 
 logger = logging.getLogger("tools.mcp_tool")
 _MISSING = object()
@@ -340,6 +341,11 @@ def _dispatch(server_name: str, server: Any, op: str, call, tool_timeout: float,
     except InterruptedError:
         return tool_error("MCP call interrupted: user sent a new message")
     except Exception as exc:
+        accounting = _completed_effect_accounting_error(exc)
+        if accounting is not None:
+            # Completed provider effect, failed local receipt: bypass every
+            # recovery rung, even for readOnlyHint=True and wrapped transport.
+            return tool_error(str(accounting), outcome_uncertain=True, retry=False)
         for recover in recoverers:
             recovered = recover(server_name, exc, call_once, op)
             if recovered is not None:
@@ -571,10 +577,22 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
         async def _call():
             async with server._rpc_lock, _track_inflight_rpc(server, server_name, op, retry_safe=read_only):
                 server._pending_call_context = contextvars.copy_context()  # for the elicitation callback
+                operation = None
                 try:
+                    if server_name.lower() == 'firecrawl':
+                        from tools.firecrawl_ledger import begin
+                        operation = begin('hermes.mcp.' + tool_name, 'mcp/' + tool_name, args)
                     result = await _call_tool_racing_stdio_death(server, server_name, tool_name, args)
+                except BaseException:
+                    if operation is not None:
+                        from tools.firecrawl_ledger import finish_failed
+                        finish_failed(operation, 'hermes.mcp.' + tool_name, 'mcp/' + tool_name, args)
+                    raise
                 finally:
                     server._pending_call_context = None
+                if operation is not None:
+                    from tools.firecrawl_ledger import finish
+                    finish(operation, 'hermes.mcp.' + tool_name, 'mcp/' + tool_name, args, result)
             if getattr(server, "_mark_session_proven", None) is not None:  # round-trip done: transport healthy
                 server._mark_session_proven()
             return _render_call_tool_result(result, server_name)

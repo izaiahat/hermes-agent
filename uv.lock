@@ -1371,7 +1371,7 @@ wheels = [
 
 [[package]]
 name = "firecrawl-py"
-version = "4.17.0"
+version = "4.49.3"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "aiohttp" },
@@ -1382,9 +1382,9 @@ dependencies = [
     { name = "requests" },
     { name = "websockets" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/06/83/b71ff91697f31167f313ee4e67bef069e8f9625fd46fe857f742665cb3cc/firecrawl_py-4.17.0.tar.gz", hash = "sha256:9b57e0fb91b7f711682a825dd64d51090fef9e8b54eafee78c14133d5deaed57", size = 169383, upload-time = "2026-02-26T00:33:55.693Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/04/71/e95cad209cb754650ec3469f64c0ca7b89070e327e2112be53dd7474c2fd/firecrawl_py-4.49.3.tar.gz", hash = "sha256:a5d1ee1b6ff226bfd8da18c6dc194b43b4ffb7c1cd1621f7bfcfea13a7f7ccf6", size = 265751, upload-time = "2026-10-07T21:22:37.208Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/07/33/97a53f155c2dec843afb0925b77d715b328134b0fe2fef142c0ff810ff49/firecrawl_py-4.17.0-py3-none-any.whl", hash = "sha256:04a3132e1bba7630a618bf19738f22404d955751d4a24f2912f0e220dac2cca0", size = 212502, upload-time = "2026-02-26T00:33:54.362Z" },
+    { url = "https://files.pythonhosted.org/packages/b9/26/b14311e6ebecad61fb8515ddda7fa1f1d634e7f7a23aab0fdd2778b44ea4/firecrawl_py-4.49.3-py3-none-any.whl", hash = "sha256:5839d1d2124b46368d17ac12af51d9168666295542f498839675d60bbcd46580", size = 326457, upload-time = "2026-10-07T21:22:35.886Z" },
 ]
 
 [[package]]
@@ -2019,7 +2019,7 @@ requires-dist = [
     { name = "faster-whisper", marker = "extra == 'voice'", specifier = "==1.2.1" },
     { name = "fire", specifier = "==0.7.1" },
     { name = "firecrawl-anydoc", specifier = "==0.2.4" },
-    { name = "firecrawl-py", marker = "extra == 'firecrawl'", specifier = "==4.17.0" },
+    { name = "firecrawl-py", marker = "extra == 'firecrawl'", specifier = "==4.49.3" },
     { name = "google-api-python-client", marker = "extra == 'google'", specifier = "==2.194.0" },
     { name = "google-api-python-client", marker = "extra == 'google-chat'", specifier = "==2.194.0" },
     { name = "google-auth", marker = "extra == 'google'", specifier = "==2.55.1" },

@@ -251,7 +251,8 @@ async def _scrape_one(url: str, formats: List[str], format: Optional[str]) -> Di
     try:
         logger.info("Firecrawl scraping: %s", url)
         try:
-            scrape_result = await asyncio.wait_for(asyncio.to_thread(_get_firecrawl_client().scrape, url=url, formats=formats), timeout=60)
+            from tools.firecrawl_ledger import sdk_call
+            scrape_result = await asyncio.wait_for(asyncio.to_thread(sdk_call, 'hermes.web_extract', '/v2/scrape', _get_firecrawl_client().scrape, url=url, formats=formats), timeout=60)
         except asyncio.TimeoutError:
             logger.warning("Firecrawl scrape timed out for %s", url)
             return _error_entry(url, _SCRAPE_TIMEOUT_MSG)
@@ -260,13 +261,19 @@ async def _scrape_one(url: str, formats: List[str], format: Optional[str]) -> Di
         # SDK may return a typed object for metadata (raw __dict__ here, unlike _to_plain_object).
         if not isinstance(metadata, dict):
             metadata = metadata.model_dump() if hasattr(metadata, "model_dump") else getattr(metadata, "__dict__", {})
-        title, final_url = metadata.get("title", ""), metadata.get("sourceURL", url)
-        if not is_safe_url(final_url):
-            logger.info("Blocked redirected web_extract for unsafe final URL: %s", final_url)
-            return _error_entry(final_url, _UNSAFE_REDIRECT_MSG, title=title, raw=True)
-        if final_blocked := check_website_access(final_url):
-            logger.info("Blocked redirected web_extract for %s by rule %s", final_blocked["host"], final_blocked["rule"])
-            return _error_entry(final_url, final_blocked["message"], title=title, raw=True, blocked=final_blocked)
+        title = metadata.get("title") or ""
+        candidates = list(dict.fromkeys([url] + [metadata[key] for key in
+            ('url', 'sourceURL', 'source_url', 'og:url') if metadata.get(key)]))
+        final_url = metadata.get("url") or metadata.get("sourceURL") or metadata.get("source_url") or url
+        # Every supplied redirect alias is evidence of a destination: a safe
+        # preferred alias must never mask a denied network or website candidate.
+        for candidate in candidates:
+            if not is_safe_url(candidate):
+                logger.info("Blocked redirected web_extract for unsafe final URL: %s", candidate)
+                return _error_entry(candidate, _UNSAFE_REDIRECT_MSG, title=title, raw=True)
+            if final_blocked := check_website_access(candidate):
+                logger.info("Blocked redirected web_extract for %s by rule %s", final_blocked["host"], final_blocked["rule"])
+                return _error_entry(candidate, final_blocked["message"], title=title, raw=True, blocked=final_blocked)
         markdown, html = payload.get("markdown"), payload.get("html")
         content = markdown if format == "markdown" or (format is None and markdown) else html or markdown or ""
         return {"url": final_url, "title": title, "content": content, "raw_content": content, "metadata": metadata}
@@ -297,7 +304,8 @@ class FirecrawlWebSearchProvider(BaseWebSearchProvider):
         logger.info("Firecrawl search: '%s' (limit=%d)", query, limit)
         client = _get_firecrawl_client()
         try:
-            web_results = _extract_web_search_results(client.search(query=query, limit=limit))
+            from tools.firecrawl_ledger import sdk_call
+            web_results = _extract_web_search_results(sdk_call('hermes.web_search', '/v2/search', client.search, query=query, limit=limit))
             logger.info("Firecrawl: found %d search results", len(web_results))
             return search_ok(web_results)
         except Exception as exc:  # noqa: BLE001

@@ -1,0 +1,25 @@
+name: Firecrawl fork exact-head
+on:
+  pull_request:
+    branches: [izaiah-main]
+permissions:
+  contents: read
+jobs:
+  sdk-and-ledger-contract:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+      - name: Exact SDK and bridge contract
+        env:
+          EXPECTED_HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD"
+          python3 -m venv .venv
+          .venv/bin/python -m pip install -e '.[dev,firecrawl,mcp]'
+          .venv/bin/python -m pytest -q tests/tools/test_firecrawl_credit_ledger.py
+          .venv/bin/python -c "from importlib.metadata import version; from firecrawl import Firecrawl; assert version('firecrawl-py')=='4.49.3'; c=Firecrawl(api_key='fixture-only'); assert all(hasattr(c,n) for n in ('search','scrape','gov_search','parse','find_tools'))"
+          git diff --exit-code
