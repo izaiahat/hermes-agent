@@ -17,7 +17,7 @@ FLOOR_USD = 5.0
 def credit_snapshot():
     tracker = get_hermes_home() / 'scripts/anthropic_api_credit_tracker.py'
     try:
-        proc = subprocess.run([sys.executable, str(tracker)], capture_output=True, text=True, timeout=45)
+        proc = subprocess.run([sys.executable, str(tracker)], capture_output=True, text=True, timeout=45, stdin=subprocess.DEVNULL)
         if proc.returncode:
             raise ValueError('tracker_failed')
         raw = json.loads(proc.stdout)

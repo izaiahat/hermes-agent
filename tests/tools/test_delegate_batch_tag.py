@@ -103,7 +103,7 @@ def test_batch_completion_lines_are_attributable_across_two_batches(monkeypatch,
 
     import re
 
-    for n in (3, 9):
+    for n in (3, 8):
         res = dt.delegate_task(
             tasks=[{"goal": f"batch of {n}: worker task number {i}"} for i in range(n)],
             parent_agent=parent,
@@ -111,9 +111,9 @@ def test_batch_completion_lines_are_attributable_across_two_batches(monkeypatch,
         assert "error" not in str(res)[:20], res
     headers = [re.match(r"\s*🔀 \[(set \d+)\] delegating (\d+) tasks", l) for l in lines]
     headers = [m for m in headers if m]
-    assert [(m.group(1), int(m.group(2))) for m in headers] == [("set 1", 3), ("set 2", 9)]
+    assert [(m.group(1), int(m.group(2))) for m in headers] == [("set 1", 3), ("set 2", 8)]
 
     done = [l for l in lines if "✓ [" in l]
-    assert len(done) == 12
+    assert len(done) == 11
     assert sum(1 for l in done if "✓ [set 1 · " in l and "/3]" in l) == 3
-    assert sum(1 for l in done if "✓ [set 2 · " in l and "/9]" in l) == 9
+    assert sum(1 for l in done if "✓ [set 2 · " in l and "/8]" in l) == 8

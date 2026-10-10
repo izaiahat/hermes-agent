@@ -83,6 +83,9 @@ def test_bind_subagent_parent_does_not_pin_agent():
 
 def _fake_child(messages):
     child = MagicMock()
+    child.reasoning_config = None
+    child._delegate_requested_route = None
+    child._delegate_resolved_route = None
     child._credential_pool = None
     child._delegate_role = "leaf"
     child.session_estimated_cost_usd = 0.0123

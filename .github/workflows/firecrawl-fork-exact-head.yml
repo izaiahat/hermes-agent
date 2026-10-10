@@ -18,6 +18,11 @@ jobs:
       - uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39
         with:
           version: '0.12.13'
+      - name: Install search test prerequisite
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ripgrep
+          rg --version
       - name: Exact SDK and bridge contract
         env:
           EXPECTED_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
@@ -33,7 +38,7 @@ jobs:
           .venv/bin/python -m pytest -q tests/agent/test_credential_pool_deferred_refresh.py tests/agent/test_credential_pool_oauth_writethrough.py tests/agent/test_credential_pool_profile_oauth_fork.py tests/agent/test_credential_pool_codex_singleton_isolation.py
       - name: Full tools and provider regressions (per-file isolation)
         env:
-          HERMES_TEST_PATHS: tests/tools:tests/agent/test_credential_pool.py:tests/agent/test_nous_portal_anthropic_wire.py:tests/plugins/browser/test_firecrawl_expiry.py
+          HERMES_TEST_PATHS: tests/tools:tests/agent/test_credential_pool.py:tests/agent/test_anthropic_credit_guard_stdin.py:tests/agent/test_nous_portal_anthropic_wire.py:tests/plugins/browser/test_firecrawl_expiry.py
           HERMES_TEST_WORKERS: '2'
           FIRECRAWL_OPERATION_LEDGER: ${{ runner.temp }}/TEST-ONLY-ledger.jsonl
         run: |

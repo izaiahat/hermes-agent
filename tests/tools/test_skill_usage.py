@@ -398,8 +398,8 @@ def test_restoring_from_archive_clears_timestamp(skills_home):
 
 
 def test_archive_and_restore_key_on_skill_name_not_directory_name(skills_home):
-    """`mlops/training/accelerate` is the skill `huggingface-accelerate`: archive lands under the NAME,
-    and an older archive flattened under the directory name is still found by `restore_skill`."""
+    """Archive keys use the skill name; metadata alone cannot authorize restoration
+    of an unrelated directory. Explicitly re-key a legacy archive first."""
     from tools.skill_usage import archive_skill, mark_agent_created, restore_skill
     skills_dir = skills_home / "skills"
     d = skills_dir / "training" / "accelerate"
@@ -415,6 +415,12 @@ def test_archive_and_restore_key_on_skill_name_not_directory_name(skills_home):
 
     # Legacy layout: archived under the directory name by an older build.
     (skills_dir / "huggingface-accelerate").rename(skills_dir / ".archive" / "accelerate")
+    ok, msg = restore_skill("huggingface-accelerate")
+    assert not ok and "not found in archive" in msg
+    assert (skills_dir / ".archive" / "accelerate" / "SKILL.md").exists()
+    assert not (skills_dir / "huggingface-accelerate").exists()
+    # Explicit operator re-keying, not a metadata-driven repair mutation.
+    (skills_dir / ".archive" / "accelerate").rename(skills_dir / ".archive" / "huggingface-accelerate")
     ok, msg = restore_skill("huggingface-accelerate")
     assert ok, msg
     assert (skills_dir / "huggingface-accelerate" / "SKILL.md").exists()

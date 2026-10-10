@@ -13,13 +13,15 @@ from tools.registry import registry
 @pytest.mark.parametrize("legacy_role", [None, "leaf", "orchestrator"])
 @pytest.mark.parametrize(
     "parent_depth,max_depth,enabled",
-    [(1, 5, True), (1, 3, True), (2, 3, True), (1, 5, False)],
+    [(0, 5, True), (0, 3, True), (1, 5, True), (2, 3, True), (0, 5, False)],
 )
 def test_dispatched_child_prompt_matches_depth_capability(
     tmp_path, monkeypatch, legacy_role, parent_depth, max_depth, enabled,
 ):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     parent = MagicMock()
+    parent.session_id = "depth-fixture-parent"
+    parent.reasoning_config = None
     parent._delegate_depth = parent_depth
     parent._active_children = []
     parent._active_children_lock = threading.Lock()
@@ -37,6 +39,9 @@ def test_dispatched_child_prompt_matches_depth_capability(
     parent.tool_progress_callback = None
     parent.thinking_callback = None
     child = MagicMock()
+    child.reasoning_config = None
+    child._delegate_requested_route = None
+    child._delegate_resolved_route = None
     child._credential_pool = None
     child._delegate_saved_tool_names = []
     child.session_prompt_tokens = 0
@@ -56,12 +61,24 @@ def test_dispatched_child_prompt_matches_depth_capability(
     ):
         result = json.loads(registry.get_entry("delegate_task").handler(args, parent_agent=parent))
 
+    # This maintained fork clamps every configured nesting depth to one.
+    # Verify the policy instead of teaching tests to bypass it.
+    if parent_depth >= 1:
+        assert "error" in result
+        assert "depth" in result["error"].lower()
+        child.run_conversation.assert_not_called()
+        return
+    assert "error" not in result, result
+    # The public root-level model handler is deliberately asynchronous.
+    from tests.tools.test_async_delegation import _drain_for
+    assert result["status"] == "dispatched"
+    event = _drain_for(result["delegation_id"])
+    assert event is not None and event["status"] == "completed", event
     child.run_conversation.assert_called_once()
-    assert "error" not in result
     kwargs = agent_class.call_args.kwargs
     prompt = kwargs["ephemeral_system_prompt"]
     depth = parent_depth + 1
-    can_delegate = enabled and depth < max_depth
+    can_delegate = enabled and depth < min(max_depth, 1)
     assert child._delegate_depth == depth
     assert child._delegate_role == ("orchestrator" if can_delegate else "leaf")
     assert ("delegation" in kwargs["enabled_toolsets"]) == can_delegate
