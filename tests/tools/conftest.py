@@ -59,7 +59,7 @@ def write_healthy_proc_root(root) -> str:
 
 
 @pytest.fixture(autouse=True)
-def _neutral_capacity_admission(request):
+def _neutral_capacity_admission(request, tmp_path):
     """Keep the host's live capacity gate out of unit tests.
 
     ``delegate_task`` refuses a spawn when THIS machine is short on memory, is
@@ -78,7 +78,10 @@ def _neutral_capacity_admission(request):
     except Exception:
         yield
         return
-    with patch.object(admission, "admission_problem", lambda: None):
+    # Keep genuine reservation logic, but never read or edit the operator's
+    # host-wide lease ledger from a unit test with mocked children.
+    with patch.object(admission, "admission_problem", lambda: None), \
+         patch.object(admission, "_budget_path", lambda: tmp_path / "host-budget.json"):
         yield
 
 

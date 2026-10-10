@@ -9,7 +9,7 @@ permissions:
 jobs:
   sdk-and-ledger-contract:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
@@ -21,7 +21,18 @@ jobs:
         run: |
           test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD"
           python3 -m venv .venv
-          .venv/bin/python -m pip install -e '.[dev,firecrawl,mcp]'
+          .venv/bin/python -m pip install -e '.[all,dev,firecrawl,mcp,anthropic,mistral,fal,modal,daytona,parallel-web,bedrock]'
           .venv/bin/python -m pytest -q tests/tools/test_firecrawl_credit_ledger.py
           .venv/bin/python -c "from importlib.metadata import version; from firecrawl import Firecrawl; assert version('firecrawl-py')=='4.49.3'; c=Firecrawl(api_key='fixture-only'); assert all(hasattr(c,n) for n in ('search','scrape','gov_search','parse','find_tools'))"
+          git diff --exit-code
+      - name: Codex persisted-authority refresh regressions
+        run: |
+          .venv/bin/python -m pytest -q tests/agent/test_credential_pool_deferred_refresh.py tests/agent/test_credential_pool_oauth_writethrough.py tests/agent/test_credential_pool_profile_oauth_fork.py tests/agent/test_credential_pool_codex_singleton_isolation.py
+      - name: Full tools and provider regressions (per-file isolation)
+        env:
+          HERMES_TEST_PATHS: tests/tools:tests/agent/test_credential_pool.py:tests/agent/test_nous_portal_anthropic_wire.py:tests/plugins/browser/test_firecrawl_expiry.py
+          HERMES_TEST_WORKERS: '2'
+          FIRECRAWL_OPERATION_LEDGER: ${{ runner.temp }}/TEST-ONLY-ledger.jsonl
+        run: |
+          .venv/bin/python scripts/run_tests_parallel.py -q
           git diff --exit-code

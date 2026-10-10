@@ -1047,7 +1047,7 @@ def test_ungrouped_task_completes_alone_and_group_completes_together(monkeypatch
         {"goal": "review PR 2 thoroughly and report"},
     ]
     handle = _grouped_fanout(monkeypatch, tasks, gates)
-    assert handle["status"] == "dispatched"
+    assert handle.get("status") == "dispatched", handle
     by_group = {tuple(u["task_indexes"]): u["group"] for u in handle["units"]}
     assert by_group == {(0,): None, (1, 2): "cmp", (3,): None}
 
